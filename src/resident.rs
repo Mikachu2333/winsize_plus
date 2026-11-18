@@ -88,7 +88,9 @@ impl App {
             return Ok(());
         }
         let cfg = config::load(&self.path, None)?;
-        self.snapshot = bytes;
+        self.snapshot = fs::read(&self.path).ok();
+        let sync_task =
+            !automatic || (cfg.autostart, cfg.elevate) != (self.cfg.autostart, self.cfg.elevate);
         let restart = automatic && (cfg.restart || cfg.elevate != self.cfg.elevate);
         input::configure(&cfg)?;
         self.overlay.guides(self.overlay.mode(), &cfg)?;
@@ -97,6 +99,9 @@ impl App {
         if restart {
             self.exit = Some(true);
             return Ok(());
+        }
+        if sync_task {
+            crate::logon::sync(self.cfg.autostart, self.cfg.elevate)?;
         }
         self.notice(self.cfg.tr("Configuration reloaded", "配置已重载"))
     }
@@ -348,6 +353,9 @@ pub fn run(path: &Path) -> Result<bool, String> {
             exit: None,
         };
         let mut msg = MSG::default();
+        if let Err(problem) = crate::logon::sync(app.cfg.autostart, app.cfg.elevate) {
+            app.notice(&problem)?;
+        }
         loop {
             if let Err(problem) = app.deadlines() {
                 let _ = app.notice(&problem);

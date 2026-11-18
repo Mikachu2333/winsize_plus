@@ -18,6 +18,7 @@ wait_ms = 4000
 gesture = "left"
 # gesture selects the Alt side for right-click placement: left, right, both or off.
 elevate = false
+autostart = false # Register the current user's logon task. Turn off to remove it.
 restart_on_change = false
 # Times are in ms. elevate requests administrator rights. restart_on_change restarts after a valid edit.
 

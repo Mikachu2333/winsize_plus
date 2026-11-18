@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+windows = { version = "0.62.2", default-features = false, features = ["Win32_System_Com", "Win32_System_Ole", "Win32_System_TaskScheduler", "Win32_System_Variant"] }
 toml_edit = { version = "0.22.27", default-features = false, features = ["parse", "display"] }
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Security", "Win32_Security_Authentication_Identity",

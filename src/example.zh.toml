@@ -17,6 +17,7 @@ wait_ms = 4000
 gesture = "left"
 # gesture 指定右键摆放时的 Alt 侧，可设为 left、right、both 或 off。
 elevate = false
+autostart = false # 开启时注册当前用户的登录任务，关闭时自动移除。
 restart_on_change = false
 # 双击间隔和等待按键时间的单位均为毫秒。elevate 请求管理员权限，restart_on_change 在配置更新后重启。
 
