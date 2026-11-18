@@ -1,0 +1,128 @@
+# WinSizeP | 内置帮助 / Embedded help
+# winsizep                       启动常驻程序 / start the resident
+# 双击左 Alt，再按 QWE / ASD / ZXC 摆放窗口。S 将宽高都设为工作区的 80% 并居中。
+# Double-tap left Alt, then QWE / ASD / ZXC. S centers at 80% of the work area.
+# 按住左 Alt 点击右键，用点击屏幕的九宫格布局。点窗口操作该窗口，点桌面移动前台窗口。
+# Hold left Alt and right-click a screen cell. On empty desktop the foreground window is moved.
+# 双击 Alt 后按反撇号进入指令框。输入 quit 退出，reboot 重启，version 显示版本，Esc 取消。
+# Double Alt, then grave opens the command prompt. Enter quit, reboot, version or press Esc.
+# winsizep --pid 123 -l 100 200 --size 900,600
+# winsizep --name notepad.exe --preset center --x -1200 --top on
+# winsizep --pid 123 --preset w
+# --preset 可写方案名或 [keys] 中绑定布局的按键。默认 w = FullTop，s = Center，同名时方案名优先。
+# --preset accepts a layout name or its current key binding. Layout names take priority.
+# --pid / --class / --name (exe) / --hwnd (decimal or 0xHEX) / --title
+# 选择可见顶层窗口。多个条件同时满足；无条件使用前台窗口。
+# Filters are combined. Use the foreground window by omitting all filters.
+# --location/-l X,Y or X Y; --x / --y override preset coordinates in desktop pixels.
+# --size/-s W,H or W H; --ignore and --top accept on/off/toggle (default toggle).
+# --help prints this file; --version prints the build version; --check validates config.
+# winsizep --export-logon-task WinSizeP.xml
+# 在任务计划程序中导入 XML。需要管理权限时，在“常规”勾选“使用最高权限运行”并授权。
+# Import the XML in Task Scheduler. For elevated startup, select Run with highest privileges and approve.
+# 停用自启时禁用该任务。Disable the imported task to turn off logon startup.
+
+[general]
+language = "auto" # auto / zh-CN / en
+alt = "left" # left / right / both. 连击必须是同侧 Alt / tap the same Alt twice.
+double_ms = 350 # 双击时间 / maximum interval between taps (ms)
+wait_ms = 4000 # 等待快捷键 / time to press a bound key (ms)
+gesture = "left" # Alt + right click: left / right / both / off
+gesture_button = "right" # 鼠标键 / mouse button: right / middle / left
+elevate = false # 启动时请求管理员权限 / request elevation when starting resident
+restart_on_change = false # 文件变动后重启 / restart after a valid config change (otherwise hot reload)
+
+[tip]
+show = "monitor" # monitor / time / off
+duration_ms = 4000 # 提示停留时间 / notification duration
+theme = "system" # system / light / dark
+background = "#F2F2F2"
+foreground = "#000000"
+dark_background = "#303030"
+dark_foreground = "#F2F2F2"
+font = "Microsoft YaHei UI" # GDI measures the actual text, including CJK
+font_size = 16 # 96 DPI 下的像素 / logical pixels at 96 DPI
+
+# 两轴独立，width 为线宽，gap 为鼠标两侧各自的缺口半径（均按 DPI 缩放）。
+# Each axis has its own thickness and gap radius in logical pixels, RGB and alpha (0..255).
+[horizontal]
+width = 2
+color = "#CCCC00"
+opacity = 160
+gap = 12
+[vertical]
+width = 2
+color = "#CCCC00"
+opacity = 160
+gap = 12
+
+# x|y|width|height[|monitor]. sw/sh = 工作区 / work area, ww/wh = 当前窗口 / window,
+# vw/vh = 虚拟桌面 / virtual desktop. 50sw = 50%, sw = 100%. 可叠加 / e.g. 50sw-8.
+# 含 vw/vh 时坐标原点改为虚拟桌面左上角。Otherwise relative to monitor work area.
+# 屏号 0 或不存在时取鼠标屏 / omitted or unknown monitor uses pointer display.
+[presets]
+LeftTop = "0|0|50sw|50sh"
+FullTop = "0|0|100sw|50sh"
+RightTop = "50sw|0|50sw|50sh"
+FullLeft = "0|0|50sw|100sh"
+Center = "10sw|10sh|80sw|80sh"
+FullRight = "50sw|0|50sw|100sh"
+LeftBottom = "0|50sh|50sw|50sh"
+FullBottom = "0|50sh|100sw|50sh"
+RightBottom = "50sw|50sh|50sw|50sh"
+
+# 双击 Alt 后按键；空字符串禁用。绑定可改用字母、数字、F1..F24、vk:XX 或标点键名。
+# Keys after double Alt. Empty string disables a binding. vk:XX is a hexadecimal virtual key.
+[keys]
+q = "LeftTop"
+w = "FullTop"
+e = "RightTop"
+a = "FullLeft"
+s = "Center"
+d = "FullRight"
+z = "LeftBottom"
+x = "FullBottom"
+c = "RightBottom"
+p = "top"
+u = "ignore"
+g = "guide"
+minus = "horizontal"
+equal = "cross"
+backslash = "vertical"
+grave = "command" # 物理反撇号键，含 ` ~ ～ / physical OEM key, IME independent
+F1 = "help"
+
+# aliases map ASCII command words to actions or presets. Enter executes, Esc cancels.
+# 自定义命令词 → 动作或方案；例如把 asdf 改成常用词。输入预设名称也可执行。
+[commands]
+asdf = "Center"
+version = "version"
+help = "help"
+reload = "reload"
+reboot = "restart"
+quit = "quit"
+pin = "top"
+exclude = "ignore"
+time = "time"
+screen = "monitor"
+g = "guide"
+
+# 点击所在屏幕的九宫格，优先级：屏号+0、屏号+格号、通用格号。
+# Map screen cells to presets. Example: 20 = "Center" overrides all cells of display 2.
+[grid]
+1 = "LeftTop"
+2 = "FullTop"
+3 = "RightTop"
+4 = "FullLeft"
+5 = "Center"
+6 = "FullRight"
+7 = "LeftBottom"
+8 = "FullBottom"
+9 = "RightBottom"
+
+# --ignore on 自动保存完整三项，非空字段必须同时匹配。留空字段表示任意。
+# Exclude rules use all nonempty fields, exact text, case-insensitive executable names.
+# [[exclusions]]
+# name = "notepad.exe"
+# class = "Notepad"
+# title = "Untitled - Notepad"
