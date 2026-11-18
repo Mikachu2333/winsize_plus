@@ -8,6 +8,7 @@
 # --preset 接受名称或绑定布局的按键，直接设置的坐标优先。
 # --size 和 --location 的两个值可以用空格或逗号分隔。--top 和 --ignore 接受 on/off/toggle。
 # --help 打印本示例，--check 校验配置，--version 显示版本号。
+# 在托盘菜单选择“设置”或使用 --settings，可编辑配置并在桌面上实时预览。
 # 界面语言可选 auto、zh-CN、en。alt 指定可双击的 Alt 侧，both 允许左右任一侧。
 [general]
 language = "auto"
@@ -34,10 +35,10 @@ dark_foreground = "#F2F2F2"
 font = "Microsoft YaHei UI"
 font_size = 16
 
-# 十字线两轴可分别设置随 DPI 缩放的宽度、缺口半径、RGB 颜色和透明度（0 到 255）。
 [crosshair]
 fps = 60.0 # 移动时的目标刷新率，范围 1 到 1000，可填 59.94 等小数。
 
+# 十字线两轴可分别设置随 DPI 缩放的宽度、缺口半径、RGB 颜色和透明度（0 到 255）。
 [horizontal]
 width = 2
 color = "#CCCC00"

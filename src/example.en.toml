@@ -9,6 +9,7 @@
 # --preset accepts names and active layout keys. Explicit coordinates override the preset.
 # --size and --location accept comma or space separated pairs. --top and --ignore accept on/off/toggle.
 # --help prints this example. --check validates the configuration. --version prints the version.
+# Open Settings from the tray or use --settings to edit with a live desktop preview.
 # Choose auto, zh-CN or en for the interface. Tap the same left/right Alt twice (both permits either).
 [general]
 language = "auto"

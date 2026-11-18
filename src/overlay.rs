@@ -2,7 +2,7 @@ use crate::{
     config::Config,
     desktop::{self, Display, check, err, wide},
     layout::Rect,
-    tray::{APP_ICON, Tray},
+    tray::APP_ICON,
 };
 use std::ptr::{null, null_mut};
 use windows_sys::{
@@ -132,7 +132,6 @@ impl Drop for Panel {
     }
 }
 pub struct Overlay {
-    pub tray: Tray,
     tip: Panel,
     shadow: Panel,
     font: HFONT,
@@ -176,7 +175,6 @@ impl Overlay {
             }
             let tip = Panel::new()?;
             Ok(Self {
-                tray: Tray::new()?,
                 shadow: Panel::new()?,
                 tip,
                 font: null_mut(),

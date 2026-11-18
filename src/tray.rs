@@ -142,6 +142,7 @@ impl Tray {
 
     pub fn menu(&self, cfg: &Config, anchor: isize) -> Result<Option<&'static str>, String> {
         let entries = [
+            ("settings", cfg.tr("Settings…", "设置…")),
             ("help", cfg.tr("Help", "帮助")),
             ("reload", cfg.tr("Reload configuration", "重载配置")),
             ("version", cfg.tr("Version", "版本")),

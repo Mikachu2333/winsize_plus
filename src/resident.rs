@@ -46,6 +46,7 @@ struct App {
     cfg: Config,
     path: PathBuf,
     overlay: Overlay,
+    tray: crate::tray::Tray,
     frames: FrameClock,
     preview: Preview,
     hold: Option<(Instant, HWND)>,
@@ -128,6 +129,7 @@ impl App {
     }
     fn act(&mut self, action: &str) -> Result<(), String> {
         match action {
+            "settings" => crate::settings::open(),
             "time" | "monitor" => self.status(action),
             "version" => self.notice(concat!("WinSizeP ", env!("CARGO_PKG_VERSION"))),
             "help" => {
@@ -249,7 +251,7 @@ impl App {
     fn event(&mut self, msg: MSG) -> Result<(), String> {
         match msg.message {
             crate::tray::MENU => {
-                if let Some(action) = self.overlay.tray.menu(&self.cfg, msg.lParam)? {
+                if let Some(action) = self.tray.menu(&self.cfg, msg.lParam)? {
                     self.act(action)?;
                 }
                 Ok(())
@@ -371,6 +373,20 @@ impl App {
     }
 }
 
+pub fn running() -> bool {
+    unsafe {
+        let handle = OpenMutexW(
+            SYNCHRONIZATION_SYNCHRONIZE,
+            0,
+            w!("Local\\WinSizeP.Resident.v1"),
+        );
+        if handle.is_null() {
+            return GetLastError() == ERROR_ACCESS_DENIED;
+        }
+        CloseHandle(handle);
+        true
+    }
+}
 pub fn run(path: &Path) -> Result<bool, String> {
     unsafe {
         let handle = CreateMutexW(null(), 0, w!("Local\\WinSizeP.Resident.v1"));
@@ -400,6 +416,7 @@ pub fn run(path: &Path) -> Result<bool, String> {
             cfg,
             path: path.into(),
             overlay,
+            tray: crate::tray::Tray::new()?,
             preview: Preview::new()?,
             hold: None,
             held_window: None,

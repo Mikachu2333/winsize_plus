@@ -128,24 +128,25 @@ fn merge(table: &mut Table, defaults: &Table, named: bool) -> bool {
     changed
 }
 
+pub const ACTIONS: &[&str] = &[
+    "top",
+    "ignore",
+    "help",
+    "version",
+    "command",
+    "restart",
+    "quit",
+    "time",
+    "monitor",
+    "guide",
+    "horizontal",
+    "vertical",
+    "cross",
+    "reload",
+    "settings",
+];
 fn is_builtin_action(name: &str) -> bool {
-    matches!(
-        name,
-        "top"
-            | "ignore"
-            | "help"
-            | "version"
-            | "command"
-            | "restart"
-            | "quit"
-            | "time"
-            | "monitor"
-            | "guide"
-            | "horizontal"
-            | "vertical"
-            | "cross"
-            | "reload"
-    )
+    ACTIONS.contains(&name)
 }
 
 impl Config {
@@ -171,7 +172,7 @@ impl Config {
     pub fn tr<'a>(&self, en: &'a str, zh: &'a str) -> &'a str {
         if self.zh { zh } else { en }
     }
-    fn parse(doc: &DocumentMut) -> Result<Self, String> {
+    pub fn parse(doc: &DocumentMut) -> Result<Self, String> {
         let field = |section: &str, key: &str| {
             doc.get(section)
                 .and_then(|item| item.get(key))
@@ -396,6 +397,24 @@ fn write(path: &Path, text: &str) -> io::Result<()> {
     }
     result
 }
+pub fn read_settings(path: &Path) -> Result<String, String> {
+    let _lock = lock()?;
+    decode(&fs::read(path).map_err(|err| err.to_string())?)
+}
+
+pub fn save_settings(path: &Path, original: &str, doc: &DocumentMut) -> Result<(), String> {
+    Config::parse(doc)?;
+    let _lock = lock()?;
+    let bytes = fs::read(path).map_err(|err| err.to_string())?;
+    if decode(&bytes)? != original {
+        return Err(
+            "Configuration changed on disk. Reopen settings. / 配置文件已变更，请重新打开设置。"
+                .into(),
+        );
+    }
+    write(path, &doc.to_string()).map_err(|err| err.to_string())
+}
+
 pub fn load(path: &Path, edit: Option<(&Identity, Switch)>) -> Result<Config, String> {
     let _lock = lock()?;
     let (text, new) = match fs::read(path) {

@@ -10,6 +10,7 @@ mod logon;
 mod overlay;
 mod preview;
 mod resident;
+mod settings;
 mod tray;
 
 use std::{
@@ -86,13 +87,14 @@ fn run() -> Result<(), String> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     let values: Vec<_> = args.iter().map(String::as_str).collect();
     #[cfg(not(debug_assertions))]
-    if !matches!(values.as_slice(), [] | ["--resident"]) {
+    if !matches!(values.as_slice(), [] | ["--resident"] | ["--settings"]) {
         attach_cli_console();
     }
     let path = config::path()?;
     match values.as_slice() {
         ["--version" | "-V"] => println!("WinSizeP {}", env!("CARGO_PKG_VERSION")),
         ["--help" | "-h"] => print!("{}", config::help()),
+        ["--settings"] => return settings::run(&path),
         ["--export-logon-task", file] => {
             logon::export(std::path::Path::new(file))?;
             println!("Import in Task Scheduler / 请在任务计划程序中导入 {file}");
