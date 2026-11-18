@@ -4,6 +4,7 @@ use crate::{
     desktop::{self, err, wide},
     input,
     overlay::Overlay,
+    preview::Preview,
 };
 use std::{
     fs,
@@ -44,6 +45,9 @@ struct App {
     cfg: Config,
     path: PathBuf,
     overlay: Overlay,
+    preview: Preview,
+    hold: Option<(Instant, HWND)>,
+    held_window: Option<HWND>,
     window: HWND,
     command: String,
     help_line: usize,
@@ -54,6 +58,17 @@ struct App {
     exit: Option<bool>,
 }
 impl App {
+    fn refresh_preview(&mut self) -> Result<(), String> {
+        self.preview.hide();
+        input::track_preview(false)?;
+        if self.cfg.preview
+            && let Some(hwnd) = self.held_window.or(self.wait.map(|_| self.window))
+        {
+            self.preview.start(hwnd, &self.cfg)?;
+            input::track_preview(true)?;
+        }
+        Ok(())
+    }
     fn notice(&mut self, text: &str) -> Result<(), String> {
         self.hide = Some(later(self.cfg.duration));
         self.overlay.tip(text, &self.cfg)
@@ -96,6 +111,9 @@ impl App {
         self.overlay.guides(self.overlay.mode(), &cfg)?;
         self.cfg = cfg;
         self.wait = None;
+        self.hold = None;
+        self.held_window = None;
+        self.refresh_preview()?;
         if restart {
             self.exit = Some(true);
             return Ok(());
@@ -235,10 +253,23 @@ impl App {
             input::ARMED => {
                 self.window = msg.wParam as HWND;
                 self.wait = Some(later(self.cfg.wait_ms));
+                self.refresh_preview()?;
                 self.status(&self.cfg.show.clone())
+            }
+            input::ALT_HOLD => {
+                self.hold = Some((later(self.cfg.double_ms), msg.wParam as HWND));
+                Ok(())
+            }
+            input::ALT_RELEASE => {
+                self.hold = None;
+                if self.held_window.take().is_some() {
+                    self.refresh_preview()?;
+                }
+                Ok(())
             }
             input::ACTION => {
                 self.wait = None;
+                self.refresh_preview()?;
                 self.clear();
                 if let Some(action) = self.cfg.keys.get(&(msg.wParam as u32)).cloned() {
                     self.act(&action)?
@@ -246,20 +277,22 @@ impl App {
                 Ok(())
             }
             input::TYPE => self.typed(msg.wParam as u32),
-            input::MOVE => self.overlay.follow(input::moved(), &self.cfg),
+            input::MOVE => {
+                let point = input::moved();
+                if self.preview.visible() {
+                    self.preview.follow(point, &self.cfg)?;
+                }
+                self.overlay.follow(point, &self.cfg)
+            }
             input::CLICK => {
                 let point = input::click_point(msg.lParam);
                 let screen = desktop::screen(point, 0)?;
                 let cell = screen.work.grid(point.x, point.y) as u32 + 1;
-                if let Some(preset) = [screen.number * 10, screen.number * 10 + cell, cell]
-                    .iter()
-                    .find_map(|id| self.cfg.grid.get(id))
-                    .filter(|name| !name.is_empty())
-                {
+                if let Some(preset) = self.cfg.cell(screen.number, cell) {
                     desktop::apply(
                         msg.wParam as HWND,
                         &Request {
-                            preset: Some(preset.clone()),
+                            preset: Some(preset.to_owned()),
                             ..Default::default()
                         },
                         &self.cfg,
@@ -271,6 +304,7 @@ impl App {
             }
             input::CANCEL => {
                 self.wait = None;
+                self.refresh_preview()?;
                 self.clear();
                 Ok(())
             }
@@ -289,8 +323,16 @@ impl App {
     }
     fn deadlines(&mut self) -> Result<(), String> {
         let now = Instant::now();
+        if let Some((when, hwnd)) = self.hold
+            && now >= when
+        {
+            self.hold = None;
+            self.held_window = Some(hwnd);
+            self.refresh_preview()?;
+        }
         if self.wait.is_some_and(|when| now >= when) {
             self.wait = None;
+            self.refresh_preview()?;
             if input::is_waiting() {
                 input::cancel();
             }
@@ -305,13 +347,18 @@ impl App {
         Ok(())
     }
     fn timeout(&self) -> u32 {
-        [self.wait, self.hide, self.reload]
-            .into_iter()
-            .flatten()
-            .min()
-            .map_or(INFINITE, |when| {
-                when.saturating_duration_since(Instant::now()).as_millis() as u32 + 1
-            })
+        [
+            self.wait,
+            self.hide,
+            self.reload,
+            self.hold.map(|(when, _)| when),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .map_or(INFINITE, |when| {
+            when.saturating_duration_since(Instant::now()).as_millis() as u32 + 1
+        })
     }
 }
 
@@ -343,6 +390,9 @@ pub fn run(path: &Path) -> Result<bool, String> {
             cfg,
             path: path.into(),
             overlay,
+            preview: Preview::new()?,
+            hold: None,
+            held_window: None,
             window: null_mut(),
             command: String::new(),
             help_line: 0,

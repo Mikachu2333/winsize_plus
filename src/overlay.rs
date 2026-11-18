@@ -55,9 +55,9 @@ unsafe extern "system" fn paint(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
         }
     }
 }
-struct Panel(HWND);
+pub(crate) struct Panel(pub HWND);
 impl Panel {
-    fn new() -> Result<Self, String> {
+    pub(crate) fn new() -> Result<Self, String> {
         unsafe {
             let hwnd = CreateWindowExW(
                 WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT,
@@ -80,14 +80,14 @@ impl Panel {
             }
         }
     }
-    fn style(&self, color: u32, alpha: u8) {
+    pub(crate) fn style(&self, color: u32, alpha: u8) {
         unsafe {
             SetWindowLongPtrW(self.0, GWLP_USERDATA, color as isize);
             SetLayeredWindowAttributes(self.0, 0, alpha, LWA_ALPHA);
             InvalidateRect(self.0, null(), 0);
         }
     }
-    fn show(&self, rect: Rect) {
+    pub(crate) fn show(&self, rect: Rect) {
         unsafe {
             if rect.width > 0 && rect.height > 0 {
                 SetWindowPos(
@@ -104,7 +104,7 @@ impl Panel {
             }
         }
     }
-    fn hide(&self) {
+    pub(crate) fn hide(&self) {
         unsafe {
             ShowWindow(self.0, SW_HIDE);
         }

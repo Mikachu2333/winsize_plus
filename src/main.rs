@@ -7,6 +7,7 @@ mod input;
 mod layout;
 mod logon;
 mod overlay;
+mod preview;
 mod resident;
 mod tray;
 

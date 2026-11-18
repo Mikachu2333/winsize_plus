@@ -56,6 +56,7 @@ pub struct Config {
     pub wait_ms: u32,
     pub elevate: bool,
     pub autostart: bool,
+    pub preview: bool,
     pub restart: bool,
     pub show: String,
     pub duration: u32,
@@ -147,6 +148,13 @@ fn is_builtin_action(name: &str) -> bool {
 }
 
 impl Config {
+    pub fn cell(&self, monitor: u32, cell: u32) -> Option<&str> {
+        [monitor * 10, monitor * 10 + cell, cell]
+            .iter()
+            .find_map(|key| self.grid.get(key))
+            .filter(|name| !name.is_empty())
+            .map(String::as_str)
+    }
     pub fn preset(&self, name_or_key: &str) -> Option<&Layout> {
         self.presets
             .get(&name_or_key.to_ascii_lowercase())
@@ -290,6 +298,7 @@ impl Config {
             wait_ms: number("general", "wait_ms", 100, 60000)? as u32,
             elevate: boolean("elevate")?,
             autostart: boolean("autostart")?,
+            preview: boolean("preview")?,
             restart: boolean("restart_on_change")?,
             show: choice("tip", "show", &["off", "time", "monitor"])?,
             duration: number("tip", "duration_ms", 100, 120000)? as u32,

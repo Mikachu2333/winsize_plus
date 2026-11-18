@@ -112,7 +112,7 @@ pub fn screen(point: POINT, wanted: u32) -> Result<Display, String> {
         })
     }
 }
-fn desktop() -> Rect {
+pub fn desktop() -> Rect {
     unsafe {
         Rect {
             x: GetSystemMetrics(SM_XVIRTUALSCREEN),
@@ -255,7 +255,7 @@ pub fn target(selector: &Selector) -> Result<HWND, String> {
     }
 }
 
-fn bounds(hwnd: HWND) -> Result<(Rect, Rect), String> {
+pub fn bounds(hwnd: HWND) -> Result<(Rect, Rect), String> {
     unsafe {
         let mut outer = RECT::default();
         check(GetWindowRect(hwnd, &mut outer))?;

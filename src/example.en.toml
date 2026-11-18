@@ -16,6 +16,7 @@ alt = "left"
 double_ms = 350
 wait_ms = 4000
 gesture = "left"
+preview = true # Show preset outlines while holding gesture Alt or waiting for a key after double Alt.
 # gesture selects the Alt side for right-click placement: left, right, both or off.
 elevate = false
 autostart = false # Register the current user's logon task. Turn off to remove it.

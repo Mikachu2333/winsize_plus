@@ -15,6 +15,8 @@ pub const TYPE: u32 = WM_APP + 3;
 pub const CLICK: u32 = WM_APP + 4;
 pub const MOVE: u32 = WM_APP + 5;
 pub const CANCEL: u32 = WM_APP + 6;
+pub const ALT_HOLD: u32 = WM_APP + 7;
+pub const ALT_RELEASE: u32 = WM_APP + 8;
 const LEFT: u32 = VK_LMENU as u32;
 const RIGHT: u32 = VK_RMENU as u32;
 
@@ -42,6 +44,8 @@ struct Input {
     command: [u64; 4],
     eaten: [u64; 4],
     guides: bool,
+    preview_enabled: bool,
+    preview_tracking: bool,
     mouse: HHOOK,
     click: bool,
     point: POINT,
@@ -67,7 +71,10 @@ fn post(message: u32, wp: usize, lp: isize) {
 impl Input {
     fn update_mouse(&mut self) -> Result<(), String> {
         unsafe {
-            let needed = self.guides || self.click || self.pressed & self.gesture_mask != 0;
+            let needed = self.guides
+                || self.preview_tracking
+                || self.click
+                || self.pressed & self.gesture_mask != 0;
             if needed && self.mouse.is_null() {
                 self.mouse =
                     SetWindowsHookExW(WH_MOUSE_LL, Some(mouse), GetModuleHandleW(null()), 0);
@@ -101,6 +108,9 @@ impl Input {
                 }
                 if self.pressed & self.gesture_mask == 0 && side & self.gesture_mask != 0 {
                     self.gesture_target = unsafe { GetForegroundWindow() };
+                    if self.preview_enabled {
+                        post(ALT_HOLD, self.gesture_target as usize, 0);
+                    }
                 }
                 self.pressed |= side;
                 let clean = self.pressed == side
@@ -119,6 +129,12 @@ impl Input {
                 return self.second;
             }
             self.pressed &= !side;
+            if self.preview_enabled
+                && side & self.gesture_mask != 0
+                && self.pressed & self.gesture_mask == 0
+            {
+                post(ALT_RELEASE, 0, 0);
+            }
             let _ = self.update_mouse();
             let consumed = self.second;
             self.second = false;
@@ -226,7 +242,7 @@ unsafe extern "system" fn mouse(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
             let eaten = INPUT.with(|cell| {
                 cell.try_borrow_mut()
                     .is_ok_and(|mut input| match wp as u32 {
-                        WM_MOUSEMOVE if input.guides => {
+                        WM_MOUSEMOVE if input.guides || input.preview_tracking => {
                             input.point = data.pt;
                             if !input.queued {
                                 input.queued = true;
@@ -297,6 +313,12 @@ pub fn set_guides(on: bool) -> Result<(), String> {
         input.update_mouse()
     })
 }
+pub fn track_preview(on: bool) -> Result<(), String> {
+    INPUT.with_borrow_mut(|input| {
+        input.preview_tracking = on;
+        input.update_mouse()
+    })
+}
 pub fn configure(cfg: &Config) -> Result<(), String> {
     INPUT.with_borrow_mut(|input| {
         input.mode = Mode::Idle;
@@ -304,6 +326,7 @@ pub fn configure(cfg: &Config) -> Result<(), String> {
         input.last_tap = None;
         input.alt_mask = mask(&cfg.alt);
         input.gesture_mask = mask(&cfg.gesture);
+        input.preview_enabled = cfg.preview;
         input.double_ms = cfg.double_ms;
         input.wait_ms = cfg.wait_ms;
         input.command = [0; 4];

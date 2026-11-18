@@ -15,6 +15,7 @@ alt = "left"
 double_ms = 350
 wait_ms = 4000
 gesture = "left"
+preview = true # 长按手势 Alt 或双击 Alt 等待按键时显示预设边框。
 # gesture 指定右键摆放时的 Alt 侧，可设为 left、right、both 或 off。
 elevate = false
 autostart = false # 开启时注册当前用户的登录任务，关闭时自动移除。
