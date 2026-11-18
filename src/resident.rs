@@ -221,6 +221,12 @@ impl App {
     }
     fn event(&mut self, msg: MSG) -> Result<(), String> {
         match msg.message {
+            crate::tray::MENU => {
+                if let Some(action) = self.overlay.tray.menu(&self.cfg, msg.lParam)? {
+                    self.act(action)?;
+                }
+                Ok(())
+            }
             input::ARMED => {
                 self.window = msg.wParam as HWND;
                 self.wait = Some(later(self.cfg.wait_ms));

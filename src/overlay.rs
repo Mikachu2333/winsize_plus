@@ -2,6 +2,7 @@ use crate::{
     config::Config,
     desktop::{self, Display, check, err, wide},
     layout::Rect,
+    tray::{APP_ICON, Tray},
 };
 use std::ptr::{null, null_mut};
 use windows_sys::{
@@ -108,6 +109,20 @@ impl Panel {
             ShowWindow(self.0, SW_HIDE);
         }
     }
+    fn round(&self, width: i32, height: i32, radius: i32) -> Result<(), String> {
+        unsafe {
+            let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, radius, radius);
+            if region.is_null() {
+                return Err(err());
+            }
+            if SetWindowRgn(self.0, region, 1) == 0 {
+                let problem = err();
+                DeleteObject(region);
+                return Err(problem);
+            }
+            Ok(())
+        }
+    }
 }
 impl Drop for Panel {
     fn drop(&mut self) {
@@ -117,7 +132,9 @@ impl Drop for Panel {
     }
 }
 pub struct Overlay {
+    pub tray: Tray,
     tip: Panel,
+    shadow: Panel,
     font: HFONT,
     segments: Vec<Panel>,
     mode: u8,
@@ -146,17 +163,22 @@ fn dark() -> bool {
 impl Overlay {
     pub fn new() -> Result<Self, String> {
         unsafe {
+            let instance = GetModuleHandleW(null());
             let cls = WNDCLASSW {
                 lpfnWndProc: Some(paint),
-                hInstance: GetModuleHandleW(null()),
+                hInstance: instance,
+                hIcon: LoadIconW(instance, APP_ICON),
                 lpszClassName: CLASS,
                 ..Default::default()
             };
             if RegisterClassW(&cls) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS {
                 return Err(err());
             }
+            let tip = Panel::new()?;
             Ok(Self {
-                tip: Panel::new()?,
+                tray: Tray::new()?,
+                shadow: Panel::new()?,
+                tip,
                 font: null_mut(),
                 segments: Vec::new(),
                 mode: 0,
@@ -166,7 +188,8 @@ impl Overlay {
         }
     }
     pub fn hide_tip(&self) {
-        self.tip.hide()
+        self.tip.hide();
+        self.shadow.hide()
     }
     pub fn tip(&mut self, text: &str, cfg: &Config) -> Result<(), String> {
         unsafe {
@@ -236,12 +259,21 @@ impl Overlay {
             self.tip.style(cfg.colors[index], 255);
             let width = (size.right + 4 * padding).min(screen.work.width);
             let height = (size.bottom + 2 * padding).min(screen.work.height);
-            self.tip.show(Rect {
+            let rect = Rect {
                 x: screen.work.x + (screen.work.width - width) / 2,
                 y: screen.work.y + screen.work.height - height - scale(6, dpi),
                 width,
                 height,
+            };
+            let radius = scale(12, dpi);
+            self.tip.round(width, height, radius)?;
+            self.shadow.round(width, height, radius)?;
+            self.shadow.style(0, 70);
+            self.shadow.show(Rect {
+                y: rect.y + scale(3, dpi),
+                ..rect
             });
+            self.tip.show(rect);
             Ok(())
         }
     }
