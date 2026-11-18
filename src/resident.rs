@@ -1,0 +1,378 @@
+use crate::{
+    cli::{Request, Switch},
+    config::{self, Config},
+    desktop::{self, err, wide},
+    input,
+    overlay::Overlay,
+};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    ptr::{null, null_mut},
+    time::{Duration, Instant},
+};
+use windows_sys::{
+    Win32::{
+        Foundation::*,
+        Storage::FileSystem::*,
+        System::{SystemInformation::GetLocalTime, Threading::*},
+        UI::WindowsAndMessaging::*,
+    },
+    core::w,
+};
+
+struct Watch(HANDLE);
+impl Drop for Watch {
+    fn drop(&mut self) {
+        unsafe {
+            FindCloseChangeNotification(self.0);
+        }
+    }
+}
+struct Instance(HANDLE);
+impl Drop for Instance {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.0);
+        }
+    }
+}
+fn later(ms: u32) -> Instant {
+    Instant::now() + Duration::from_millis(ms.into())
+}
+struct App {
+    cfg: Config,
+    path: PathBuf,
+    overlay: Overlay,
+    window: HWND,
+    command: String,
+    help_line: usize,
+    hide: Option<Instant>,
+    wait: Option<Instant>,
+    reload: Option<Instant>,
+    snapshot: Option<Vec<u8>>,
+    exit: Option<bool>,
+}
+impl App {
+    fn notice(&mut self, text: &str) -> Result<(), String> {
+        self.hide = Some(later(self.cfg.duration));
+        self.overlay.tip(text, &self.cfg)
+    }
+    fn status(&mut self, kind: &str) -> Result<(), String> {
+        match kind {
+            "monitor" => {
+                let number = desktop::screen(desktop::cursor()?, 0)?.number;
+                self.notice(&format!("{} {number}", self.cfg.tr("Monitor", "屏幕")))
+            }
+            "time" => {
+                let mut time = SYSTEMTIME::default();
+                unsafe { GetLocalTime(&mut time) };
+                self.notice(&format!(
+                    "{:02}:{:02}:{:02}",
+                    time.wHour, time.wMinute, time.wSecond
+                ))
+            }
+            _ => {
+                self.clear();
+                Ok(())
+            }
+        }
+    }
+    fn clear(&mut self) {
+        self.hide = None;
+        self.overlay.hide_tip()
+    }
+    fn load(&mut self, automatic: bool) -> Result<(), String> {
+        let bytes = fs::read(&self.path).ok();
+        if automatic && bytes.is_some() && bytes == self.snapshot {
+            return Ok(());
+        }
+        let cfg = config::load(&self.path, None)?;
+        self.snapshot = bytes;
+        let restart = automatic && (cfg.restart || cfg.elevate != self.cfg.elevate);
+        input::configure(&cfg)?;
+        self.overlay.guides(self.overlay.mode(), &cfg)?;
+        self.cfg = cfg;
+        self.wait = None;
+        if restart {
+            self.exit = Some(true);
+            return Ok(());
+        }
+        self.notice(self.cfg.tr("Configuration reloaded", "配置已重载"))
+    }
+    fn act(&mut self, action: &str) -> Result<(), String> {
+        match action {
+            "time" | "monitor" => self.status(action),
+            "version" => self.notice(concat!("WinSizeP ", env!("CARGO_PKG_VERSION"))),
+            "help" => {
+                let lines: Vec<_> = config::HELP
+                    .lines()
+                    .filter(|line| !line.trim().is_empty())
+                    .collect();
+                let pages = lines.len().div_ceil(8);
+                let page = self.help_line % pages;
+                self.help_line = page + 1;
+                self.notice(&format!(
+                    "{}  {}/{}\n{}",
+                    self.cfg.tr("Help", "帮助"),
+                    page + 1,
+                    pages,
+                    lines[page * 8..lines.len().min((page + 1) * 8)]
+                        .iter()
+                        .map(|line| line.trim_start_matches('#').trim())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ))
+            }
+            "command" => {
+                input::command_mode();
+                self.command.clear();
+                self.hide = None;
+                self.overlay.tip(": ▏", &self.cfg)
+            }
+            "reload" => self.load(false),
+            "restart" | "quit" => {
+                self.exit = Some(action == "restart");
+                Ok(())
+            }
+            "guide" | "cross" | "horizontal" | "vertical" => {
+                let current = self.overlay.mode();
+                let wanted = match action {
+                    "horizontal" => 1,
+                    "vertical" => 2,
+                    _ => 3,
+                };
+                let mode = if wanted == current || (action == "guide" && current != 0) {
+                    0
+                } else {
+                    wanted
+                };
+                self.overlay.guides(mode, &self.cfg)?;
+                input::set_guides(mode != 0)
+            }
+            name if self.cfg.presets.contains_key(name) || matches!(name, "top" | "ignore") => {
+                let req = match name {
+                    "top" => Request {
+                        top: Some(Switch::Toggle),
+                        ..Default::default()
+                    },
+                    "ignore" => Request {
+                        ignore: Some(Switch::Toggle),
+                        ..Default::default()
+                    },
+                    _ => Request {
+                        preset: Some(name.into()),
+                        ..Default::default()
+                    },
+                };
+                desktop::apply(self.window, &req, &self.cfg, &self.path, desktop::cursor()?)?;
+                if name == "ignore" {
+                    self.cfg = config::load(&self.path, None)?;
+                    let id = desktop::identity(self.window);
+                    let excluded = self.cfg.exclusions.iter().any(|rule| rule.matches(&id));
+                    self.notice(if excluded {
+                        self.cfg.tr("Excluded", "已排除")
+                    } else {
+                        self.cfg.tr("Included", "已取消排除")
+                    })?
+                }
+                Ok(())
+            }
+            _ => Err(format!(
+                "{}: {action}",
+                self.cfg.tr("Unknown command", "未知命令")
+            )),
+        }
+    }
+    fn typed(&mut self, key: u32) -> Result<(), String> {
+        match key {
+            13 => {
+                let text = std::mem::take(&mut self.command);
+                let name = text.trim();
+                self.clear();
+                if name.is_empty() {
+                    return Ok(());
+                }
+                let action = self
+                    .cfg
+                    .commands
+                    .get(name)
+                    .map(String::as_str)
+                    .unwrap_or(name)
+                    .to_string();
+                return self.act(&action);
+            }
+            27 => {
+                self.command.clear();
+                self.clear();
+                return Ok(());
+            }
+            8 => {
+                self.command.pop();
+            }
+            _ if self.command.len() < 80 => {
+                if let Some(ch) = char::from_u32(key) {
+                    self.command.push(ch)
+                }
+            }
+            _ => {}
+        }
+        self.overlay.tip(&format!(": {}▏", self.command), &self.cfg)
+    }
+    fn event(&mut self, msg: MSG) -> Result<(), String> {
+        match msg.message {
+            input::ARMED => {
+                self.window = msg.wParam as HWND;
+                self.wait = Some(later(self.cfg.wait_ms));
+                self.status(&self.cfg.show.clone())
+            }
+            input::ACTION => {
+                self.wait = None;
+                self.clear();
+                if let Some(action) = self.cfg.keys.get(&(msg.wParam as u32)).cloned() {
+                    self.act(&action)?
+                }
+                Ok(())
+            }
+            input::TYPE => self.typed(msg.wParam as u32),
+            input::MOVE => self.overlay.follow(input::moved(), &self.cfg),
+            input::CLICK => {
+                let point = input::click_point(msg.lParam);
+                let screen = desktop::screen(point, 0)?;
+                let cell = screen.work.grid(point.x, point.y) as u32 + 1;
+                if let Some(preset) = [screen.number * 10, screen.number * 10 + cell, cell]
+                    .iter()
+                    .find_map(|id| self.cfg.grid.get(id))
+                    .filter(|name| !name.is_empty())
+                {
+                    desktop::apply(
+                        desktop::clicked_target(msg.wParam as HWND),
+                        &Request {
+                            preset: Some(preset.clone()),
+                            ..Default::default()
+                        },
+                        &self.cfg,
+                        &self.path,
+                        point,
+                    )?
+                }
+                Ok(())
+            }
+            input::CANCEL => {
+                self.wait = None;
+                self.clear();
+                Ok(())
+            }
+            WM_QUIT => {
+                self.exit = Some(false);
+                Ok(())
+            }
+            _ => {
+                unsafe {
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+                Ok(())
+            }
+        }
+    }
+    fn deadlines(&mut self) -> Result<(), String> {
+        let now = Instant::now();
+        if self.wait.is_some_and(|when| now >= when) {
+            self.wait = None;
+            if input::is_waiting() {
+                input::cancel();
+            }
+        }
+        if self.hide.is_some_and(|when| now >= when) {
+            self.clear()
+        }
+        if self.reload.is_some_and(|when| now >= when) {
+            self.reload = None;
+            self.load(true)?
+        }
+        Ok(())
+    }
+    fn timeout(&self) -> u32 {
+        [self.wait, self.hide, self.reload]
+            .into_iter()
+            .flatten()
+            .min()
+            .map_or(INFINITE, |when| {
+                when.saturating_duration_since(Instant::now()).as_millis() as u32 + 1
+            })
+    }
+}
+
+pub fn run(path: &Path) -> Result<bool, String> {
+    unsafe {
+        let handle = CreateMutexW(null(), 0, w!("Local\\WinSizeP.Resident.v1"));
+        if handle.is_null() {
+            return Err(err());
+        }
+        let status = GetLastError();
+        let _instance = Instance(handle);
+        if status == ERROR_ALREADY_EXISTS {
+            return Ok(false);
+        }
+        let watch = FindFirstChangeNotificationW(
+            wide(path.parent().ok_or("Config directory")?).as_ptr(),
+            0,
+            FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE,
+        );
+        if watch == INVALID_HANDLE_VALUE {
+            return Err(err());
+        }
+        let watch = Watch(watch);
+        let snapshot = fs::read(path).ok();
+        let cfg = config::load(path, None)?;
+        let overlay = Overlay::new()?;
+        let _hooks = input::Hooks::start(&cfg)?;
+        let mut app = App {
+            cfg,
+            path: path.into(),
+            overlay,
+            window: null_mut(),
+            command: String::new(),
+            help_line: 0,
+            hide: None,
+            wait: None,
+            reload: None,
+            snapshot,
+            exit: None,
+        };
+        let mut msg = MSG::default();
+        loop {
+            if let Err(problem) = app.deadlines() {
+                let _ = app.notice(&problem);
+            }
+            if let Some(restart) = app.exit {
+                return Ok(restart);
+            }
+            match MsgWaitForMultipleObjectsEx(
+                1,
+                &watch.0,
+                app.timeout(),
+                QS_ALLINPUT,
+                MWMO_INPUTAVAILABLE,
+            ) {
+                WAIT_OBJECT_0 => {
+                    desktop::check(FindNextChangeNotification(watch.0))?;
+                    app.reload = Some(later(160));
+                }
+                value if value == WAIT_OBJECT_0 + 1 => {
+                    while PeekMessageW(&mut msg, null_mut(), 0, 0, PM_REMOVE) != 0 {
+                        if let Err(problem) = app.event(msg) {
+                            let _ = app.notice(&problem);
+                        }
+                        if app.exit.is_some() {
+                            break;
+                        }
+                    }
+                }
+                WAIT_TIMEOUT => {}
+                _ => return Err(err()),
+            }
+        }
+    }
+}
