@@ -30,8 +30,7 @@ struct Input {
     mode: Mode,
     alt_mask: u8,
     gesture_mask: u8,
-    gesture_down: u32,
-    captured_up: u32,
+    gesture_target: HWND,
     double_ms: u32,
     wait_ms: u32,
     last_tap: Option<(u32, u32)>,
@@ -99,6 +98,9 @@ impl Input {
             if down {
                 if self.pressed & side != 0 {
                     return self.second;
+                }
+                if self.pressed & self.gesture_mask == 0 && side & self.gesture_mask != 0 {
+                    self.gesture_target = unsafe { GetForegroundWindow() };
                 }
                 self.pressed |= side;
                 let clean = self.pressed == side
@@ -232,22 +234,18 @@ unsafe extern "system" fn mouse(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
                             }
                             false
                         }
-                        message
-                            if message == input.gesture_down
-                                && input.pressed & input.gesture_mask != 0 =>
-                        {
+                        WM_RBUTTONDOWN if input.pressed & input.gesture_mask != 0 => {
                             input.tap = None;
                             input.last_tap = None;
                             input.click = true;
-                            input.captured_up = message + 1;
-                            let hwnd = GetAncestor(WindowFromPoint(data.pt), GA_ROOT);
+                            let hwnd = input.gesture_target;
                             let coords =
                                 (data.pt.x as u32 as u64) | ((data.pt.y as u32 as u64) << 32);
                             CLICK_POS.with(|point| point.set((data.pt, hwnd)));
                             post(CLICK, hwnd as usize, coords as isize);
                             true
                         }
-                        message if input.click && message == input.captured_up => {
+                        WM_RBUTTONUP if input.click => {
                             input.click = false;
                             let _ = input.update_mouse();
                             true
@@ -306,11 +304,6 @@ pub fn configure(cfg: &Config) -> Result<(), String> {
         input.last_tap = None;
         input.alt_mask = mask(&cfg.alt);
         input.gesture_mask = mask(&cfg.gesture);
-        input.gesture_down = match cfg.gesture_button.as_str() {
-            "left" => WM_LBUTTONDOWN,
-            "middle" => WM_MBUTTONDOWN,
-            _ => WM_RBUTTONDOWN,
-        };
         input.double_ms = cfg.double_ms;
         input.wait_ms = cfg.wait_ms;
         input.command = [0; 4];

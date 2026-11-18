@@ -90,7 +90,7 @@ fn run() -> Result<(), String> {
     let path = config::path()?;
     match values.as_slice() {
         ["--version" | "-V"] => println!("WinSizeP {}", env!("CARGO_PKG_VERSION")),
-        ["--help" | "-h"] => print!("{}", config::HELP),
+        ["--help" | "-h"] => print!("{}", config::help()),
         ["--export-logon-task", file] => {
             logon::export(std::path::Path::new(file))?;
             println!("Import in Task Scheduler / 请在任务计划程序中导入 {file}");

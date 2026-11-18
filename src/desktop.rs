@@ -168,14 +168,6 @@ pub fn identity(hwnd: HWND) -> Identity {
         title: title(hwnd),
     }
 }
-pub fn clicked_target(hwnd: HWND) -> HWND {
-    if matches!(class(hwnd).as_str(), "WorkerW" | "Progman") {
-        unsafe { GetForegroundWindow() }
-    } else {
-        hwnd
-    }
-}
-
 fn eligible(hwnd: HWND) -> bool {
     unsafe {
         if hwnd.is_null()

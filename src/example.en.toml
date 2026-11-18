@@ -1,0 +1,111 @@
+# WinSizeP configuration and keyboard reference
+# Run winsizep to start. Double-tap the same Alt, then press QWE / ASD / ZXC.
+# S centers the foreground window at 80% of the work area. Hold Alt and right-click
+# a cell on any display to place the window that was active when you pressed Alt.
+# Double-tap Alt and press grave to enter a command. Enter runs it, Esc cancels.
+# winsizep --pid 123 -l 100 200 --size 900,600
+# winsizep --name notepad.exe --preset w --x -1200 --top on
+# Combine --pid, --class, --name, --hwnd and --title filters or use the foreground window.
+# --preset accepts names and active layout keys. Explicit coordinates override the preset.
+# --size and --location accept comma or space separated pairs. --top and --ignore accept on/off/toggle.
+# --help prints this example. --check validates the configuration. --version prints the version.
+# Choose auto, zh-CN or en for the interface. Tap the same left/right Alt twice (both permits either).
+[general]
+language = "auto"
+alt = "left"
+double_ms = 350
+wait_ms = 4000
+gesture = "left"
+# gesture selects the Alt side for right-click placement: left, right, both or off.
+elevate = false
+restart_on_change = false
+# Times are in ms. elevate requests administrator rights. restart_on_change restarts after a valid edit.
+
+# Show monitor, time or off. Duration is in ms. Choose system, light or dark colors. Font size is in logical pixels.
+[tip]
+show = "monitor"
+duration_ms = 4000
+theme = "system"
+background = "#F2F2F2"
+foreground = "#000000"
+dark_background = "#303030"
+dark_foreground = "#F2F2F2"
+font = "Microsoft YaHei UI"
+font_size = 16
+
+# Each crosshair axis has its own DPI-scaled width and gap radius, RGB color and opacity from 0 to 255.
+[horizontal]
+width = 2
+color = "#CCCC00"
+opacity = 160
+gap = 12
+[vertical]
+width = 2
+color = "#CCCC00"
+opacity = 160
+gap = 12
+
+# Format x|y|width|height[|monitor]. sw/sh = work area, ww/wh = window, vw/vh = virtual desktop.
+# 50sw-8 means half the width minus 8 px. vw/vh use the virtual desktop origin. Monitor 0 follows the pointer.
+[presets]
+LeftTop = "0|0|50sw|50sh"
+FullTop = "0|0|100sw|50sh"
+RightTop = "50sw|0|50sw|50sh"
+FullLeft = "0|0|50sw|100sh"
+Center = "10sw|10sh|80sw|80sh"
+FullRight = "50sw|0|50sw|100sh"
+LeftBottom = "0|50sh|50sw|50sh"
+FullBottom = "0|50sh|100sw|50sh"
+RightBottom = "50sw|50sh|50sw|50sh"
+
+# After double Alt use letters, digits, F1..F24, keyboard vk:XX or punctuation names. An empty value disables the key.
+[keys]
+q = "LeftTop"
+w = "FullTop"
+e = "RightTop"
+a = "FullLeft"
+s = "Center"
+d = "FullRight"
+z = "LeftBottom"
+x = "FullBottom"
+c = "RightBottom"
+p = "top"
+u = "ignore"
+g = "guide"
+minus = "horizontal"
+equal = "cross"
+backslash = "vertical"
+grave = "command"
+F1 = "help"
+
+# Map an ASCII command word to a preset or action. You can also type a preset name directly.
+[commands]
+asdf = "Center"
+version = "version"
+help = "help"
+reload = "reload"
+reboot = "restart"
+quit = "quit"
+pin = "top"
+exclude = "ignore"
+time = "time"
+screen = "monitor"
+g = "guide"
+
+# Grid lookup order: display number × 10, then that number + cell, then the cell alone (1..9).
+[grid]
+1 = "LeftTop"
+2 = "FullTop"
+3 = "RightTop"
+4 = "FullLeft"
+5 = "Center"
+6 = "FullRight"
+7 = "LeftBottom"
+8 = "FullBottom"
+9 = "RightBottom"
+
+# Exclusions match every nonempty field. --ignore on records the process name, class and title.
+# [[exclusions]]
+# name = "notepad.exe"
+# class = "Notepad"
+# title = ""

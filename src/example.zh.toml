@@ -1,0 +1,110 @@
+# WinSizeP 配置与快捷键帮助
+# 运行 winsizep 启动。双击同一侧 Alt，再按 QWE / ASD / ZXC 摆放前台窗口。
+# S 将宽高都设为工作区的 80% 并居中。按住 Alt，在任意屏幕右击目标格，移动按下 Alt 时的前台窗口。
+# 双击 Alt 后按反撇号打开指令框，回车执行，Esc 取消。
+# winsizep --pid 123 -l 100 200 --size 900,600
+# winsizep --name notepad.exe --preset w --x -1200 --top on
+# --pid、--class、--name、--hwnd、--title 可组合筛选窗口，省略时使用前台窗口。
+# --preset 接受名称或绑定布局的按键，直接设置的坐标优先。
+# --size 和 --location 的两个值可以用空格或逗号分隔。--top 和 --ignore 接受 on/off/toggle。
+# --help 打印本示例，--check 校验配置，--version 显示版本号。
+# 界面语言可选 auto、zh-CN、en。alt 指定可双击的 Alt 侧，both 允许左右任一侧。
+[general]
+language = "auto"
+alt = "left"
+double_ms = 350
+wait_ms = 4000
+gesture = "left"
+# gesture 指定右键摆放时的 Alt 侧，可设为 left、right、both 或 off。
+elevate = false
+restart_on_change = false
+# 双击间隔和等待按键时间的单位均为毫秒。elevate 请求管理员权限，restart_on_change 在配置更新后重启。
+
+# show 可选 monitor、time、off。停留时间以毫秒计，主题可选 system、light、dark，字号以逻辑像素计。
+[tip]
+show = "monitor"
+duration_ms = 4000
+theme = "system"
+background = "#F2F2F2"
+foreground = "#000000"
+dark_background = "#303030"
+dark_foreground = "#F2F2F2"
+font = "Microsoft YaHei UI"
+font_size = 16
+
+# 十字线两轴可分别设置随 DPI 缩放的宽度、缺口半径、RGB 颜色和透明度（0 到 255）。
+[horizontal]
+width = 2
+color = "#CCCC00"
+opacity = 160
+gap = 12
+[vertical]
+width = 2
+color = "#CCCC00"
+opacity = 160
+gap = 12
+
+# 格式为 x|y|宽|高[|屏号]。sw/sh 为工作区宽高，ww/wh 为当前窗口宽高，vw/vh 为虚拟桌面宽高。
+# 50sw-8 表示半屏宽减 8 像素。含 vw/vh 时相对虚拟桌面原点。屏号 0 取鼠标所在屏。
+[presets]
+LeftTop = "0|0|50sw|50sh"
+FullTop = "0|0|100sw|50sh"
+RightTop = "50sw|0|50sw|50sh"
+FullLeft = "0|0|50sw|100sh"
+Center = "10sw|10sh|80sw|80sh"
+FullRight = "50sw|0|50sw|100sh"
+LeftBottom = "0|50sh|50sw|50sh"
+FullBottom = "0|50sh|100sw|50sh"
+RightBottom = "50sw|50sh|50sw|50sh"
+
+# 双击 Alt 后使用字母、数字、F1 至 F24、键盘虚拟键码 vk:XX 或标点键名。设为空字符串可禁用绑定。
+[keys]
+q = "LeftTop"
+w = "FullTop"
+e = "RightTop"
+a = "FullLeft"
+s = "Center"
+d = "FullRight"
+z = "LeftBottom"
+x = "FullBottom"
+c = "RightBottom"
+p = "top"
+u = "ignore"
+g = "guide"
+minus = "horizontal"
+equal = "cross"
+backslash = "vertical"
+grave = "command"
+F1 = "help"
+
+# 将自定义指令词映射到预设或动作，也可以直接键入预设名。
+[commands]
+asdf = "Center"
+version = "version"
+help = "help"
+reload = "reload"
+reboot = "restart"
+quit = "quit"
+pin = "top"
+exclude = "ignore"
+time = "time"
+screen = "monitor"
+g = "guide"
+
+# 格子从左上到右下编号 1 到 9。优先使用屏号乘十，再查屏号乘十加格号，最后查通用格号。
+[grid]
+1 = "LeftTop"
+2 = "FullTop"
+3 = "RightTop"
+4 = "FullLeft"
+5 = "Center"
+6 = "FullRight"
+7 = "LeftBottom"
+8 = "FullBottom"
+9 = "RightBottom"
+
+# 排除项要求所有非空字段同时匹配。--ignore on 记录进程名、类名和标题。
+# [[exclusions]]
+# name = "notepad.exe"
+# class = "Notepad"
+# title = ""

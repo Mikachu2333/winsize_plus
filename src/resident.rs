@@ -105,7 +105,7 @@ impl App {
             "time" | "monitor" => self.status(action),
             "version" => self.notice(concat!("WinSizeP ", env!("CARGO_PKG_VERSION"))),
             "help" => {
-                let lines: Vec<_> = config::HELP
+                let lines: Vec<_> = config::help()
                     .lines()
                     .filter(|line| !line.trim().is_empty())
                     .collect();
@@ -252,7 +252,7 @@ impl App {
                     .filter(|name| !name.is_empty())
                 {
                     desktop::apply(
-                        desktop::clicked_target(msg.wParam as HWND),
+                        msg.wParam as HWND,
                         &Request {
                             preset: Some(preset.clone()),
                             ..Default::default()

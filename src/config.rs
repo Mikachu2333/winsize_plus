@@ -12,11 +12,20 @@ use windows_sys::Win32::{
 };
 use windows_sys::core::w;
 
-pub const HELP: &str = include_str!("example.toml");
+fn system_zh() -> bool {
+    (unsafe { GetUserDefaultUILanguage() } & 0x3ff) == 4
+}
+pub fn help() -> &'static str {
+    if system_zh() {
+        include_str!("example.zh.toml")
+    } else {
+        include_str!("example.en.toml")
+    }
+}
 pub fn path() -> Result<PathBuf, String> {
     Ok(std::env::current_exe()
         .map_err(|err| err.to_string())?
-        .with_file_name("winsizep_config"))
+        .with_file_name("winsizep_config.toml"))
 }
 
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -43,7 +52,6 @@ pub struct Config {
     pub zh: bool,
     pub alt: String,
     pub gesture: String,
-    pub gesture_button: String,
     pub double_ms: u32,
     pub wait_ms: u32,
     pub elevate: bool,
@@ -76,7 +84,7 @@ pub fn vk(text: &str) -> Option<u32> {
     if let Some(number) = text.strip_prefix("vk:") {
         return u32::from_str_radix(number, 16)
             .ok()
-            .filter(|number| (1..255).contains(number));
+            .filter(|number| (7..255).contains(number) || *number == 3);
     }
     Some(match text.as_str() {
         "grave" | "`" | "~" | "～" => 0xc0,
@@ -274,11 +282,9 @@ impl Config {
         }
         let language = choice("general", "language", &["auto", "zh-CN", "en"])?;
         Ok(Self {
-            zh: language == "zh-CN"
-                || (language == "auto" && unsafe { GetUserDefaultUILanguage() } & 0x3ff == 4),
+            zh: language == "zh-CN" || (language == "auto" && system_zh()),
             alt: choice("general", "alt", &["left", "right", "both"])?,
             gesture: choice("general", "gesture", &["left", "right", "both", "off"])?,
-            gesture_button: choice("general", "gesture_button", &["right", "middle", "left"])?,
             double_ms: number("general", "double_ms", 50, 2000)? as u32,
             wait_ms: number("general", "wait_ms", 100, 60000)? as u32,
             elevate: boolean("elevate")?,
@@ -375,12 +381,24 @@ pub fn load(path: &Path, edit: Option<(&Identity, Switch)>) -> Result<Config, St
     let _lock = lock()?;
     let (text, new) = match fs::read(path) {
         Ok(bytes) => (decode(&bytes)?, false),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => (HELP.into(), true),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            let legacy = path.with_file_name("winsizep_config");
+            match fs::read(legacy) {
+                Ok(bytes) => (decode(&bytes)?, true),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => (help().into(), true),
+                Err(err) => return Err(err.to_string()),
+            }
+        }
         Err(err) => return Err(err.to_string()),
     };
     let mut doc = text.parse::<DocumentMut>().map_err(|err| err.to_string())?;
-    let defaults = HELP.parse::<DocumentMut>().map_err(|err| err.to_string())?;
-    let mut changed = new || merge(doc.as_table_mut(), defaults.as_table(), false);
+    let defaults = help()
+        .parse::<DocumentMut>()
+        .map_err(|err| err.to_string())?;
+    let mut changed = merge(doc.as_table_mut(), defaults.as_table(), false) || new;
+    if let Some(general) = doc.get_mut("general").and_then(Item::as_table_mut) {
+        changed |= general.remove("gesture_button").is_some();
+    }
     let mut config = Config::parse(&doc)?;
     if let Some((id, switch)) = edit {
         let matches: Vec<_> = config
