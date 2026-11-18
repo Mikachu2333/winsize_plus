@@ -2,6 +2,7 @@ use crate::{
     cli::{Request, Switch},
     config::{self, Config},
     desktop::{self, err, wide},
+    framerate::FrameClock,
     input,
     overlay::Overlay,
     preview::Preview,
@@ -45,6 +46,7 @@ struct App {
     cfg: Config,
     path: PathBuf,
     overlay: Overlay,
+    frames: FrameClock,
     preview: Preview,
     hold: Option<(Instant, HWND)>,
     held_window: Option<HWND>,
@@ -108,6 +110,7 @@ impl App {
             !automatic || (cfg.autostart, cfg.elevate) != (self.cfg.autostart, self.cfg.elevate);
         let restart = automatic && (cfg.restart || cfg.elevate != self.cfg.elevate);
         input::configure(&cfg)?;
+        self.frames.reset(cfg.fps);
         self.overlay.guides(self.overlay.mode(), &cfg)?;
         self.cfg = cfg;
         self.wait = None;
@@ -171,6 +174,7 @@ impl App {
                     wanted
                 };
                 self.overlay.guides(mode, &self.cfg)?;
+                self.frames.reset(self.cfg.fps);
                 input::set_guides(mode != 0)
             }
             name if self.cfg.presets.contains_key(name) || matches!(name, "top" | "ignore") => {
@@ -282,7 +286,12 @@ impl App {
                 if self.preview.visible() {
                     self.preview.follow(point, &self.cfg)?;
                 }
-                self.overlay.follow(point, &self.cfg)
+                if self.overlay.mode() != 0
+                    && let Some(frame) = self.frames.moved(point)?
+                {
+                    self.overlay.follow(frame, &self.cfg)?;
+                }
+                Ok(())
             }
             input::CLICK => {
                 let point = input::click_point(msg.lParam);
@@ -387,6 +396,7 @@ pub fn run(path: &Path) -> Result<bool, String> {
         let overlay = Overlay::new()?;
         let _hooks = input::Hooks::start(&cfg)?;
         let mut app = App {
+            frames: FrameClock::new(cfg.fps)?,
             cfg,
             path: path.into(),
             overlay,
@@ -414,8 +424,8 @@ pub fn run(path: &Path) -> Result<bool, String> {
                 return Ok(restart);
             }
             match MsgWaitForMultipleObjectsEx(
-                1,
-                &watch.0,
+                2,
+                [watch.0, app.frames.handle()].as_ptr(),
                 app.timeout(),
                 QS_ALLINPUT,
                 MWMO_INPUTAVAILABLE,
@@ -425,7 +435,17 @@ pub fn run(path: &Path) -> Result<bool, String> {
                     app.reload = Some(later(160));
                 }
                 value if value == WAIT_OBJECT_0 + 1 => {
-                    while PeekMessageW(&mut msg, null_mut(), 0, 0, PM_REMOVE) != 0 {
+                    if let Some(point) = app.frames.tick()
+                        && let Err(problem) = app.overlay.follow(point, &app.cfg)
+                    {
+                        let _ = app.notice(&problem);
+                    }
+                }
+                value if value == WAIT_OBJECT_0 + 2 => {
+                    for _ in 0..64 {
+                        if PeekMessageW(&mut msg, null_mut(), 0, 0, PM_REMOVE) == 0 {
+                            break;
+                        }
                         if let Err(problem) = app.event(msg) {
                             let _ = app.notice(&problem);
                         }

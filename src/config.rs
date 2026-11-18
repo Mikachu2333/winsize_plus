@@ -65,6 +65,7 @@ pub struct Config {
     pub font: String,
     pub font_size: i32,
     pub lines: [Line; 2],
+    pub fps: f64,
     pub presets: HashMap<String, Layout>,
     pub keys: HashMap<u32, String>,
     pub commands: HashMap<String, String>,
@@ -312,6 +313,13 @@ impl Config {
             font: text("tip", "font")?.into(),
             font_size: number("tip", "font_size", 6, 128)? as i32,
             lines: [line("horizontal")?, line("vertical")?],
+            fps: {
+                let rate = field("crosshair", "fps")?;
+                rate.as_float()
+                    .or_else(|| rate.as_integer().map(|value| value as f64))
+                    .filter(|value| (1.0..=1000.0).contains(value))
+                    .ok_or("crosshair.fps (1..1000)")?
+            },
             presets,
             keys,
             commands,

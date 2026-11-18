@@ -35,6 +35,9 @@ dark_foreground = "#F2F2F2"
 font = "Microsoft YaHei UI"
 font_size = 16
 
+[crosshair]
+fps = 60.0 # Target refresh rate while moving, from 1 to 1000. Fractional values such as 59.94 are supported.
+
 # Each crosshair axis has its own DPI-scaled width and gap radius, RGB color and opacity from 0 to 255.
 [horizontal]
 width = 2

@@ -35,6 +35,9 @@ font = "Microsoft YaHei UI"
 font_size = 16
 
 # 十字线两轴可分别设置随 DPI 缩放的宽度、缺口半径、RGB 颜色和透明度（0 到 255）。
+[crosshair]
+fps = 60.0 # 移动时的目标刷新率，范围 1 到 1000，可填 59.94 等小数。
+
 [horizontal]
 width = 2
 color = "#CCCC00"
