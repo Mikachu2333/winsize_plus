@@ -92,6 +92,31 @@ impl Font {
     pub fn height(&self) -> i32 {
         self.1
     }
+    pub fn supports_label(&self, text: &[u16]) -> bool {
+        // SAFETY: the font stays alive, buffers match the UTF-16 length, and the DC is restored.
+        unsafe {
+            let dc = GetDC(null_mut());
+            if dc.is_null() {
+                return false;
+            }
+            let old = SelectObject(dc, self.0);
+            let mut metrics = TEXTMETRICW::default();
+            let mut glyphs = vec![0u16; text.len()];
+            let supported = GetTextMetricsW(dc, &mut metrics) != 0
+                && metrics.tmCharSet != SYMBOL_CHARSET
+                && GetGlyphIndicesW(
+                    dc,
+                    text.as_ptr(),
+                    text.len() as i32,
+                    glyphs.as_mut_ptr(),
+                    GGI_MARK_NONEXISTING_GLYPHS,
+                ) != GDI_ERROR as u32
+                && glyphs.iter().all(|glyph| *glyph != 0xffff && *glyph != 0);
+            SelectObject(dc, old);
+            ReleaseDC(null_mut(), dc);
+            supported
+        }
+    }
 }
 
 pub fn families() -> Vec<String> {

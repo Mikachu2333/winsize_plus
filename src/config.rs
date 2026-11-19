@@ -1141,6 +1141,8 @@ mod tests {
     fn new_defaults_and_migration_do_not_override_later_user_edits() {
         let mut doc = help().parse::<DocumentMut>().unwrap();
         assert_eq!(Config::parse(&doc).unwrap().font_size, 12);
+        assert_eq!(doc["keys"]["L"].as_str(), Some("Guide"));
+        assert!(doc["keys"].get("G").is_none());
         assert!(doc["commands"].get("ASDF").is_none());
         doc["outline"]
             .as_table_mut()

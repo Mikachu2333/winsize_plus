@@ -44,6 +44,7 @@ const RESIZE: u32 = WM_APP + 82;
 const HOVER: u32 = WM_APP + 83;
 const EDIT_LAYOUT: u32 = WM_APP + 84;
 const APP_EXIT: u32 = WM_APP + 85;
+const ACTIVATE_PREVIEW: u32 = WM_APP + 86;
 const TAB_BASE: i32 = 100;
 const AXIS_H: i32 = 500;
 const AXIS_V: i32 = 501;
@@ -462,6 +463,17 @@ impl Editor {
         send(hwnd, WM_SETFONT, self.font.0 as usize, 0);
         unsafe {
             SetWindowSubclass(hwnd, Some(control_proc), 1, self.window.0 as usize);
+            if is_combo {
+                let mut info = COMBOBOXINFO {
+                    cbSize: size_of::<COMBOBOXINFO>() as u32,
+                    ..Default::default()
+                };
+                if GetComboBoxInfo(hwnd, &mut info) != 0 {
+                    SetPropW(info.hwndList, w!("OwnerCombo"), hwnd);
+                    SetWindowSubclass(info.hwndList, Some(control_proc), 1, self.window.0 as usize);
+                }
+                send(hwnd, CB_SETMINVISIBLE, 8, 0);
+            }
         }
         Ok(hwnd)
     }
@@ -734,7 +746,12 @@ impl Editor {
                         0,
                         w!("LISTBOX"),
                         "",
-                        LBS_NOTIFY as u32 | WS_BORDER | WS_VSCROLL | WS_TABSTOP,
+                        LBS_NOTIFY as u32
+                            | LBS_OWNERDRAWFIXED as u32
+                            | LBS_HASSTRINGS as u32
+                            | WS_BORDER
+                            | WS_VSCROLL
+                            | WS_TABSTOP,
                     )?;
                     if let Some(fonts) = item.and_then(Item::as_array) {
                         for family in fonts.iter().filter_map(Value::as_str) {
@@ -1413,6 +1430,11 @@ impl Editor {
     fn render(&mut self) -> Result<(), String> {
         self.preview.hide();
         self.overlay.hide_tip();
+        if !unsafe { GetPropW(self.window.0, w!("PreviewSuspended")) }.is_null() {
+            self.overlay.guides(0, &self.cfg)?;
+            input::set_guides(false)?;
+            return input::track_preview(false);
+        }
         let guides = if self.tab == 5 && self.live {
             match self.axis {
                 0 => 1,
@@ -1613,16 +1635,6 @@ impl Editor {
     fn command(&mut self, id: i32, event: u32, sender: HWND) -> Result<(), String> {
         if event == CBN_DROPDOWN && id >= BASE {
             self.active_combo = Some(sender);
-            unsafe {
-                let mut info = COMBOBOXINFO {
-                    cbSize: size_of::<COMBOBOXINFO>() as u32,
-                    ..Default::default()
-                };
-                if GetComboBoxInfo(sender, &mut info) != 0 {
-                    SetPropW(info.hwndList, w!("OwnerCombo"), sender);
-                    SetWindowSubclass(info.hwndList, Some(control_proc), 1, self.window.0 as usize);
-                }
-            }
         }
         if event == CBN_CLOSEUP {
             self.active_combo = None;
@@ -1718,6 +1730,9 @@ impl Editor {
         Ok(())
     }
     fn tick(&mut self) -> Result<(), String> {
+        if !unsafe { RemovePropW(self.window.0, w!("PreviewActivationPending")) }.is_null() {
+            self.render()?;
+        }
         let now = Instant::now();
         // Native combo popups capture the pointer and do not reliably deliver list mouse-move
         // messages to subclasses. Hit-test the open list on the existing UI timer as well.
@@ -1915,6 +1930,44 @@ fn with_editor(action: impl FnOnce(&mut Editor) -> Result<(), String>) {
         }
     });
 }
+fn size_dropdown(root: HWND, combo: HWND, position: &mut WINDOWPOS) {
+    // SAFETY: all handles belong to this UI thread; WINDOWPOS is live for the callback.
+    unsafe {
+        let mut window = RECT::default();
+        let mut control = RECT::default();
+        let mut monitor = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if GetClientRect(root, &mut window) == 0
+            || GetWindowRect(combo, &mut control) == 0
+            || GetMonitorInfoW(
+                MonitorFromWindow(combo, MONITOR_DEFAULTTONEAREST),
+                &mut monitor,
+            ) == 0
+        {
+            return;
+        }
+        let row = send(combo, CB_GETITEMHEIGHT, 0, 0).max(1) as i32;
+        let border = 2 * GetSystemMetricsForDpi(SM_CYBORDER, GetDpiForWindow(root).max(96));
+        let below = (monitor.rcWork.bottom - control.bottom).max(0);
+        let above = (control.top - monitor.rcWork.top).max(0);
+        let limit = window.bottom.min(below.max(above));
+        let count = send(combo, CB_GETCOUNT, 0, 0).clamp(1, 8) as i32;
+        let rows = ((limit - border) / row).max(1).min(count);
+        position.cy = (rows * row + border).min(limit).max(1);
+        position.y = if below >= position.cy || below >= above {
+            control.bottom
+        } else {
+            control.top - position.cy
+        };
+        position.y = position.y.clamp(
+            monitor.rcWork.top,
+            (monitor.rcWork.bottom - position.cy).max(monitor.rcWork.top),
+        );
+        position.flags &= !(SWP_NOSIZE | SWP_NOMOVE);
+    }
+}
 unsafe extern "system" fn control_proc(
     hwnd: HWND,
     message: u32,
@@ -1924,6 +1977,21 @@ unsafe extern "system" fn control_proc(
     root: usize,
 ) -> LRESULT {
     unsafe {
+        let combo = GetPropW(hwnd, w!("OwnerCombo"));
+        if message == WM_WINDOWPOSCHANGING
+            && !combo.is_null()
+            && (*(lp as *const WINDOWPOS)).flags & SWP_NOSIZE == 0
+        {
+            let result = DefSubclassProc(hwnd, message, wp, lp);
+            // SAFETY: Windows supplies a writable WINDOWPOS for WM_WINDOWPOSCHANGING.
+            size_dropdown(root as HWND, combo, &mut *(lp as *mut WINDOWPOS));
+            return result;
+        }
+        if message == WM_NCDESTROY {
+            RemovePropW(hwnd, w!("OwnerCombo"));
+            RemoveWindowSubclass(hwnd, Some(control_proc), 1);
+            return DefSubclassProc(hwnd, message, wp, lp);
+        }
         let mut class = [0u16; 32];
         let length = GetClassNameW(hwnd, class.as_mut_ptr(), 32);
         let class = String::from_utf16_lossy(&class[..length as usize]);
@@ -2260,13 +2328,24 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
             }
             isize::from(accepted)
         }
-        WM_ACTIVATE if (wp & 0xffff) as u32 == WA_INACTIVE => {
+        WM_ACTIVATE => {
+            // Activation can arrive inside a native modal dialog while Editor is borrowed.
+            // Record the latest state immediately, then render outside that callback.
+            unsafe {
+                if (wp & 0xffff) as u32 == WA_INACTIVE {
+                    SetPropW(hwnd, w!("PreviewSuspended"), 1usize as HANDLE);
+                } else {
+                    RemovePropW(hwnd, w!("PreviewSuspended"));
+                }
+                SetPropW(hwnd, w!("PreviewActivationPending"), 1usize as HANDLE);
+                PostMessageW(hwnd, ACTIVATE_PREVIEW, 0, 0);
+            }
+            unsafe { DefWindowProcW(hwnd, message, wp, lp) }
+        }
+        ACTIVATE_PREVIEW => {
             with_editor(|editor| {
-                editor.preview.hide();
-                editor.overlay.hide_tip();
-                editor.overlay.guides(0, &editor.cfg)?;
-                input::track_preview(false)?;
-                input::set_guides(false)
+                unsafe { RemovePropW(hwnd, w!("PreviewActivationPending")) };
+                editor.render()
             });
             0
         }
@@ -2343,6 +2422,7 @@ pub fn run(path: &Path) -> Result<(), String> {
         if hwnd.is_null() {
             return Err(err());
         }
+        SetPropW(hwnd, w!("PreviewSuspended"), 1usize as HANDLE);
         // Settings may retain an elevated token after the resident is restarted normally.
         // Only this payload-free lifecycle message is allowed across that boundary.
         desktop::check(ChangeWindowMessageFilterEx(
@@ -2583,6 +2663,31 @@ mod tests {
     #[test]
     #[ignore = "opens a real settings window; run explicitly on an interactive Windows desktop"]
     fn interactive_settings_smoke() {
+        fn check_dropdown(root: HWND, combo: HWND) -> Result<(), String> {
+            unsafe {
+                let mut info = COMBOBOXINFO {
+                    cbSize: size_of::<COMBOBOXINFO>() as u32,
+                    ..Default::default()
+                };
+                GetComboBoxInfo(combo, &mut info);
+                let mut window = RECT::default();
+                let mut popup = RECT::default();
+                GetWindowRect(root, &mut window);
+                GetWindowRect(info.hwndList, &mut popup);
+                let height = popup.bottom - popup.top;
+                let row = send(combo, CB_GETITEMHEIGHT, 0, 0) as i32;
+                if height > window.bottom - window.top || height > row * 8 + 8 || height <= row {
+                    return Err(format!("Invalid dropdown height: {height}, row={row}"));
+                }
+                let count = send(combo, CB_GETCOUNT, 0, 0) as i32;
+                if count * row > height
+                    && GetWindowLongW(info.hwndList, GWL_STYLE) as u32 & WS_VSCROLL == 0
+                {
+                    return Err("Overflow dropdown has no scrollbar".into());
+                }
+                Ok(())
+            }
+        }
         fn wait_tab(hwnd: HWND, tab: usize) -> Result<(), String> {
             let until = Instant::now() + Duration::from_secs(5);
             while unsafe { GetPropW(hwnd, w!("ReadyTab")) } as usize != tab + 1 {
@@ -2598,6 +2703,10 @@ mod tests {
         let path = folder.join("config.toml");
         let mut doc = config::help().parse::<DocumentMut>().unwrap();
         doc["general"]["language"] = value("zh-CN");
+        let mut fallbacks = toml_edit::Array::new();
+        fallbacks.push("Noto Color Emoji");
+        fallbacks.push("Microsoft YaHei UI");
+        doc["tip"]["font_fallbacks"] = value(fallbacks);
         doc["presets"]["这是一个超过八个汉字的测试分区名称"] = value("0|0|50sw|50sh");
         std::fs::write(&path, doc.to_string()).unwrap();
         assert!(
@@ -2697,6 +2806,69 @@ mod tests {
                     println!("tab {tab} cached_ms={}", start.elapsed().as_millis());
                     if start.elapsed() > Duration::from_secs(1) {
                         return Err(format!("Cached tab {tab} took over one second"));
+                    }
+                }
+                // Every preview pauses in the background and resumes with its checkbox intact.
+                let overlay_count = || unsafe {
+                    let mut count = 0;
+                    let mut overlay = null_mut();
+                    loop {
+                        overlay =
+                            FindWindowExW(null_mut(), overlay, w!("WinSizeP.Overlay"), null());
+                        if overlay.is_null() {
+                            break;
+                        }
+                        let mut process = 0;
+                        GetWindowThreadProcessId(overlay, &mut process);
+                        if process == GetCurrentProcessId() && IsWindowVisible(overlay) != 0 {
+                            count += 1;
+                        }
+                    }
+                    count
+                };
+                for tab in [1, 2, 3, 5, 6] {
+                    send(hwnd, WM_COMMAND, (TAB_BASE + tab) as usize, 0);
+                    wait_tab(hwnd, tab as usize)?;
+                    let pane = unsafe { GetDlgItem(hwnd, 2) };
+                    let fields =
+                        schema::fields(tab as usize, 0, &Config::parse(&doc).unwrap(), &doc);
+                    let preview = fields
+                        .iter()
+                        .position(|f| matches!(f.kind, Kind::Preview))
+                        .map(|row| unsafe { GetDlgItem(pane, BASE + row as i32 * STRIDE) });
+                    if let Some(control) = preview
+                        && send(control, BM_GETCHECK, 0, 0) == 0
+                    {
+                        send(control, BM_CLICK, 0, 0);
+                    }
+                    if tab == 2 {
+                        let row = fields.iter().position(|f| f.section == "presets").unwrap();
+                        send(
+                            unsafe { GetDlgItem(pane, BASE + row as i32 * STRIDE + 5) },
+                            BM_CLICK,
+                            0,
+                            0,
+                        );
+                    }
+                    send(hwnd, WM_ACTIVATE, WA_ACTIVE as usize, 0);
+                    send(hwnd, ACTIVATE_PREVIEW, 0, 0);
+                    if overlay_count() == 0 {
+                        return Err(format!("Preview missing on tab {tab}"));
+                    }
+                    send(hwnd, WM_ACTIVATE, WA_INACTIVE as usize, 0);
+                    send(hwnd, ACTIVATE_PREVIEW, 0, 0);
+                    // A background rerender must also leave the preview hidden.
+                    send(hwnd, ACTIVATE_PREVIEW, 0, 0);
+                    if overlay_count() != 0 {
+                        return Err(format!("Background preview visible on tab {tab}"));
+                    }
+                    if preview.is_some_and(|control| send(control, BM_GETCHECK, 0, 0) != 1) {
+                        return Err(format!("Preview selection lost on tab {tab}"));
+                    }
+                    send(hwnd, WM_ACTIVATE, WA_ACTIVE as usize, 0);
+                    send(hwnd, ACTIVATE_PREVIEW, 0, 0);
+                    if overlay_count() == 0 {
+                        return Err(format!("Preview did not resume on tab {tab}"));
                     }
                 }
                 // Change FPS through the native edit notification, then confirm persisted clamping.
@@ -2802,7 +2974,7 @@ mod tests {
                 let pane = unsafe { GetDlgItem(hwnd, 2) };
                 let row = schema::fields(4, 0, &Config::parse(&merged).unwrap(), &merged)
                     .iter()
-                    .position(|field| field.section == "keys" && field.key == "G")
+                    .position(|field| field.section == "keys" && field.key == "L")
                     .ok_or("Guide mapping missing")?;
                 let combo = unsafe { GetDlgItem(pane, BASE + row as i32 * STRIDE) };
                 let mut combo_class = [0u16; 64];
@@ -2826,6 +2998,7 @@ mod tests {
                 }
                 std::thread::sleep(Duration::from_millis(150));
                 send(combo, CB_SHOWDROPDOWN, 1, 0);
+                check_dropdown(hwnd, combo)?;
                 let mut info = COMBOBOXINFO {
                     cbSize: size_of::<COMBOBOXINFO>() as u32,
                     ..Default::default()
@@ -2910,6 +3083,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(150));
                 send(font_combo, CB_SHOWDROPDOWN, 1, 0);
                 std::thread::sleep(Duration::from_millis(100));
+                check_dropdown(hwnd, font_combo)?;
                 let mut font_info = COMBOBOXINFO {
                     cbSize: size_of::<COMBOBOXINFO>() as u32,
                     ..Default::default()

@@ -27,7 +27,7 @@ pub fn draw(root: HWND, draw: &DRAWITEMSTRUCT) {
         let old = SelectObject(dc, font);
         let saved = SaveDC(dc);
         SetBkMode(dc, TRANSPARENT as i32);
-        if draw.CtlType == ODT_COMBOBOX {
+        if matches!(draw.CtlType, ODT_COMBOBOX | ODT_LISTBOX) {
             let selected = draw.itemState & ODS_SELECTED != 0;
             FillRect(
                 dc,
@@ -47,12 +47,17 @@ pub fn draw(root: HWND, draw: &DRAWITEMSTRUCT) {
                 }),
             );
             if draw.itemID != u32::MAX {
-                let length = SendMessageW(draw.hwndItem, CB_GETLBTEXTLEN, draw.itemID as usize, 0);
+                let (get_length, get_text) = if draw.CtlType == ODT_LISTBOX {
+                    (LB_GETTEXTLEN, LB_GETTEXT)
+                } else {
+                    (CB_GETLBTEXTLEN, CB_GETLBTEXT)
+                };
+                let length = SendMessageW(draw.hwndItem, get_length, draw.itemID as usize, 0);
                 if length >= 0 {
                     let mut label = vec![0u16; length as usize + 1];
                     SendMessageW(
                         draw.hwndItem,
-                        CB_GETLBTEXT,
+                        get_text,
                         draw.itemID as usize,
                         label.as_mut_ptr() as isize,
                     );
@@ -65,7 +70,8 @@ pub fn draw(root: HWND, draw: &DRAWITEMSTRUCT) {
                         FONTS.with_borrow_mut(|fonts| {
                             if let std::collections::hash_map::Entry::Vacant(entry) =
                                 fonts.entry((dpi, family.clone()))
-                                && let Ok(font) = Font::new(&family, 0, dpi, false, false)
+                                && let Ok(font) =
+                                    label_font(&family, &label[..length as usize], dpi)
                             {
                                 entry.insert(font);
                             }
@@ -199,4 +205,34 @@ pub fn draw(root: HWND, draw: &DRAWITEMSTRUCT) {
 }
 pub fn reset_fonts() {
     FONTS.with_borrow_mut(HashMap::clear);
+}
+fn label_font(family: &str, label: &[u16], dpi: i32) -> Result<Font, String> {
+    let font = Font::new(family, 0, dpi, false, false)?;
+    if font.supports_label(label) {
+        Ok(font)
+    } else {
+        Font::new("SystemFont", 0, dpi, false, false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn symbol_and_emoji_font_names_remain_readable() {
+        let names = crate::fonts::families();
+        for family in ["Wingdings", "Noto Color Emoji", "Noto Emoji"] {
+            if !names.iter().any(|name| name == family) {
+                continue;
+            }
+            let label: Vec<u16> = family.encode_utf16().collect();
+            assert!(
+                label_font(family, &label, 96)
+                    .unwrap()
+                    .supports_label(&label),
+                "Unreadable font name: {family}"
+            );
+        }
+    }
 }
