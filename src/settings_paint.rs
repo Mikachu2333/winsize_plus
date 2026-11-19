@@ -144,7 +144,13 @@ pub fn draw(root: HWND, draw: &DRAWITEMSTRUCT) {
                     .unwrap_or(255)
                     .min(255)
             };
-            let channels = [channel(3), channel(4), channel(5), channel(6)];
+            let has_alpha = !GetDlgItem(parent, id + 6).is_null();
+            let channels = [
+                channel(3),
+                channel(4),
+                channel(5),
+                if has_alpha { channel(6) } else { 255 },
+            ];
             let foreground = channels[0] | (channels[1] << 8) | (channels[2] << 16);
             let tile = scale(10).max(1);
             for y in (rect.top..rect.bottom).step_by(tile as usize) {
@@ -170,10 +176,11 @@ pub fn draw(root: HWND, draw: &DRAWITEMSTRUCT) {
                     );
                 }
             }
-            let label = wide(format!(
-                "#{:02X}{:02X}{:02X}   A: {}",
-                channels[0], channels[1], channels[2], channels[3]
-            ));
+            let mut label = format!("#{:02X}{:02X}{:02X}", channels[0], channels[1], channels[2]);
+            if has_alpha {
+                label.push_str(&format!("   A: {}", channels[3]));
+            }
+            let label = wide(label);
             SetTextColor(
                 dc,
                 crate::colors::swatch_text(foreground, channels[3] as u8),

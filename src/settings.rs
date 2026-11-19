@@ -6,7 +6,7 @@ use crate::{
     input,
     overlay::Overlay,
     preview::Preview,
-    settings_schema::{self as schema, Field, Kind, TABS},
+    settings_schema::{self as schema, ColorChannels, Field, Kind, TABS},
     settings_tooltip::HoverTip,
 };
 use std::{
@@ -637,7 +637,7 @@ impl Editor {
                         );
                     }
                 }
-                Kind::Color => {
+                Kind::Color(channels) => {
                     self.control(
                         &mut row,
                         index,
@@ -659,6 +659,7 @@ impl Editor {
                         alpha.unwrap_or(255) as u32,
                     ]
                     .into_iter()
+                    .take(channels.count())
                     .enumerate()
                     {
                         self.control(
@@ -677,11 +678,6 @@ impl Editor {
                             ["R", "G", "B", "A"][channel],
                             SS_CENTER,
                         )?;
-                        if channel == 3 && alpha.is_none() {
-                            unsafe {
-                                EnableWindow(row.c(6), 0);
-                            }
-                        }
                     }
                 }
                 Kind::Fallbacks => {
@@ -902,13 +898,13 @@ impl Editor {
                         y += h;
                     }
                 }
-                Kind::Color => {
+                Kind::Color(channels) => {
                     let color_width = (combo_width + self.s(80)).min(width);
                     place(row.c(0), padding, y - self.scroll[1], color_width, h);
                     y += h + gap;
                     let unit = number_width + self.s(28);
-                    let columns = (width / unit).clamp(1, 4) as usize;
-                    for channel in 0..4 {
+                    let columns = (width / unit).clamp(1, channels.count() as i32) as usize;
+                    for channel in 0..channels.count() {
                         let x = padding + (channel % columns) as i32 * unit;
                         let top = y + (channel / columns) as i32 * (h + gap) - self.scroll[1];
                         place(
@@ -920,7 +916,7 @@ impl Editor {
                         );
                         place(row.c(channel + 3), x + self.s(20), top, number_width, h);
                     }
-                    y += 4usize.div_ceil(columns) as i32 * (h + gap) - gap;
+                    y += channels.count().div_ceil(columns) as i32 * (h + gap) - gap;
                 }
                 Kind::Fallbacks => {
                     let list_width = (combo_width * 2).min(width);
@@ -1147,17 +1143,19 @@ impl Editor {
                 }
                 Kind::Text => value(caption(row.c(0))),
                 Kind::Font | Kind::Choice(_) => value(Self::selected_value(row, 0)),
-                Kind::Color => {
-                    let channels: Vec<u8> = (3..=6)
+                Kind::Color(format) => {
+                    let channels: Vec<u8> = (3..3 + format.count())
                         .map(|slot| {
                             caption(row.c(slot)).parse::<u8>().map_err(|_| {
-                                self.cfg
-                                    .tr("RGBA must be 0–255", "RGBA 必须为 0–255")
-                                    .to_owned()
+                                format!(
+                                    "{} {}",
+                                    format.label(),
+                                    self.cfg.tr("must be 0–255", "必须为 0–255")
+                                )
                             })
                         })
                         .collect::<Result<_, _>>()?;
-                    if draft[section].get("opacity").is_some() {
+                    if *format == ColorChannels::Rgba {
                         draft[section]["opacity"] = value(i64::from(channels[3]));
                     }
                     value(format!(
@@ -1340,7 +1338,7 @@ impl Editor {
                         send(row.c(0), LB_SETCURSEL, selected as usize, 0);
                     }
                 }
-                Kind::Color => {
+                Kind::Color(channels) => {
                     if let Some(text) = item.and_then(Item::as_str) {
                         set_text(row.c(0), text);
                         let rgb =
@@ -1351,6 +1349,7 @@ impl Editor {
                             .unwrap_or(255);
                         for (i, n) in [(rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255, a as u32]
                             .into_iter()
+                            .take(channels.count())
                             .enumerate()
                         {
                             set_text(row.c(i + 3), &n.to_string());
@@ -1642,7 +1641,7 @@ impl Editor {
                 return self.font_list(index, slot);
             }
             Kind::Fallbacks => return Ok(()),
-            Kind::Color if slot == 0 && event == BN_CLICKED => return self.color_dialog(index),
+            Kind::Color(_) if slot == 0 && event == BN_CLICKED => return self.color_dialog(index),
             Kind::Note => return Ok(()),
             _ => {}
         }
@@ -1662,7 +1661,7 @@ impl Editor {
                 if self.tab != 0 && self.tab != 4 {
                     self.render()?;
                 }
-                if matches!(kind, Kind::Color) {
+                if matches!(kind, Kind::Color(_)) {
                     unsafe {
                         InvalidateRect(self.rows[index].c(0), null(), 1);
                     }
@@ -2538,6 +2537,40 @@ mod tests {
                     let status = caption(unsafe { GetDlgItem(hwnd, 600) });
                     if status.contains("error") || status.contains("错误") {
                         return Err(status);
+                    }
+                    let pane = unsafe { GetDlgItem(hwnd, 2) };
+                    let mut child = unsafe { GetWindow(pane, GW_CHILD) };
+                    while !child.is_null() {
+                        if unsafe { IsWindowVisible(child) } != 0
+                            && unsafe { IsWindowEnabled(child) } == 0
+                        {
+                            return Err(format!(
+                                "Tab {tab} contains a permanently disabled control"
+                            ));
+                        }
+                        child = unsafe { GetWindow(child, GW_HWNDNEXT) };
+                    }
+                    for (index, field) in
+                        schema::fields(tab as usize, 0, &Config::parse(&doc).unwrap(), &doc)
+                            .iter()
+                            .enumerate()
+                    {
+                        if let Kind::Color(format) = field.kind {
+                            let alpha =
+                                unsafe { GetDlgItem(pane, BASE + index as i32 * STRIDE + 6) };
+                            let alpha_label =
+                                unsafe { GetDlgItem(pane, BASE + index as i32 * STRIDE + 10) };
+                            if (format == ColorChannels::Rgb)
+                                && (!alpha.is_null() || !alpha_label.is_null())
+                            {
+                                return Err("Opaque color exposes an alpha control".into());
+                            }
+                            if (format == ColorChannels::Rgba)
+                                && (alpha.is_null() || alpha_label.is_null())
+                            {
+                                return Err("Editable alpha channel is missing".into());
+                            }
+                        }
                     }
                     snapshot(hwnd, &output.join(format!("tab-{tab}.bmp")));
                     if tab == 1 {

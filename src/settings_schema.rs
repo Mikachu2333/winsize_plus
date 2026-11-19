@@ -18,11 +18,30 @@ pub enum Kind {
     Choice(Vec<(String, String)>),
     Font,
     Fallbacks,
-    Color,
+    Color(ColorChannels),
     Mapping,
     Add,
     Preview,
     Note,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColorChannels {
+    Rgb,
+    Rgba,
+}
+impl ColorChannels {
+    pub fn count(self) -> usize {
+        match self {
+            Self::Rgb => 3,
+            Self::Rgba => 4,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Rgb => "RGB",
+            Self::Rgba => "RGBA",
+        }
+    }
 }
 #[derive(Clone)]
 pub struct Field {
@@ -287,6 +306,11 @@ fn describe(section: &str, key: &str) -> (&'static str, &'static str, &'static s
 }
 
 pub fn fields(tab: usize, axis: usize, cfg: &Config, doc: &DocumentMut) -> Vec<Field> {
+    static DEFAULTS: std::sync::LazyLock<DocumentMut> = std::sync::LazyLock::new(|| {
+        config::help()
+            .parse()
+            .expect("valid built-in configuration")
+    });
     let mut fields = Vec::new();
     let sections: &[&str] = match tab {
         0 => &["general"],
@@ -319,7 +343,13 @@ pub fn fields(tab: usize, axis: usize, cfg: &Config, doc: &DocumentMut) -> Vec<F
         };
         let mapping = matches!(*section, "presets" | "keys" | "commands" | "grid");
         for (key, item) in table {
-            if key == "opacity" {
+            if !mapping
+                && (key == "opacity"
+                    || DEFAULTS
+                        .get(section)
+                        .and_then(|table| table.get(key))
+                        .is_none())
+            {
                 continue;
             }
             let (en, zh, hint_en, hint_zh) = describe(section, key);
@@ -342,7 +372,13 @@ pub fn fields(tab: usize, axis: usize, cfg: &Config, doc: &DocumentMut) -> Vec<F
                     "background" | "foreground" | "dark_background" | "dark_foreground"
                 )
             {
-                kind = Kind::Color;
+                kind = Kind::Color(
+                    if matches!(*section, "outline" | "horizontal" | "vertical") {
+                        ColorChannels::Rgba
+                    } else {
+                        ColorChannels::Rgb
+                    },
+                );
             } else {
                 let values: &[&str] = match (*section, key) {
                     ("general", "language") => &["auto", "zh-CN", "en"],
@@ -433,6 +469,46 @@ pub fn actions(cfg: &Config, presets_only: bool) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn color_fields_expose_only_supported_channels_and_known_options() {
+        let mut doc = config::help().parse::<DocumentMut>().unwrap();
+        doc["tip"]["opacity"] = toml_edit::value(120);
+        doc["tip"]["font_opacity"] = toml_edit::value(120);
+        doc["regions"]["font_opacity"] = toml_edit::value(120);
+        doc["presets"]["opacity"] = toml_edit::value("0|0|50sw|50sh");
+        let cfg = Config::parse(&doc).unwrap();
+        let tips = fields(1, 0, &cfg, &doc);
+        assert_eq!(
+            tips.iter()
+                .filter(|field| matches!(field.kind, Kind::Color(ColorChannels::Rgb)))
+                .count(),
+            4
+        );
+        assert!(!tips.iter().any(|field| field.key.contains("opacity")));
+        let regions = fields(2, 0, &cfg, &doc);
+        assert!(
+            !regions
+                .iter()
+                .any(|field| field.section == "regions" && field.key == "font_opacity")
+        );
+        assert!(
+            regions
+                .iter()
+                .any(|field| field.section == "presets" && field.key == "opacity")
+        );
+        for tab in [3, 5] {
+            let colors: Vec<_> = fields(tab, 0, &cfg, &doc)
+                .into_iter()
+                .filter(|field| matches!(field.kind, Kind::Color(_)))
+                .collect();
+            assert!(!colors.is_empty());
+            assert!(
+                colors
+                    .iter()
+                    .all(|field| matches!(field.kind, Kind::Color(ColorChannels::Rgba)))
+            );
+        }
+    }
     #[test]
     fn time_labels_depend_on_type_not_capitalization() {
         let mut doc = config::help().parse::<DocumentMut>().unwrap();
