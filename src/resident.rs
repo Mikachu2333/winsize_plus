@@ -49,6 +49,8 @@ struct App {
     hold: Option<(Instant, HWND)>,
     held_window: Option<HWND>,
     preview_latched: bool,
+    preview_until: Option<Instant>,
+    preview_check: Option<Instant>,
     window: HWND,
     drag: Option<desktop::Drag>,
     command: String,
@@ -69,6 +71,16 @@ impl App {
             input::track_preview(true)?;
         }
         Ok(())
+    }
+    fn close_preview(&mut self) -> Result<(), String> {
+        self.hold = None;
+        self.wait = None;
+        self.held_window = None;
+        self.preview_until = None;
+        self.preview_check = None;
+        self.preview_latched = false;
+        self.preview.hide();
+        input::track_preview(false)
     }
     fn notice(&mut self, text: &str) -> Result<(), String> {
         self.hide = Some(later(self.cfg.duration));
@@ -115,10 +127,7 @@ impl App {
         self.frames.reset(cfg.fps);
         self.overlay.guides(self.overlay.mode(), &cfg)?;
         self.cfg = cfg;
-        self.wait = None;
-        self.hold = None;
-        self.held_window = None;
-        self.refresh_preview()?;
+        self.close_preview()?;
         if restart {
             self.exit = Some(crate::ResidentExit::Restart(Some(self.cfg.elevate)));
             return Ok(());
@@ -283,6 +292,7 @@ impl App {
                 Ok(())
             }
             input::ARMED => {
+                self.close_preview()?;
                 self.window = msg.wParam as HWND;
                 self.wait = Some(later(self.cfg.duration));
                 self.hold = None;
@@ -292,6 +302,7 @@ impl App {
                 self.status(&self.cfg.show.clone())
             }
             input::ALT_HOLD => {
+                self.close_preview()?;
                 self.window = msg.wParam as HWND;
                 self.hold = Some((later(self.cfg.duration), self.window));
                 self.wait = None;
@@ -303,16 +314,12 @@ impl App {
             input::ALT_RELEASE => {
                 self.hold = None;
                 if !self.preview_latched {
-                    self.held_window = None;
-                    self.refresh_preview()?;
+                    self.close_preview()?;
                 }
                 Ok(())
             }
             input::ACTION => {
-                self.wait = None;
-                self.hold = None;
-                self.held_window = None;
-                self.refresh_preview()?;
+                self.close_preview()?;
                 self.clear();
                 if let Some(action) = self.cfg.keys.get(&(msg.wParam as u32)).cloned() {
                     self.act(&action)?
@@ -333,11 +340,7 @@ impl App {
                 Ok(())
             }
             input::CLICK => {
-                self.preview.hide();
-                self.held_window = None;
-                self.hold = None;
-                self.wait = None;
-                input::track_preview(false)?;
+                self.close_preview()?;
                 let point = input::click_point(msg.lParam);
                 let screen = desktop::screen(point, 0)?;
                 let cell = screen.full.grid(point.x, point.y) as u32 + 1;
@@ -356,9 +359,11 @@ impl App {
                 Ok(())
             }
             input::GRID_SHOW => {
+                self.close_preview()?;
                 self.window = msg.wParam as HWND;
                 self.hold = None;
                 self.preview.grid(self.window, &self.cfg)?;
+                self.preview_check = Some(later(100));
                 input::track_preview(true)
             }
             input::DRAG_START => {
@@ -372,6 +377,8 @@ impl App {
                 self.held_window = None;
                 self.wait = None;
                 self.preview.hide();
+                self.preview_until = None;
+                self.preview_check = None;
                 input::track_preview(false)?;
                 self.clear();
                 self.frames.reset(self.cfg.fps);
@@ -390,12 +397,10 @@ impl App {
                 self.wait = None;
                 self.hold = None;
                 if self.preview.reset(&self.cfg)? {
+                    self.preview_until = Some(later(self.cfg.duration));
                     return Ok(());
                 }
-                self.hold = None;
-                self.held_window = None;
-                self.wait = None;
-                self.refresh_preview()?;
+                self.close_preview()?;
                 Ok(())
             }
             WM_QUIT => {
@@ -425,11 +430,29 @@ impl App {
             self.hold = None;
             self.held_window = Some(hwnd);
             self.refresh_preview()?;
+            self.preview_check = Some(later(100));
         }
         if self.wait.is_some_and(|when| now >= when) {
             self.wait = None;
             self.held_window = Some(self.window);
             self.refresh_preview()?;
+            self.preview_until = Some(later(self.cfg.duration));
+            self.preview_check = Some(later(100));
+        }
+        if self.preview_until.is_some_and(|when| now >= when) {
+            input::cancel();
+            self.close_preview()?;
+        }
+        if self.preview_check.is_some_and(|when| now >= when) {
+            if unsafe { IsWindow(self.window) } == 0
+                || (!self.preview_latched && !input::alt_held())
+                || unsafe { GetForegroundWindow() } != self.window
+            {
+                input::cancel();
+                self.close_preview()?;
+            } else {
+                self.preview_check = Some(later(100));
+            }
         }
         if self.preview.deadline().is_some_and(|when| now >= when) {
             self.preview.tick(&self.cfg)?;
@@ -450,6 +473,8 @@ impl App {
             self.reload,
             self.hold.map(|(when, _)| when),
             self.preview.deadline(),
+            self.preview_until,
+            self.preview_check,
         ]
         .into_iter()
         .flatten()
@@ -511,6 +536,8 @@ pub fn run(path: &Path) -> Result<crate::ResidentExit, String> {
             hold: None,
             held_window: None,
             preview_latched: false,
+            preview_until: None,
+            preview_check: None,
             window: null_mut(),
             drag: None,
             command: String::new(),
@@ -568,5 +595,264 @@ pub fn run(path: &Path) -> Result<crate::ResidentExit, String> {
                 _ => return Err(err()),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        process::{Command, Stdio},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+    };
+    use windows_sys::Win32::{
+        System::LibraryLoader::GetModuleHandleW, UI::Input::KeyboardAndMouse::*,
+    };
+    const TARGET: &str = "WinSizeP preview test target";
+
+    #[test]
+    #[ignore = "helper process for the global input integration test"]
+    fn target_window() {
+        if std::env::var_os("WINSIZEP_PREVIEW_TARGET").is_none() {
+            return;
+        }
+        unsafe {
+            let hwnd = CreateWindowExW(
+                0,
+                w!("STATIC"),
+                wide(TARGET).as_ptr(),
+                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                200,
+                150,
+                800,
+                550,
+                null_mut(),
+                null_mut(),
+                GetModuleHandleW(null()),
+                null(),
+            );
+            assert!(!hwnd.is_null());
+            SetForegroundWindow(hwnd);
+            let until = Instant::now() + Duration::from_secs(20);
+            while Instant::now() < until && IsWindow(hwnd) != 0 {
+                MsgWaitForMultipleObjectsEx(0, null(), 50, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+                let mut msg = MSG::default();
+                while PeekMessageW(&mut msg, null_mut(), 0, 0, PM_REMOVE) != 0 {
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+            DestroyWindow(hwnd);
+        }
+    }
+    fn key(vk: u16, down: bool) {
+        unsafe {
+            let event = INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: vk,
+                        dwFlags: if down { 0 } else { KEYEVENTF_KEYUP },
+                        ..Default::default()
+                    },
+                },
+            };
+            assert_eq!(SendInput(1, &event, size_of::<INPUT>() as i32), 1);
+        }
+    }
+    fn visible(state: &AtomicBool, wanted: bool) -> Result<(), String> {
+        let until = Instant::now() + Duration::from_secs(2);
+        while state.load(Ordering::SeqCst) != wanted {
+            if Instant::now() >= until {
+                return Err(format!("Preview did not become {wanted}"));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Ok(())
+    }
+    #[test]
+    #[ignore = "sends Alt/Esc to a temporary test window; needs an interactive desktop"]
+    fn alt_preview_lifecycle() {
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "resident::tests::target_window",
+                "--nocapture",
+            ])
+            .env("WINSIZEP_PREVIEW_TARGET", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut doc = config::help().parse::<toml_edit::DocumentMut>().unwrap();
+        doc["tip"]["duration_ms"] = toml_edit::value(300);
+        let cfg = Config::parse(&doc).unwrap();
+        let overlay = Overlay::new().unwrap();
+        let _hooks = input::Hooks::start(&cfg).unwrap();
+        let mut app = App {
+            frames: FrameClock::new(cfg.fps).unwrap(),
+            cfg,
+            path: PathBuf::new(),
+            overlay,
+            tray: crate::tray::Tray::new().unwrap(),
+            preview: Preview::new().unwrap(),
+            hold: None,
+            held_window: None,
+            preview_latched: false,
+            preview_until: None,
+            preview_check: None,
+            window: null_mut(),
+            drag: None,
+            command: String::new(),
+            hide: None,
+            wait: None,
+            reload: None,
+            snapshot: None,
+            exit: None,
+        };
+        let state = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let observed = state.clone();
+        let finished = done.clone();
+        let controller = std::thread::spawn(move || {
+            let result = (|| {
+                let until = Instant::now() + Duration::from_secs(5);
+                let target = loop {
+                    let hwnd = unsafe { FindWindowW(w!("STATIC"), wide(TARGET).as_ptr()) };
+                    if !hwnd.is_null() {
+                        break hwnd;
+                    }
+                    if Instant::now() > until {
+                        return Err("Target window missing".into());
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                };
+                unsafe {
+                    // Tests share a desktop with the terminal. Attach only for this explicit
+                    // activation so foreground-lock policy does not invalidate the hook test.
+                    let current = GetCurrentThreadId();
+                    let foreground = GetWindowThreadProcessId(GetForegroundWindow(), null_mut());
+                    let target_thread = GetWindowThreadProcessId(target, null_mut());
+                    windows_sys::Win32::System::Threading::AttachThreadInput(
+                        current, foreground, 1,
+                    );
+                    windows_sys::Win32::System::Threading::AttachThreadInput(
+                        current,
+                        target_thread,
+                        1,
+                    );
+                    SetForegroundWindow(target);
+                    windows_sys::Win32::System::Threading::AttachThreadInput(
+                        current,
+                        target_thread,
+                        0,
+                    );
+                    windows_sys::Win32::System::Threading::AttachThreadInput(
+                        current, foreground, 0,
+                    );
+                    SetCursorPos(600, 400);
+                }
+                std::thread::sleep(Duration::from_millis(100));
+                if unsafe { GetForegroundWindow() } != target {
+                    unsafe {
+                        let mut rect = RECT::default();
+                        GetWindowRect(target, &mut rect);
+                        SetWindowPos(target, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+                        SetCursorPos(rect.left + 100, rect.top + 12);
+                        let down = INPUT {
+                            r#type: INPUT_MOUSE,
+                            Anonymous: INPUT_0 {
+                                mi: MOUSEINPUT {
+                                    dwFlags: MOUSEEVENTF_LEFTDOWN,
+                                    ..Default::default()
+                                },
+                            },
+                        };
+                        let up = INPUT {
+                            r#type: INPUT_MOUSE,
+                            Anonymous: INPUT_0 {
+                                mi: MOUSEINPUT {
+                                    dwFlags: MOUSEEVENTF_LEFTUP,
+                                    ..Default::default()
+                                },
+                            },
+                        };
+                        SendInput(2, [down, up].as_ptr(), size_of::<INPUT>() as i32);
+                        SetWindowPos(target, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+                        SetCursorPos(600, 400);
+                    }
+                    std::thread::sleep(Duration::from_millis(150));
+                    if unsafe { GetForegroundWindow() } != target {
+                        return Err(format!(
+                            "Cannot focus test target {target:?}; foreground={:?}",
+                            unsafe { GetForegroundWindow() }
+                        ));
+                    }
+                }
+                key(VK_LMENU, true);
+                visible(&observed, true)?;
+                key(VK_LMENU, false);
+                visible(&observed, false)?;
+                println!("held Alt preview appeared and released cleanly");
+                std::thread::sleep(Duration::from_millis(650));
+                key(VK_LMENU, true);
+                std::thread::sleep(Duration::from_millis(30));
+                key(VK_LMENU, false);
+                std::thread::sleep(Duration::from_millis(50));
+                key(VK_LMENU, true);
+                std::thread::sleep(Duration::from_millis(30));
+                key(VK_LMENU, false);
+                visible(&observed, true)?;
+                visible(&observed, false)?;
+                println!("double Alt preview appeared and expired without Escape");
+                std::thread::sleep(Duration::from_millis(650));
+                key(VK_LMENU, true);
+                visible(&observed, true)?;
+                key(VK_ESCAPE, true);
+                key(VK_ESCAPE, false);
+                visible(&observed, false)?;
+                key(VK_LMENU, false);
+                println!("Escape canceled held preview");
+                Ok::<_, String>(())
+            })();
+            key(VK_LMENU, false);
+            finished.store(true, Ordering::SeqCst);
+            result
+        });
+        let until = Instant::now() + Duration::from_secs(15);
+        let mut failure = None;
+        while !done.load(Ordering::SeqCst) && Instant::now() < until {
+            if let Err(err) = app.deadlines() {
+                failure = Some(err);
+                break;
+            }
+            unsafe {
+                MsgWaitForMultipleObjectsEx(
+                    0,
+                    null(),
+                    app.timeout().min(50),
+                    QS_ALLINPUT,
+                    MWMO_INPUTAVAILABLE,
+                );
+                let mut msg = MSG::default();
+                while PeekMessageW(&mut msg, null_mut(), 0, 0, PM_REMOVE) != 0 {
+                    if let Err(err) = app.event(msg) {
+                        failure = Some(err);
+                        break;
+                    }
+                }
+            }
+            state.store(app.preview.visible(), Ordering::SeqCst);
+        }
+        let result = controller.join().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(failure.is_none(), "{failure:?}");
+        result.unwrap();
     }
 }

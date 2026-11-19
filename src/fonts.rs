@@ -177,10 +177,18 @@ impl Fonts {
         quality: u8,
     ) -> Result<Self, String> {
         let mut fonts = Vec::new();
+        let mut families = Vec::<&str>::new();
         for name in std::iter::once(primary)
             .chain(fallbacks.iter().take(3).map(String::as_str))
             .chain(std::iter::once("SystemFont"))
         {
+            if families
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(name))
+            {
+                continue;
+            }
+            families.push(name);
             // Transparent overlay text needs grayscale edges; opaque settings use ClearType.
             fonts.push(Font::with_quality(name, size, dpi, bold, italic, quality)?);
         }
@@ -200,6 +208,8 @@ pub struct TextLayout {
     fonts: Fonts,
     lines: Vec<Line>,
     line_height: i32,
+    ascents: Vec<i32>,
+    baseline: i32,
     pub width: i32,
     pub height: i32,
 }
@@ -213,6 +223,8 @@ impl TextLayout {
             fonts,
             lines: Vec::new(),
             line_height: 1,
+            ascents: Vec::new(),
+            baseline: 0,
             width: 0,
             height: 0,
         };
@@ -221,6 +233,7 @@ impl TextLayout {
             width: 0,
         };
         let mut previous = null_mut();
+        let mut descent = 0;
         unsafe {
             for (index, font) in layout.fonts.0.iter().enumerate() {
                 let old = SelectObject(dc, font.0);
@@ -232,7 +245,11 @@ impl TextLayout {
                 layout.line_height = layout
                     .line_height
                     .max(metrics.tmHeight + metrics.tmExternalLeading);
+                layout.ascents.push(metrics.tmAscent);
+                layout.baseline = layout.baseline.max(metrics.tmAscent);
+                descent = descent.max(metrics.tmDescent + metrics.tmExternalLeading);
             }
+            layout.line_height = layout.line_height.max(layout.baseline + descent);
             for ch in text.replace('\r', "").chars() {
                 if ch == '\n' {
                     layout.lines.push(line);
@@ -330,7 +347,8 @@ impl TextLayout {
                     TextOutW(
                         dc,
                         left,
-                        y + index as i32 * self.line_height,
+                        y + index as i32 * self.line_height + self.baseline
+                            - self.ascents[run.font],
                         run.text.as_ptr(),
                         run.text.len() as i32,
                     );

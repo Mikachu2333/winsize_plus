@@ -145,8 +145,8 @@ impl Input {
                     self.gesture_target = unsafe { GetForegroundWindow() };
                     self.target_allowed = desktop::allowed(self.gesture_target, &self.exclusions);
                 }
-                if self.pressed & self.gesture_mask == 0
-                    && side & self.gesture_mask != 0
+                if self.pressed & (self.gesture_mask | self.alt_mask) == 0
+                    && side & (self.gesture_mask | self.alt_mask) != 0
                     && self.preview_enabled
                     && self.target_allowed
                 {
@@ -171,8 +171,8 @@ impl Input {
             }
             self.pressed &= !side;
             if self.preview_enabled
-                && side & self.gesture_mask != 0
-                && self.pressed & self.gesture_mask == 0
+                && side & (self.gesture_mask | self.alt_mask) != 0
+                && self.pressed & (self.gesture_mask | self.alt_mask) == 0
             {
                 post(ALT_RELEASE, 0, 0);
             }
@@ -344,6 +344,7 @@ unsafe extern "system" fn mouse(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
                                 return true;
                             }
                             if !down { return false; }
+                            if input.preview_tracking && input.pressed==0 {post(CANCEL,0,0);input.mode=Mode::Idle;}
                             input.tap = None;
                             input.last_tap = None;
                             if input.target_allowed && input.pressed & input.gesture_mask != 0 && input.drag.is_none() {
@@ -416,6 +417,9 @@ pub fn cancel() {
             drag.canceled = true;
         }
     })
+}
+pub fn alt_held() -> bool {
+    INPUT.with_borrow(|input| input.pressed & (input.alt_mask | input.gesture_mask) != 0)
 }
 pub fn command_mode() {
     INPUT.with_borrow_mut(|input| input.mode = Mode::Command);

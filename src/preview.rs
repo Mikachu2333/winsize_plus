@@ -19,28 +19,34 @@ fn strokes(rect: Rect, area: Rect, width: i32) -> [Rect; 4] {
         .y
         .saturating_add(rect.height)
         .min(area.y.saturating_add(area.height));
+    // Interior edges share one centered stroke, instead of two inward strokes joined
+    // across adjacent rectangles. Outer screen edges remain clipped inside the screen.
+    let vx =
+        |edge: i32| (edge - width / 2).clamp(area.x, (area.x + area.width - width).max(area.x));
+    let hy =
+        |edge: i32| (edge - width / 2).clamp(area.y, (area.y + area.height - width).max(area.y));
     [
         Rect {
-            x: left,
+            x: vx(left),
             y: top,
             width,
             height: bottom - top,
         },
         Rect {
-            x: right - width,
+            x: vx(right),
             y: top,
             width,
             height: bottom - top,
         },
         Rect {
             x: left,
-            y: top,
+            y: hy(top),
             width: right - left,
             height: width,
         },
         Rect {
             x: left,
-            y: bottom - width,
+            y: hy(bottom),
             width: right - left,
             height: width,
         },
@@ -253,8 +259,10 @@ impl Preview {
         let width = (cfg.outline.width * display.dpi / 96).max(1);
         outline(&self.base, &all, virtual_area, width)?;
         self.base.style(Self::color(cfg), cfg.outline.opacity);
-        self.highlight
-            .style(Self::color(cfg), cfg.highlight_opacity);
+        self.highlight.style(
+            unsafe { GetSysColor(COLOR_HIGHLIGHT) },
+            cfg.highlight_opacity,
+        );
         self.display = Some((monitor, display));
         self.show_base(cfg)?;
         Ok(())
@@ -297,14 +305,8 @@ impl Preview {
         if let Some(index) = selected {
             let region = &self.regions[index];
             let dpi = self.display.as_ref().unwrap().1.dpi;
-            outline(
-                &self.highlight,
-                &[(region.rect, region.area)],
-                desktop::desktop(),
-                (cfg.outline.width * dpi / 96).max(1),
-            )?;
-            // Raise all four edges after the base; overlapping base strokes cannot cover the selection.
-            self.highlight.show(desktop::desktop());
+            // Selection uses a translucent interior fill; the ordinary outline stays unchanged.
+            self.highlight.show(region.rect);
             self.label.show(
                 cfg.display_name(&region.name),
                 region.rect,
@@ -405,6 +407,44 @@ impl Preview {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn adjacent_regions_share_the_same_stroke() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 1200,
+            height: 900,
+        };
+        let left = strokes(Rect { width: 600, ..area }, area, 2);
+        let right = strokes(
+            Rect {
+                x: 600,
+                width: 600,
+                ..area
+            },
+            area,
+            2,
+        );
+        assert_eq!(left[1], right[0]);
+        let top = strokes(
+            Rect {
+                height: 450,
+                ..area
+            },
+            area,
+            2,
+        );
+        let bottom = strokes(
+            Rect {
+                y: 450,
+                height: 450,
+                ..area
+            },
+            area,
+            2,
+        );
+        assert_eq!(top[3], bottom[2]);
+    }
     fn region(name: &str, x: i32, y: i32, width: i32, height: i32) -> PresetRegion {
         let rect = Rect {
             x,

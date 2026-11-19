@@ -254,6 +254,9 @@ fn measured(text: &str, font: &Font, width: i32) -> i32 {
         ReleaseDC(null_mut(), dc);
         let height = rect.bottom.max(font.height());
         MEASUREMENTS.with_borrow_mut(|cache| {
+            if cache.len() > 8192 {
+                cache.clear();
+            }
             cache.insert(key, height);
         });
         height
@@ -1274,6 +1277,9 @@ impl Editor {
                 .get(&row.field.section)
                 .and_then(|s| s.get(&row.field.key));
             match row.field.kind {
+                Kind::Preview => {
+                    send(row.c(0), BM_SETCHECK, usize::from(self.live), 0);
+                }
                 Kind::Bool => {
                     send(
                         row.c(0),
@@ -1294,6 +1300,14 @@ impl Editor {
                 }
                 Kind::Mapping => {
                     set_text(row.c(3), &row.field.key);
+                    if row.field.section == "presets" {
+                        send(
+                            row.c(5),
+                            BM_SETCHECK,
+                            usize::from(self.selected.as_ref() == Some(&row.field.key)),
+                            0,
+                        );
+                    }
                     if let Some(text) = item.and_then(Item::as_str) {
                         if row.field.section == "presets" {
                             set_text(row.c(0), text);
@@ -2109,7 +2123,8 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
         WM_CTLCOLORSTATIC => unsafe {
             SetBkMode(wp as HDC, TRANSPARENT as i32);
             SetTextColor(wp as HDC, GetSysColor(COLOR_WINDOWTEXT));
-            GetStockObject(NULL_BRUSH) as isize
+            // The label has no visible background, but its previous glyphs must be cleared.
+            GetSysColorBrush(COLOR_WINDOW) as isize
         },
         WM_TIMER => {
             with_editor(|e| e.tick());
@@ -2554,6 +2569,33 @@ mod tests {
                 let fps = unsafe { GetDlgItem(pane, BASE + STRIDE) };
                 if fps.is_null() {
                     return Err("FPS control missing".into());
+                }
+                let resize_started = Instant::now();
+                unsafe {
+                    let mut rect = RECT::default();
+                    GetWindowRect(hwnd, &mut rect);
+                    for step in 0..16 {
+                        SetWindowPos(
+                            hwnd,
+                            null_mut(),
+                            rect.left,
+                            rect.top,
+                            980 + step * 6,
+                            720 + step * 2,
+                            SWP_NOZORDER | SWP_NOACTIVATE,
+                        );
+                    }
+                    SendMessageW(hwnd, RESIZE, 0, 0);
+                }
+                println!(
+                    "resize_16_steps_ms={}",
+                    resize_started.elapsed().as_millis()
+                );
+                if resize_started.elapsed() > Duration::from_secs(2) {
+                    return Err("Resize sequence took over two seconds".into());
+                }
+                if unsafe { GetDlgItem(pane, BASE + STRIDE) } != fps {
+                    return Err("Resize recreated controls".into());
                 }
                 unsafe {
                     let mut client = RECT::default();

@@ -779,6 +779,20 @@ fn migrate(doc: &mut DocumentMut) {
         .and_then(Item::as_table_mut)
         .and_then(|table| table.remove("highlight_opacity"))
     {
+        if let Some(commands) = doc.get_mut("commands").and_then(Item::as_table_mut) {
+            let example = commands
+                .iter()
+                .find(|(key, item)| {
+                    key.eq_ignore_ascii_case("asdf")
+                        && item
+                            .as_str()
+                            .is_some_and(|value| value.eq_ignore_ascii_case("center"))
+                })
+                .map(|(key, _)| key.to_owned());
+            if let Some(example) = example {
+                commands.remove(&example);
+            }
+        }
         if doc["outline"].get("fill_opacity").is_none() {
             let alpha = legacy
                 .as_integer()
@@ -1217,6 +1231,41 @@ mod tests {
         assert_eq!(disk["tip"]["font_size"].as_integer(), Some(24));
         assert_eq!(disk["tip"]["show"].as_str(), Some("time"));
         assert!(disk["commands"].get("Custom").is_none());
+    }
+    #[test]
+    fn merging_renames_preserves_positions_and_manual_order() {
+        let base = "[keys]\nQ='LeftTop'\nG='Guide'\nH='Help'\n"
+            .parse::<DocumentMut>()
+            .unwrap();
+        let draft = "[keys]\nQ='LeftTop'\nF12='Guide'\nH='Help'\n"
+            .parse::<DocumentMut>()
+            .unwrap();
+        let mut disk = base.clone();
+        merge_edits(base.as_table(), draft.as_table(), disk.as_table_mut());
+        assert_eq!(
+            disk["keys"]
+                .as_table()
+                .unwrap()
+                .iter()
+                .map(|(key, _)| key)
+                .collect::<Vec<_>>(),
+            ["Q", "F12", "H"]
+        );
+        let mut reordered = "[keys]\nH='Help'\nG='Guide'\nQ='LeftTop'\n"
+            .parse::<DocumentMut>()
+            .unwrap();
+        let mut draft = base.clone();
+        draft["keys"]["Q"] = value("Center");
+        merge_edits(base.as_table(), draft.as_table(), reordered.as_table_mut());
+        assert_eq!(
+            reordered["keys"]
+                .as_table()
+                .unwrap()
+                .iter()
+                .map(|(key, _)| key)
+                .collect::<Vec<_>>(),
+            ["H", "G", "Q"]
+        );
     }
 
     #[test]

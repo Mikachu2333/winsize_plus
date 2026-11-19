@@ -28,6 +28,10 @@ unsafe extern "system" fn paint(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
             WM_PAINT => {
                 let mut paint = PAINTSTRUCT::default();
                 let dc = BeginPaint(hwnd, &mut paint);
+                if !GetPropW(hwnd, w!("PixelAlpha")).is_null() {
+                    EndPaint(hwnd, &paint);
+                    return 0;
+                }
                 let mut area = RECT::default();
                 GetClientRect(hwnd, &mut area);
                 SetDCBrushColor(dc, GetWindowLongPtrW(hwnd, GWLP_USERDATA) as u32);
@@ -269,7 +273,7 @@ impl Overlay {
         let screen = desktop::screen(desktop::cursor()?, 0)?;
         let dpi = screen.dpi;
         let padding = scale(8, dpi);
-        let fonts = Fonts::new(
+        let fonts = Fonts::opaque(
             &cfg.font,
             &cfg.font_fallbacks,
             cfg.font_size,
@@ -433,13 +437,20 @@ impl Drop for Overlay {
 
 pub struct Label {
     panel: Panel,
-    text: Option<Box<TextLayout>>,
+}
+fn premultiply_coverage(coverage: u32, color: u32) -> u32 {
+    let alpha = (coverage & 255)
+        .max((coverage >> 8) & 255)
+        .max((coverage >> 16) & 255);
+    let red = (color & 255) * alpha / 255;
+    let green = ((color >> 8) & 255) * alpha / 255;
+    let blue = ((color >> 16) & 255) * alpha / 255;
+    (alpha << 24) | (red << 16) | (green << 8) | blue
 }
 impl Label {
     pub fn new() -> Result<Self, String> {
         Ok(Self {
             panel: Panel::new()?,
-            text: None,
         })
     }
     pub fn hide(&self) {
@@ -468,30 +479,83 @@ impl Label {
             width: text.width,
             height: text.height,
         };
+        // Render neutral glyph coverage, then premultiply the desired color. Color-keyed
+        // anti-aliasing mixes text edges with the key color and leaves opaque halos.
         unsafe {
-            check(SetPropW(
+            SetPropW(self.panel.0, w!("PixelAlpha"), 1usize as HANDLE);
+            let dc = GetDC(self.panel.0);
+            let memory = CreateCompatibleDC(dc);
+            if memory.is_null() {
+                ReleaseDC(self.panel.0, dc);
+                return Err(err());
+            }
+            let info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: size.width,
+                    biHeight: -size.height,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut bits = null_mut();
+            let bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
+            if bitmap.is_null() {
+                DeleteDC(memory);
+                ReleaseDC(self.panel.0, dc);
+                return Err(err());
+            }
+            let old = SelectObject(memory, bitmap);
+            let pixels = std::slice::from_raw_parts_mut(
+                bits as *mut u32,
+                (size.width * size.height) as usize,
+            );
+            pixels.fill(0);
+            text.draw(memory, 0, 0, 0xffffff, true);
+            GdiFlush();
+            for pixel in pixels.iter_mut() {
+                *pixel = premultiply_coverage(*pixel, color);
+            }
+            let position = POINT {
+                x: size.x,
+                y: size.y,
+            };
+            let dimensions = SIZE {
+                cx: size.width,
+                cy: size.height,
+            };
+            let origin = POINT::default();
+            let blend = BLENDFUNCTION {
+                BlendOp: AC_SRC_OVER as u8,
+                BlendFlags: 0,
+                SourceConstantAlpha: 255,
+                AlphaFormat: AC_SRC_ALPHA as u8,
+            };
+            let ok = UpdateLayeredWindow(
                 self.panel.0,
-                w!("TextLayout"),
-                (&*text as *const TextLayout) as HANDLE,
-            ))?;
-            SetPropW(self.panel.0, w!("Centered"), 1usize as HANDLE);
-            SetPropW(self.panel.0, w!("TextColor"), color as usize as HANDLE);
-            // Transparency key is an implementation detail, deliberately different from text.
-            let key = color ^ 0x00ffffff;
-            SetWindowLongPtrW(self.panel.0, GWLP_USERDATA, key as isize);
-            SetLayeredWindowAttributes(self.panel.0, key, 255, LWA_COLORKEY);
-            InvalidateRect(self.panel.0, null(), 0);
+                dc,
+                &position,
+                &dimensions,
+                memory,
+                &origin,
+                0,
+                &blend,
+                ULW_ALPHA,
+            );
+            let error = err();
+            SelectObject(memory, old);
+            DeleteObject(bitmap);
+            DeleteDC(memory);
+            ReleaseDC(self.panel.0, dc);
+            if ok == 0 {
+                return Err(error);
+            }
         }
-        self.text = Some(text);
         self.panel.show(size);
         Ok(())
-    }
-}
-impl Drop for Label {
-    fn drop(&mut self) {
-        unsafe {
-            RemovePropW(self.panel.0, w!("TextLayout"));
-        }
     }
 }
 
@@ -500,6 +564,19 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
     use windows_sys::Win32::System::Threading::*;
+    #[test]
+    fn transparent_text_edges_have_coverage_not_a_color_key() {
+        let blue = crate::colors::colorref(0x0f6cbd);
+        assert_eq!(premultiply_coverage(0, blue), 0);
+        assert_eq!(premultiply_coverage(0xffffff, blue), 0xff0f6cbd);
+        for coverage in 1..255u32 {
+            let pixel = premultiply_coverage(coverage * 0x010101, blue);
+            assert_eq!(pixel >> 24, coverage);
+            for shift in [0, 8, 16] {
+                assert!((pixel >> shift) & 255 <= coverage);
+            }
+        }
+    }
     fn cpu_seconds() -> f64 {
         unsafe {
             let (mut creation, mut exit, mut kernel, mut user) = (
