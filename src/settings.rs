@@ -1757,13 +1757,10 @@ impl Editor {
             self.disk_check = now;
             let disk = config::read_settings(&self.path)?;
             if disk != self.original {
-                let loaded = config::load(&self.path, None)?;
-                self.original = config::read_settings(&self.path)?;
-                self.doc = self
-                    .original
-                    .parse::<DocumentMut>()
-                    .map_err(|e| e.to_string())?;
-                self.cfg = loaded;
+                let loaded = config::load_snapshot(&self.path, None)?;
+                self.original = loaded.text;
+                self.doc = loaded.document;
+                self.cfg = loaded.config;
                 if self.cfg.warnings.is_empty() {
                     self.status(
                         self.cfg
@@ -2370,10 +2367,10 @@ pub fn run(path: &Path) -> Result<(), String> {
             }
             return Ok(());
         }
-        config::load(path, None)?;
-        let original = config::read_settings(path)?;
-        let doc = original.parse::<DocumentMut>().map_err(|e| e.to_string())?;
-        let cfg = Config::parse(&doc)?;
+        let loaded = config::load_snapshot(path, None)?;
+        let original = loaded.text;
+        let doc = loaded.document;
+        let cfg = loaded.config;
         let screen = desktop::screen(desktop::cursor()?, 0)?;
         let dpi = screen.dpi;
         for (name, proc) in [

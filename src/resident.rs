@@ -118,8 +118,9 @@ impl App {
         if automatic && bytes.is_some() && bytes == self.snapshot {
             return Ok(());
         }
-        let mut cfg = config::load(&self.path, None)?;
-        self.snapshot = fs::read(&self.path).ok();
+        let loaded = config::load_snapshot(&self.path, None)?;
+        let mut cfg = loaded.config;
+        self.snapshot = Some(loaded.bytes);
         let sync_task =
             !automatic || (cfg.autostart, cfg.elevate) != (self.cfg.autostart, self.cfg.elevate);
         let mut restart = automatic && cfg.elevate != self.cfg.elevate;
@@ -497,8 +498,9 @@ pub fn run(path: &Path) -> Result<crate::ResidentExit, String> {
             return Err(err());
         }
         let watch = Watch(watch);
-        let cfg = config::load(path, None)?;
-        let snapshot = fs::read(path).ok();
+        let loaded = config::load_snapshot(path, None)?;
+        let cfg = loaded.config;
+        let snapshot = Some(loaded.bytes);
         let overlay = Overlay::new()?;
         let _hooks = input::Hooks::start(&cfg)?;
         let mut app = App {

@@ -197,6 +197,10 @@ pub fn standard_name(name: &str) -> String {
 fn is_builtin_action(name: &str) -> bool {
     ACTIONS.contains(&name)
 }
+fn reserved_preset_name(name: &str) -> bool {
+    let name = command_name(name);
+    is_builtin_action(&name) || ALIASES.iter().any(|(alias, _)| *alias == name)
+}
 
 fn canonicalize(doc: &mut DocumentMut) {
     let names: HashMap<String, String> = doc
@@ -280,8 +284,8 @@ impl Config {
         };
         let mut lines = vec![
             self.tr(
-                "WinSizeP — Esc closes this help",
-                "WinSizeP 帮助：按 Esc 关闭",
+                "WinSizeP — Esc closes; PgUp/PgDn, Up/Down, Home/End scroll long tips",
+                "WinSizeP 帮助：Esc 关闭；内容过长时用翻页键、上下键、Home/End 滚动",
             )
             .to_owned(),
         ];
@@ -399,6 +403,11 @@ impl Config {
         let mut presets = HashMap::new();
         let mut preset_names = HashMap::new();
         for (key, item) in entries("presets")? {
+            if reserved_preset_name(key) {
+                return Err(format!(
+                    "presets.{key}: reserved action name / 分区名与内置动作冲突"
+                ));
+            }
             if key.eq_ignore_ascii_case("esc")
                 || key.eq_ignore_ascii_case("escape")
                 || key.is_empty()
@@ -703,76 +712,29 @@ fn repair_punctuation(text: &str) -> String {
 }
 
 fn document(text: &str) -> Result<(DocumentMut, bool), String> {
-    let spaces = text.replace('\t', "    ");
-    let source = match spaces.parse::<DocumentMut>() {
-        Ok(_) => spaces,
+    match text.parse::<DocumentMut>() {
+        Ok(doc) => Ok((doc, false)),
         Err(original) => {
-            let repaired = repair_punctuation(&spaces);
-            repaired
+            let repaired = repair_punctuation(text);
+            let doc = repaired
                 .parse::<DocumentMut>()
                 .map_err(|_| original.to_string())?;
-            repaired
+            Ok((doc, repaired != text))
         }
-    };
-    let clean = english_comments(&source);
-    let doc = clean
-        .parse::<DocumentMut>()
-        .map_err(|err| err.to_string())?;
-    Ok((doc, clean != text))
-}
-
-fn english_comments(text: &str) -> String {
-    let chars: Vec<_> = text.chars().collect();
-    let mut out = String::with_capacity(text.len());
-    let mut index = 0;
-    let mut quote = None;
-    let mut triple = false;
-    let mut escaped = false;
-    while index < chars.len() {
-        let ch = chars[index];
-        if let Some(end) = quote {
-            out.push(ch);
-            if ch == end
-                && !escaped
-                && (!triple || chars.get(index..index + 3) == Some(&[end, end, end]))
-            {
-                if triple {
-                    out.push(end);
-                    out.push(end);
-                    index += 2;
-                }
-                quote = None;
-            }
-            escaped = end == '"' && ch == '\\' && !escaped;
-        } else if matches!(ch, '"' | '\'') {
-            quote = Some(ch);
-            triple = chars.get(index..index + 3) == Some(&[ch, ch, ch]);
-            escaped = false;
-            out.push(ch);
-            if triple {
-                out.push(ch);
-                out.push(ch);
-                index += 2;
-            }
-        } else if ch == '#' {
-            let end = chars[index..]
-                .iter()
-                .position(|ch| *ch == '\n')
-                .map_or(chars.len(), |n| index + n);
-            if chars[index..end].iter().all(char::is_ascii) {
-                out.extend(&chars[index..end]);
-            }
-            index = end;
-            continue;
-        } else {
-            out.push(ch);
-        }
-        index += 1;
     }
-    out
 }
 
-fn migrate(doc: &mut DocumentMut) {
+fn migrate(doc: &mut DocumentMut) -> Result<(), String> {
+    // Validate the destination before removing any legacy fields. A malformed
+    // document must remain available for correction instead of panicking in a callback.
+    if doc
+        .get("general")
+        .and_then(Item::as_table)
+        .is_some_and(|general| general.contains_key("alt") || general.contains_key("gesture"))
+        && doc.get("shortcuts").is_some_and(|item| !item.is_table())
+    {
+        return Err("shortcuts: expected a table / 快捷操作配置必须为表".into());
+    }
     // Convert the old edge-highlight schema once, so later deliberate font/alpha edits survive.
     if let Some(legacy) = doc
         .get_mut("outline")
@@ -809,23 +771,8 @@ fn migrate(doc: &mut DocumentMut) {
             doc["tip"]["font_size"] = value(12);
         }
     }
-    if let Some(keys) = doc.get_mut("keys").and_then(Item::as_table_mut) {
-        let old = keys
-            .iter()
-            .find(|(key, item)| {
-                key.eq_ignore_ascii_case("f1")
-                    && item
-                        .as_str()
-                        .is_some_and(|name| name.eq_ignore_ascii_case("help"))
-            })
-            .map(|(key, _)| key.to_owned());
-        if let Some(old) = old
-            && !keys.iter().any(|(key, _)| key.eq_ignore_ascii_case("h"))
-        {
-            keys.remove(&old);
-            keys.insert("H", value("Help"));
-        }
-    }
+    // Key bindings are user data. Historical defaults cannot distinguish an old
+    // template from a deliberate F1 binding; only new files get the current H default.
     for key in ["alt", "gesture"] {
         if let Some(item) = doc
             .get_mut("general")
@@ -851,9 +798,21 @@ fn migrate(doc: &mut DocumentMut) {
             table.remove(key);
         }
     }
+    Ok(())
 }
 
 fn recover(doc: &mut DocumentMut) -> Result<Config, String> {
+    // Dropping a conflicting preset would reinterpret its bindings as actions.
+    // Reject before canonicalization or any other document mutation.
+    if let Some((key, _)) = doc
+        .get("presets")
+        .and_then(Item::as_table)
+        .and_then(|table| table.iter().find(|(key, _)| reserved_preset_name(key)))
+    {
+        return Err(format!(
+            "presets.{key}: reserved action name / 分区名与内置动作冲突"
+        ));
+    }
     let defaults = help()
         .parse::<DocumentMut>()
         .map_err(|err| err.to_string())?;
@@ -902,9 +861,12 @@ fn recover(doc: &mut DocumentMut) -> Result<Config, String> {
                     .unwrap_or_else(|| error.split([':', ' ', '(']).next().unwrap_or_default());
                 if field.starts_with("exclusions") || field == "[[exclusions]]" || field == "empty"
                 {
-                    doc.remove("exclusions");
-                    warnings.push("exclusions".into());
-                    continue;
+                    // Exclusions restrict which windows may be changed. Guessing at
+                    // invalid rules can silently remove those restrictions. Reject this
+                    // update so callers keep their last valid configuration and the file.
+                    return Err(format!(
+                        "{error}: exclusion rules were preserved; correct the invalid rule / 排除规则已保留，请修正无效项"
+                    ));
                 }
                 let Some((section, key)) = field.split_once('.') else {
                     return Err(error);
@@ -1032,16 +994,29 @@ fn lock() -> Result<Lock, String> {
     }
 }
 
-fn write(path: &Path, text: &str) -> io::Result<()> {
+fn write(path: &Path, text: &str, expected: Option<&[u8]>) -> io::Result<()> {
     let temp = path.with_extension(format!("{}.tmp", std::process::id()));
     let mut file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&temp)?;
     let result = (|| {
-        file.write_all(text.replace('\t', "    ").as_bytes())?;
+        file.write_all(text.as_bytes())?;
         file.sync_all()?;
         drop(file);
+        // Editors outside WinSizeP do not acquire our mutex. Refuse an observed
+        // intervening edit rather than replacing a version we never merged.
+        let current = match fs::read(path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        if current.as_deref() != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Configuration changed during save; retry / 保存期间配置已变化，请重试",
+            ));
+        }
         fs::rename(&temp, path)
     })();
     if result.is_err() {
@@ -1060,7 +1035,7 @@ pub fn requested_elevation(path: &Path) -> Result<bool, String> {
         Err(error) => return Err(error.to_string()),
     };
     let (mut doc, _) = document(&text)?;
-    migrate(&mut doc);
+    migrate(&mut doc)?;
     Ok(recover(&mut doc)?.elevate)
 }
 
@@ -1071,29 +1046,44 @@ pub fn save_settings(path: &Path, original: &str, doc: &DocumentMut) -> Result<S
     let (base, _) = document(original)?;
     let (mut disk, _) = document(&decode(&bytes)?)?;
     merge_edits(base.as_table(), doc.as_table(), disk.as_table_mut());
-    migrate(&mut disk);
+    migrate(&mut disk)?;
     recover(&mut disk)?;
-    let saved = disk.to_string().replace('\t', "    ");
-    write(path, &saved).map_err(|err| err.to_string())?;
+    let saved = disk.to_string();
+    write(path, &saved, Some(&bytes)).map_err(|err| err.to_string())?;
     Ok(saved)
 }
 
+pub struct Loaded {
+    pub config: Config,
+    pub document: DocumentMut,
+    pub text: String,
+    pub bytes: Vec<u8>,
+}
+
 pub fn load(path: &Path, edit: Option<(&Identity, Switch)>) -> Result<Config, String> {
+    load_snapshot(path, edit).map(|loaded| loaded.config)
+}
+
+/// All returned values describe the same read (or the same committed write).
+pub fn load_snapshot(path: &Path, edit: Option<(&Identity, Switch)>) -> Result<Loaded, String> {
     let _lock = lock()?;
-    let (text, new) = match fs::read(path) {
-        Ok(bytes) => (decode(&bytes)?, false),
+    let (bytes, new) = match fs::read(path) {
+        Ok(bytes) => (bytes, false),
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
             let legacy = path.with_file_name("winsizep_config");
             match fs::read(legacy) {
-                Ok(bytes) => (decode(&bytes)?, true),
-                Err(err) if err.kind() == io::ErrorKind::NotFound => (help().into(), true),
+                Ok(bytes) => (bytes, true),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                    (help().as_bytes().to_vec(), true)
+                }
                 Err(err) => return Err(err.to_string()),
             }
         }
         Err(err) => return Err(err.to_string()),
     };
+    let text = decode(&bytes)?;
     let (mut doc, repaired) = document(&text)?;
-    migrate(&mut doc);
+    migrate(&mut doc)?;
     let mut config = recover(&mut doc)?;
     let mut changed = new || repaired || doc.to_string() != text;
     if let Some((id, switch)) = edit {
@@ -1128,15 +1118,112 @@ pub fn load(path: &Path, edit: Option<(&Identity, Switch)>) -> Result<Config, St
             config = Config::parse(&doc)?;
         }
     }
-    if changed {
-        write(path, &doc.to_string()).map_err(|err| err.to_string())?
-    }
-    Ok(config)
+    let (text, bytes) = if changed {
+        let text = doc.to_string();
+        write(path, &text, (!new).then_some(bytes.as_slice())).map_err(|err| err.to_string())?;
+        let bytes = text.as_bytes().to_vec();
+        (text, bytes)
+    } else {
+        (text, bytes)
+    };
+    Ok(Loaded {
+        config,
+        document: doc,
+        text,
+        bytes,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn built_in_actions_and_aliases_cannot_be_reinterpreted_as_presets() {
+        for name in ACTIONS
+            .iter()
+            .copied()
+            .chain(ALIASES.iter().map(|(alias, _)| *alias))
+            .chain([" Quit ", "Ｑｕｉｔ"])
+        {
+            let mut doc = help().parse::<DocumentMut>().unwrap();
+            doc["presets"][name] = value("0|0|100|100");
+            doc["keys"]["Q"] = value(name);
+            assert!(
+                Config::parse(&doc)
+                    .err()
+                    .unwrap()
+                    .contains("reserved action name")
+            );
+            assert!(recover(&mut doc).is_err());
+            assert!(doc["presets"].get(name).is_some());
+            assert_eq!(doc["keys"]["Q"].as_str(), Some(name));
+        }
+    }
+    #[test]
+    fn snapshot_keeps_the_version_that_was_actually_parsed() {
+        let folder = std::env::temp_dir().join(format!("winsizep-snapshot-{}", std::process::id()));
+        fs::create_dir_all(&folder).unwrap();
+        let path = folder.join("config.toml");
+        fs::write(&path, encode(help())).unwrap();
+        let first = load_snapshot(&path, None).unwrap();
+        let mut newer = first.document.clone();
+        newer["crosshair"]["fps"] = value(120);
+        fs::write(&path, newer.to_string()).unwrap();
+        assert_eq!(
+            write(&path, "unmerged", Some(&first.bytes))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(first.config.fps, 30.0);
+        assert_eq!(decode(&first.bytes).unwrap(), first.text);
+        assert_ne!(first.bytes, fs::read(&path).unwrap());
+        let second = load_snapshot(&path, None).unwrap();
+        assert_eq!(second.config.fps, 120.0);
+        assert_eq!(second.document["crosshair"]["fps"].as_integer(), Some(120));
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(folder).unwrap();
+    }
+    #[test]
+    fn invalid_exclusion_never_removes_valid_protection() {
+        for invalid in ["name = 123", "class = false", "title = []", ""] {
+            let source = format!(
+                "{}\n[[exclusions]]\nname = 'protected.exe'\n[[exclusions]]\n{invalid}\n",
+                help()
+            );
+            let mut doc = source.parse::<DocumentMut>().unwrap();
+            let before = doc["exclusions"].to_string();
+            assert!(recover(&mut doc).is_err());
+            assert_eq!(doc["exclusions"].to_string(), before);
+        }
+        let mut doc = help().parse::<DocumentMut>().unwrap();
+        doc["exclusions"] = value("invalid");
+        assert!(recover(&mut doc).is_err());
+        assert_eq!(doc["exclusions"].as_str(), Some("invalid"));
+    }
+    #[test]
+    fn malformed_migration_destination_returns_an_error_without_changing_input() {
+        for key in ["alt", "gesture"] {
+            for malformed in [
+                value(123),
+                value("left"),
+                value(false),
+                value(toml_edit::Array::new()),
+            ] {
+                let mut doc = help().parse::<DocumentMut>().unwrap();
+                doc["general"][key] = value("left");
+                doc["shortcuts"] = malformed;
+                let original = doc.to_string();
+                assert!(migrate(&mut doc).unwrap_err().starts_with("shortcuts:"));
+                assert_eq!(doc.to_string(), original);
+            }
+        }
+        let mut doc = help().parse::<DocumentMut>().unwrap();
+        doc.as_table_mut().remove("shortcuts");
+        doc["general"]["alt"] = value("right");
+        migrate(&mut doc).unwrap();
+        assert_eq!(recover(&mut doc).unwrap().alt, "right");
+    }
     #[test]
     fn new_defaults_and_migration_do_not_override_later_user_edits() {
         let mut doc = help().parse::<DocumentMut>().unwrap();
@@ -1150,16 +1237,16 @@ mod tests {
             .remove("fill_opacity");
         doc["outline"]["highlight_opacity"] = value(255);
         doc["tip"]["font_size"] = value(16);
-        migrate(&mut doc);
+        migrate(&mut doc).unwrap();
         assert_eq!(doc["outline"]["fill_opacity"].as_integer(), Some(48));
         doc["tip"]["font_size"] = value(16);
         doc["outline"]["fill_opacity"] = value(255);
-        migrate(&mut doc);
+        migrate(&mut doc).unwrap();
         assert_eq!(doc["tip"]["font_size"].as_integer(), Some(16));
         assert_eq!(doc["outline"]["fill_opacity"].as_integer(), Some(255));
     }
     #[test]
-    fn default_help_key_is_h_and_legacy_migration_respects_custom_bindings() {
+    fn new_help_default_is_h_but_migration_preserves_explicit_f1() {
         let mut doc = help().parse::<DocumentMut>().unwrap();
         assert_eq!(
             Config::parse(&doc)
@@ -1171,12 +1258,15 @@ mod tests {
         );
         doc["keys"].as_table_mut().unwrap().remove("H");
         doc["keys"]["F1"] = value("Help");
-        migrate(&mut doc);
-        assert!(doc["keys"].get("F1").is_none());
-        assert_eq!(doc["keys"]["H"].as_str(), Some("Help"));
+        migrate(&mut doc).unwrap();
+        assert_eq!(doc["keys"]["F1"].as_str(), Some("Help"));
+        assert!(doc["keys"].get("H").is_none());
+        migrate(&mut doc).unwrap();
+        assert_eq!(doc["keys"]["F1"].as_str(), Some("Help"));
+        assert!(doc["keys"].get("H").is_none());
         doc["keys"]["H"] = value("Horizontal");
         doc["keys"]["F1"] = value("Help");
-        migrate(&mut doc);
+        migrate(&mut doc).unwrap();
         assert_eq!(doc["keys"]["H"].as_str(), Some("Horizontal"));
         assert_eq!(doc["keys"]["F1"].as_str(), Some("Help"));
     }
@@ -1196,7 +1286,7 @@ mod tests {
         assert!(repaired);
         assert_eq!(doc["tip"]["font"].as_str(), Some("微软雅黑"));
         assert_eq!(doc["tip"]["window_format"].as_str(), Some("中文，。‘’【】"));
-        assert!(!doc.to_string().contains("# 注释：，"));
+        assert!(doc.to_string().contains("# 注释：，"));
         assert!(repair_punctuation(text).contains("# 注释：，"));
         let valid = "[tip]\nfont = '“微软雅黑”'\n";
         assert!(!document(valid).unwrap().1);
@@ -1293,7 +1383,7 @@ mod tests {
         assert_eq!(cfg.warnings, ["presets.My Region"]);
     }
     #[test]
-    fn comment_migration_preserves_hashes_and_multiline_strings() {
+    fn parsing_preserves_comments_hashes_and_multiline_strings() {
         let source = "# 旧注释\n[tip]\nwindow_format = '''中文 # 注释不是注释\n下一行''' # 删除\nfont = \"SystemFont\" # English\n";
         let (doc, _) = document(source).unwrap();
         assert_eq!(
@@ -1301,6 +1391,33 @@ mod tests {
             Some("中文 # 注释不是注释\n下一行")
         );
         assert!(doc.to_string().contains("# English"));
-        assert!(!doc.to_string().contains("# 旧注释"));
+        assert_eq!(doc.to_string(), source);
+    }
+    #[test]
+    fn saving_an_unrelated_setting_preserves_tabs_and_unicode_comments() {
+        let folder = std::env::temp_dir().join(format!("winsizep-preserve-{}", std::process::id()));
+        fs::create_dir_all(&folder).unwrap();
+        let path = folder.join("config.toml");
+        let original = format!(
+            "{}\n# 保留用户说明\n[[exclusions]]\ntitle = 'before\tafter'\n",
+            help()
+        );
+        fs::write(&path, &original).unwrap();
+        let loaded = load_snapshot(&path, None).unwrap();
+        assert_eq!(
+            loaded.text.replace("\r\n", "\n"),
+            original.replace("\r\n", "\n")
+        );
+        let mut draft = loaded.document;
+        draft["general"]["preview"] = value(false);
+        let saved = save_settings(&path, &original, &draft).unwrap();
+        assert!(saved.contains("# 保留用户说明"));
+        assert!(saved.contains("'before\tafter'"));
+        assert_eq!(
+            load(&path, None).unwrap().exclusions[0].title,
+            "before\tafter"
+        );
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(folder).unwrap();
     }
 }
