@@ -2,6 +2,7 @@
 name = "winsizep"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 
 [dependencies]
 windows = { version = "0.62.2", default-features = false, features = [
@@ -14,7 +15,8 @@ windows = { version = "0.62.2", default-features = false, features = [
     "Win32_System_TaskScheduler",
     "Win32_System_Variant",
 ] }
-windows-numerics = { version = "0.3.1", default-features = false }
+# windows 0.62.2 depends on windows-numerics 0.3.1.
+windows-numerics = { version = "=0.3.1", default-features = false }
 toml_edit = { version = "0.25.19", default-features = false, features = [
     "parse",
     "display",
