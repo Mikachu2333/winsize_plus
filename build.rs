@@ -1,10 +1,15 @@
 fn main() -> std::io::Result<()> {
     let icon = "assets/winsizep.ico";
     println!("cargo:rerun-if-changed={icon}");
-    println!("cargo:rerun-if-changed=assets/settings.rc");
+    println!("cargo:rerun-if-changed=assets/winsizep.manifest");
+    // Cargo.toml [package].version is the sole product-version source.
+    let version = std::env::var("CARGO_PKG_VERSION").expect("Cargo package version");
+    let numbers = version.split(['-', '+']).next().unwrap_or(&version);
+    let manifest =
+        include_str!("assets/winsizep.manifest").replace("@VERSION@", &format!("{numbers}.0"));
     winresource::WindowsResource::new()
         .set_icon(icon)
+        .set_manifest(&manifest)
         .add_toolkit_include(true)
-        .append_rc_content(include_str!("assets/settings.rc"))
         .compile_for("winsizep")
 }
