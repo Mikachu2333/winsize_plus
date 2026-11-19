@@ -3,6 +3,7 @@
 mod cli;
 mod config;
 mod desktop;
+mod fonts;
 mod framerate;
 mod input;
 mod layout;

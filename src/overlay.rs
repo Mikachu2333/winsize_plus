@@ -1,10 +1,14 @@
 use crate::{
     config::Config,
-    desktop::{self, Display, check, err, wide},
+    desktop::{self, Display, check, err},
+    fonts::{Fonts, TextLayout},
     layout::Rect,
     tray::APP_ICON,
 };
-use std::ptr::{null, null_mut};
+use std::{
+    cell::Cell,
+    ptr::{null, null_mut},
+};
 use windows_sys::{
     Win32::{
         Foundation::*,
@@ -28,6 +32,20 @@ unsafe extern "system" fn paint(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
                 GetClientRect(hwnd, &mut area);
                 SetDCBrushColor(dc, GetWindowLongPtrW(hwnd, GWLP_USERDATA) as u32);
                 FillRect(dc, &area, GetStockObject(DC_BRUSH));
+                let layout = GetPropW(hwnd, w!("TextLayout")) as *const TextLayout;
+                if !layout.is_null() {
+                    // SAFETY: the owning overlay removes this property before dropping the boxed layout.
+                    let layout = &*layout;
+                    let padding = GetPropW(hwnd, w!("Padding")) as usize as i32;
+                    let color = GetPropW(hwnd, w!("TextColor")) as usize as u32;
+                    layout.draw(
+                        dc,
+                        padding * 2,
+                        padding,
+                        color,
+                        GetPropW(hwnd, w!("Centered")) as usize != 0,
+                    );
+                }
                 let font = GetPropW(hwnd, w!("Font"));
                 if !font.is_null() {
                     let mut text = vec![0; GetWindowTextLengthW(hwnd) as usize + 1];
@@ -55,7 +73,7 @@ unsafe extern "system" fn paint(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
         }
     }
 }
-pub(crate) struct Panel(pub HWND);
+pub(crate) struct Panel(pub HWND, Cell<Option<Rect>>);
 impl Panel {
     pub(crate) fn new() -> Result<Self, String> {
         unsafe {
@@ -76,7 +94,7 @@ impl Panel {
             if hwnd.is_null() {
                 Err(err())
             } else {
-                Ok(Self(hwnd))
+                Ok(Self(hwnd, Cell::new(None)))
             }
         }
     }
@@ -88,8 +106,16 @@ impl Panel {
         }
     }
     pub(crate) fn show(&self, rect: Rect) {
+        if self.1.get() == Some(rect) {
+            return;
+        }
         unsafe {
             if rect.width > 0 && rect.height > 0 {
+                let z_order = if self.1.get().is_some() {
+                    SWP_NOZORDER
+                } else {
+                    0
+                };
                 SetWindowPos(
                     self.0,
                     HWND_TOPMOST,
@@ -97,14 +123,22 @@ impl Panel {
                     rect.y,
                     rect.width,
                     rect.height,
-                    SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOOWNERZORDER,
+                    SWP_NOACTIVATE
+                        | SWP_SHOWWINDOW
+                        | SWP_NOOWNERZORDER
+                        | SWP_NOSENDCHANGING
+                        | z_order,
                 );
+                self.1.set(Some(rect));
             } else {
                 self.hide();
             }
         }
     }
     pub(crate) fn hide(&self) {
+        if self.1.take().is_none() {
+            return;
+        }
         unsafe {
             ShowWindow(self.0, SW_HIDE);
         }
@@ -134,7 +168,7 @@ impl Drop for Panel {
 pub struct Overlay {
     tip: Panel,
     shadow: Panel,
-    font: HFONT,
+    text: Option<Box<TextLayout>>,
     segments: Vec<Panel>,
     mode: u8,
     last_monitor: HMONITOR,
@@ -143,7 +177,7 @@ pub struct Overlay {
 fn scale(value: i32, dpi: i32) -> i32 {
     (value * dpi + 48) / 96
 }
-fn dark() -> bool {
+pub fn dark() -> bool {
     unsafe {
         let mut light = 1u32;
         let mut len = 4;
@@ -177,7 +211,7 @@ impl Overlay {
             Ok(Self {
                 shadow: Panel::new()?,
                 tip,
-                font: null_mut(),
+                text: None,
                 segments: Vec::new(),
                 mode: 0,
                 last_monitor: null_mut(),
@@ -191,91 +225,61 @@ impl Overlay {
         self.shadow.hide()
     }
     pub fn tip(&mut self, text: &str, cfg: &Config) -> Result<(), String> {
-        crate::input::tip_visible(true);
+        let screen = desktop::screen(desktop::cursor()?, 0)?;
+        let dpi = screen.dpi;
+        let padding = scale(8, dpi);
+        let fonts = Fonts::new(
+            &cfg.font,
+            &cfg.font_fallbacks,
+            cfg.font_size,
+            dpi,
+            cfg.font_bold,
+            cfg.font_italic,
+        )?;
+        let text = Box::new(TextLayout::new(
+            text,
+            fonts,
+            (screen.work.width - 4 * padding).max(1),
+        )?);
+        let width = (text.width + 4 * padding).min(screen.work.width);
+        let height = (text.height + 2 * padding).min(screen.work.height);
+        let index = if cfg.theme == "dark" || (cfg.theme == "system" && dark()) {
+            2
+        } else {
+            0
+        };
         unsafe {
-            let screen = desktop::screen(desktop::cursor()?, 0)?;
-            let dpi = screen.dpi;
-            let text = wide(text);
-            let font = CreateFontW(
-                -scale(cfg.font_size, dpi),
-                0,
-                0,
-                0,
-                FW_NORMAL as i32,
-                0,
-                0,
-                0,
-                DEFAULT_CHARSET.into(),
-                0,
-                0,
-                CLEARTYPE_QUALITY.into(),
-                0,
-                wide(&cfg.font).as_ptr(),
-            );
-            if font.is_null() {
-                return Err(err());
-            }
-            let hwnd = self.tip.0;
-            let dc = GetDC(hwnd);
-            if dc.is_null() {
-                DeleteObject(font);
-                return Err(err());
-            }
-            let old = SelectObject(dc, font);
-            let padding = scale(8, dpi);
-            let mut size = RECT {
-                right: (screen.work.width - 4 * padding).max(1),
-                ..Default::default()
-            };
-            let measured = DrawTextW(
-                dc,
-                text.as_ptr(),
-                (text.len() - 1) as i32,
-                &mut size,
-                DT_CALCRECT | DT_NOPREFIX | DT_WORDBREAK,
-            );
-            SelectObject(dc, old);
-            ReleaseDC(hwnd, dc);
-            if measured == 0 || SetPropW(hwnd, w!("Font"), font) == 0 {
-                DeleteObject(font);
-                return Err(err());
-            }
-            if !self.font.is_null() {
-                DeleteObject(self.font);
-            }
-            self.font = font;
-            SetPropW(hwnd, w!("Padding"), padding as usize as HANDLE);
-            let index = if cfg.theme == "dark" || (cfg.theme == "system" && dark()) {
-                2
-            } else {
-                0
-            };
+            check(SetPropW(
+                self.tip.0,
+                w!("TextLayout"),
+                (&*text as *const TextLayout) as HANDLE,
+            ))?;
+            SetPropW(self.tip.0, w!("Padding"), padding as usize as HANDLE);
             SetPropW(
-                hwnd,
+                self.tip.0,
                 w!("TextColor"),
                 cfg.colors[index + 1] as usize as HANDLE,
             );
-            check(SetWindowTextW(hwnd, text.as_ptr()))?;
-            self.tip.style(cfg.colors[index], 255);
-            let width = (size.right + 4 * padding).min(screen.work.width);
-            let height = (size.bottom + 2 * padding).min(screen.work.height);
-            let rect = Rect {
-                x: screen.work.x + (screen.work.width - width) / 2,
-                y: screen.work.y + screen.work.height - height - scale(6, dpi),
-                width,
-                height,
-            };
-            let radius = scale(12, dpi);
-            self.tip.round(width, height, radius)?;
-            self.shadow.round(width, height, radius)?;
-            self.shadow.style(0, 70);
-            self.shadow.show(Rect {
-                y: rect.y + scale(3, dpi),
-                ..rect
-            });
-            self.tip.show(rect);
-            Ok(())
         }
+        self.text = Some(text);
+        self.tip.style(cfg.colors[index], 255);
+        let rect = Rect {
+            x: screen.work.x + (screen.work.width - width) / 2,
+            y: screen.work.y + screen.work.height - height - scale(6, dpi),
+            width,
+            height,
+        };
+        let radius = scale(12, dpi);
+        self.tip.round(width, height, radius)?;
+        self.shadow.round(width, height, radius)?;
+        self.shadow.style(0, 70);
+        self.shadow.show(Rect {
+            y: rect.y + scale(3, dpi),
+            ..rect
+        });
+        self.tip.show(rect);
+        crate::input::tip_visible(true);
+        Ok(())
     }
     pub fn mode(&self) -> u8 {
         self.mode
@@ -369,10 +373,69 @@ impl Overlay {
 impl Drop for Overlay {
     fn drop(&mut self) {
         unsafe {
-            RemovePropW(self.tip.0, w!("Font"));
-            if !self.font.is_null() {
-                DeleteObject(self.font);
-            }
+            RemovePropW(self.tip.0, w!("TextLayout"));
+        }
+    }
+}
+
+pub struct Label {
+    panel: Panel,
+    text: Option<Box<TextLayout>>,
+}
+impl Label {
+    pub fn new() -> Result<Self, String> {
+        Ok(Self {
+            panel: Panel::new()?,
+            text: None,
+        })
+    }
+    pub fn hide(&self) {
+        self.panel.hide();
+    }
+    pub fn show(
+        &mut self,
+        caption: &str,
+        region: Rect,
+        color: u32,
+        dpi: i32,
+        cfg: &Config,
+    ) -> Result<(), String> {
+        let fonts = Fonts::new(
+            &cfg.region_font,
+            &cfg.region_fallbacks,
+            cfg.region_font_size,
+            dpi,
+            cfg.region_bold,
+            cfg.region_italic,
+        )?;
+        let text = Box::new(TextLayout::new(caption, fonts, region.width.max(1))?);
+        let size = Rect {
+            x: region.x + (region.width - text.width) / 2,
+            y: region.y + (region.height - text.height) / 2,
+            width: text.width,
+            height: text.height,
+        };
+        unsafe {
+            check(SetPropW(
+                self.panel.0,
+                w!("TextLayout"),
+                (&*text as *const TextLayout) as HANDLE,
+            ))?;
+            SetPropW(self.panel.0, w!("Centered"), 1usize as HANDLE);
+            SetPropW(self.panel.0, w!("TextColor"), color as usize as HANDLE);
+            SetWindowLongPtrW(self.panel.0, GWLP_USERDATA, 0x010101);
+            SetLayeredWindowAttributes(self.panel.0, 0x010101, 255, LWA_COLORKEY);
+            InvalidateRect(self.panel.0, null(), 0);
+        }
+        self.text = Some(text);
+        self.panel.show(size);
+        Ok(())
+    }
+}
+impl Drop for Label {
+    fn drop(&mut self) {
+        unsafe {
+            RemovePropW(self.panel.0, w!("TextLayout"));
         }
     }
 }

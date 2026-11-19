@@ -15,10 +15,7 @@ use std::{
 };
 use windows_sys::{
     Win32::{
-        Foundation::*,
-        Storage::FileSystem::*,
-        System::{SystemInformation::GetLocalTime, Threading::*},
-        UI::WindowsAndMessaging::*,
+        Foundation::*, Storage::FileSystem::*, System::Threading::*, UI::WindowsAndMessaging::*,
     },
     core::w,
 };
@@ -51,6 +48,7 @@ struct App {
     preview: Preview,
     hold: Option<(Instant, HWND)>,
     held_window: Option<HWND>,
+    preview_latched: bool,
     window: HWND,
     drag: Option<desktop::Drag>,
     command: String,
@@ -65,7 +63,7 @@ impl App {
         self.preview.hide();
         input::track_preview(false)?;
         if self.cfg.preview
-            && let Some(hwnd) = self.held_window.or(self.wait.map(|_| self.window))
+            && let Some(hwnd) = self.held_window
         {
             self.preview.start(hwnd, &self.cfg)?;
             input::track_preview(true)?;
@@ -82,14 +80,8 @@ impl App {
                 let number = desktop::screen(desktop::cursor()?, 0)?.number;
                 self.notice(&format!("{} {number}", self.cfg.tr("Monitor", "屏幕")))
             }
-            "time" => {
-                let mut time = SYSTEMTIME::default();
-                unsafe { GetLocalTime(&mut time) };
-                self.notice(&format!(
-                    "{:02}:{:02}:{:02}",
-                    time.wHour, time.wMinute, time.wSecond
-                ))
-            }
+            "time" => self.notice(&desktop::time_text(&self.cfg.time_format)),
+            "window" => self.notice(&desktop::window_text(self.window, &self.cfg.window_format)),
             _ => {
                 self.clear();
                 Ok(())
@@ -179,7 +171,25 @@ impl App {
                 };
                 self.overlay.guides(mode, &self.cfg)?;
                 self.frames.reset(self.cfg.fps);
-                input::set_guides(mode != 0)
+                input::set_guides(mode != 0)?;
+                self.notice(if mode == 0 {
+                    self.cfg.tr("Crosshair hidden", "十字线已隐藏")
+                } else {
+                    self.cfg.tr("Crosshair shown", "十字线已显示")
+                })
+            }
+            "borders" => {
+                if self.preview.visible() {
+                    self.held_window = None;
+                    self.preview.hide();
+                    input::track_preview(false)?;
+                    self.notice(self.cfg.tr("Outlines hidden", "框线已隐藏"))
+                } else {
+                    self.held_window = Some(self.window);
+                    self.preview_latched = true;
+                    self.refresh_preview()?;
+                    self.notice(self.cfg.tr("Outlines shown", "框线已显示"))
+                }
             }
             name if self.cfg.presets.contains_key(name) || matches!(name, "top" | "ignore") => {
                 let req = match name {
@@ -188,7 +198,7 @@ impl App {
                         ..Default::default()
                     },
                     "ignore" => Request {
-                        ignore: Some(Switch::Toggle),
+                        ignore: Some(Switch::On),
                         ..Default::default()
                     },
                     _ => Request {
@@ -205,7 +215,17 @@ impl App {
                         self.cfg.tr("Excluded", "已排除")
                     } else {
                         self.cfg.tr("Included", "已取消排除")
-                    })?
+                    })?;
+                    input::configure(&self.cfg)?;
+                } else if name == "top" {
+                    let top = unsafe {
+                        GetWindowLongW(self.window, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST != 0
+                    };
+                    self.notice(if top {
+                        self.cfg.tr("Always on top enabled", "已置顶")
+                    } else {
+                        self.cfg.tr("Always on top disabled", "已取消置顶")
+                    })?;
                 }
                 Ok(())
             }
@@ -254,23 +274,33 @@ impl App {
             }
             input::ARMED => {
                 self.window = msg.wParam as HWND;
-                self.wait = Some(later(self.cfg.wait_ms));
+                self.wait = Some(later(self.cfg.duration));
+                self.hold = None;
+                self.held_window = None;
+                self.preview_latched = true;
                 self.refresh_preview()?;
                 self.status(&self.cfg.show.clone())
             }
             input::ALT_HOLD => {
-                self.hold = Some((later(self.cfg.double_ms), msg.wParam as HWND));
-                Ok(())
+                self.window = msg.wParam as HWND;
+                self.hold = Some((later(self.cfg.duration), self.window));
+                self.wait = None;
+                self.held_window = None;
+                self.preview_latched = false;
+                self.refresh_preview()?;
+                self.status(&self.cfg.show.clone())
             }
             input::ALT_RELEASE => {
                 self.hold = None;
-                if self.held_window.take().is_some() {
+                if !self.preview_latched && self.held_window.take().is_some() {
                     self.refresh_preview()?;
                 }
                 Ok(())
             }
             input::ACTION => {
                 self.wait = None;
+                self.hold = None;
+                self.held_window = None;
                 self.refresh_preview()?;
                 self.clear();
                 if let Some(action) = self.cfg.keys.get(&(msg.wParam as u32)).cloned() {
@@ -292,9 +322,14 @@ impl App {
                 Ok(())
             }
             input::CLICK => {
+                self.preview.hide();
+                self.held_window = None;
+                self.hold = None;
+                self.wait = None;
+                input::track_preview(false)?;
                 let point = input::click_point(msg.lParam);
                 let screen = desktop::screen(point, 0)?;
-                let cell = screen.work.grid(point.x, point.y) as u32 + 1;
+                let cell = screen.full.grid(point.x, point.y) as u32 + 1;
                 if let Some(preset) = self.cfg.cell(screen.number, cell) {
                     desktop::apply(
                         msg.wParam as HWND,
@@ -308,6 +343,12 @@ impl App {
                     )?
                 }
                 Ok(())
+            }
+            input::GRID_SHOW => {
+                self.window = msg.wParam as HWND;
+                self.hold = None;
+                self.preview.grid(self.window, &self.cfg)?;
+                input::track_preview(true)
             }
             input::DRAG_START => {
                 self.drag = Some(desktop::Drag::start(
@@ -333,11 +374,14 @@ impl App {
             input::CANCEL => {
                 input::cancel();
                 self.drag = None;
+                self.clear();
+                if self.preview.reset(&self.cfg)? {
+                    return Ok(());
+                }
                 self.hold = None;
                 self.held_window = None;
                 self.wait = None;
                 self.refresh_preview()?;
-                self.clear();
                 Ok(())
             }
             WM_QUIT => {
@@ -370,10 +414,11 @@ impl App {
         }
         if self.wait.is_some_and(|when| now >= when) {
             self.wait = None;
+            self.held_window = Some(self.window);
             self.refresh_preview()?;
-            if input::is_waiting() {
-                input::cancel();
-            }
+        }
+        if self.preview.deadline().is_some_and(|when| now >= when) {
+            self.preview.tick(&self.cfg)?;
         }
         if self.hide.is_some_and(|when| now >= when) {
             self.clear()
@@ -390,6 +435,7 @@ impl App {
             self.hide,
             self.reload,
             self.hold.map(|(when, _)| when),
+            self.preview.deadline(),
         ]
         .into_iter()
         .flatten()
@@ -450,6 +496,7 @@ pub fn run(path: &Path) -> Result<crate::ResidentExit, String> {
             preview: Preview::new()?,
             hold: None,
             held_window: None,
+            preview_latched: false,
             window: null_mut(),
             drag: None,
             command: String::new(),

@@ -22,6 +22,7 @@ pub const ALT_HOLD: u32 = WM_APP + 7;
 pub const ALT_RELEASE: u32 = WM_APP + 8;
 pub const DRAG_START: u32 = WM_APP + 9;
 pub const DRAG_END: u32 = WM_APP + 10;
+pub const GRID_SHOW: u32 = WM_APP + 11;
 const LEFT: u32 = VK_LMENU as u32;
 const RIGHT: u32 = VK_RMENU as u32;
 
@@ -338,6 +339,7 @@ unsafe extern "system" fn mouse(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
                                 let resize = input.resize_button == Some(button);
                                 let draggable = resize || input.move_button == Some(button);
                                 if draggable || button == 2 {
+                                    if button == 2 { post(GRID_SHOW, input.gesture_target as usize, 0); }
                                     input.drag = Some(PointerAction { start: data.pt, button, resize, draggable, active: false, canceled: false });
                                     return true;
                                 }
@@ -395,9 +397,6 @@ pub fn moved() -> POINT {
         input.queued = false;
         input.point
     })
-}
-pub fn is_waiting() -> bool {
-    INPUT.with_borrow(|input| input.mode == Mode::Wait)
 }
 pub fn cancel() {
     INPUT.with_borrow_mut(|input| {

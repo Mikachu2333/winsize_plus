@@ -141,6 +141,13 @@ fn title(hwnd: HWND) -> String {
     }
 }
 fn name(hwnd: HWND) -> String {
+    process_path(hwnd)
+        .rsplit('\\')
+        .next()
+        .unwrap_or_default()
+        .into()
+}
+fn process_path(hwnd: HWND) -> String {
     unsafe {
         let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid(hwnd));
         if process.is_null() {
@@ -154,12 +161,107 @@ fn name(hwnd: HWND) -> String {
             String::new()
         } else {
             String::from_utf16_lossy(&buf[..len as usize])
-                .rsplit('\\')
-                .next()
-                .unwrap_or_default()
-                .into()
         }
     }
+}
+pub fn window_text(hwnd: HWND, format: &str) -> String {
+    let id = identity(hwnd);
+    let display_name = if format.contains("{display_name}") {
+        process_description(hwnd).unwrap_or_else(|| id.name.clone())
+    } else {
+        String::new()
+    };
+    // Parse placeholders once so a window title containing braces remains literal.
+    let values = [
+        ("hwnd", format!("0x{:X}", hwnd as usize)),
+        ("title", id.title),
+        ("pid", pid(hwnd).to_string()),
+        ("process", id.name),
+        ("display_name", display_name),
+        ("class", id.class),
+    ];
+    let mut result = String::new();
+    let mut rest = format;
+    while let Some(start) = rest.find('{') {
+        result.push_str(&rest[..start]);
+        let Some(end) = rest[start..].find('}') else {
+            result.push_str(&rest[start..]);
+            return result;
+        };
+        let token = &rest[start + 1..start + end];
+        if let Some((_, value)) = values.iter().find(|(key, _)| *key == token) {
+            result.push_str(value);
+        } else {
+            result.push_str(&rest[start..=start + end]);
+        }
+        rest = &rest[start + end + 1..];
+    }
+    result.push_str(rest);
+    result
+}
+fn process_description(hwnd: HWND) -> Option<String> {
+    use windows_sys::Win32::Storage::FileSystem::*;
+    let path = wide(process_path(hwnd));
+    unsafe {
+        let mut ignored = 0;
+        let size = GetFileVersionInfoSizeW(path.as_ptr(), &mut ignored);
+        if size == 0 || size > 16 * 1024 * 1024 {
+            return None;
+        }
+        let mut data = vec![0u8; size as usize];
+        if GetFileVersionInfoW(path.as_ptr(), 0, size, data.as_mut_ptr().cast()) == 0 {
+            return None;
+        }
+        let mut pointer = null_mut();
+        let mut length = 0;
+        if VerQueryValueW(
+            data.as_ptr().cast(),
+            wide("\\VarFileInfo\\Translation").as_ptr(),
+            &mut pointer,
+            &mut length,
+        ) == 0
+            || length < 4
+        {
+            return None;
+        }
+        let pair = std::slice::from_raw_parts(pointer as *const u16, 2);
+        let query = wide(format!(
+            "\\StringFileInfo\\{:04x}{:04x}\\FileDescription",
+            pair[0], pair[1]
+        ));
+        if VerQueryValueW(
+            data.as_ptr().cast(),
+            query.as_ptr(),
+            &mut pointer,
+            &mut length,
+        ) == 0
+            || pointer.is_null()
+            || length == 0
+        {
+            return None;
+        }
+        Some(
+            String::from_utf16_lossy(std::slice::from_raw_parts(
+                pointer as *const u16,
+                length as usize,
+            ))
+            .trim_end_matches('\0')
+            .to_owned(),
+        )
+    }
+}
+pub fn time_text(format: &str) -> String {
+    let mut time = SYSTEMTIME::default();
+    unsafe {
+        windows_sys::Win32::System::SystemInformation::GetLocalTime(&mut time);
+    }
+    format
+        .replace("YYYY", &format!("{:04}", time.wYear))
+        .replace("MM", &format!("{:02}", time.wMonth))
+        .replace("DD", &format!("{:02}", time.wDay))
+        .replace("hh", &format!("{:02}", time.wHour))
+        .replace("mm", &format!("{:02}", time.wMinute))
+        .replace("ss", &format!("{:02}", time.wSecond))
 }
 pub fn identity(hwnd: HWND) -> Identity {
     Identity {
