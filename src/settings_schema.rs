@@ -260,6 +260,24 @@ fn describe(section: &str, key: &str) -> (&'static str, &'static str, &'static s
             "Click the swatch or edit the color channels.",
             "点击色块选色，或直接修改颜色通道。",
         ),
+        ("outline", "opacity") => (
+            "Line opacity (both themes)",
+            "线条不透明度（明暗主题共用）",
+            "0–255. Shared by the light and dark outline colors.",
+            "0–255，明亮与黑暗框线颜色共用此值。",
+        ),
+        ("outline", "color") => (
+            "Light-mode line color (RGB)",
+            "明亮模式线条颜色（RGB）",
+            "Opacity is configured separately for both themes.",
+            "不透明度在下方统一设置，两种主题共用。",
+        ),
+        ("outline", "dark_color") => (
+            "Dark-mode line color (RGB)",
+            "黑暗模式线条颜色（RGB）",
+            "Opacity is configured separately for both themes.",
+            "不透明度在下方统一设置，两种主题共用。",
+        ),
         (_, "color") => (
             "Line color (RGBA)",
             "线条颜色（RGBA）",
@@ -344,7 +362,7 @@ pub fn fields(tab: usize, axis: usize, cfg: &Config, doc: &DocumentMut) -> Vec<F
         let mapping = matches!(*section, "presets" | "keys" | "commands" | "grid");
         for (key, item) in table {
             if !mapping
-                && (key == "opacity"
+                && ((key == "opacity" && *section != "outline")
                     || DEFAULTS
                         .get(section)
                         .and_then(|table| table.get(key))
@@ -372,13 +390,11 @@ pub fn fields(tab: usize, axis: usize, cfg: &Config, doc: &DocumentMut) -> Vec<F
                     "background" | "foreground" | "dark_background" | "dark_foreground"
                 )
             {
-                kind = Kind::Color(
-                    if matches!(*section, "outline" | "horizontal" | "vertical") {
-                        ColorChannels::Rgba
-                    } else {
-                        ColorChannels::Rgb
-                    },
-                );
+                kind = Kind::Color(if matches!(*section, "horizontal" | "vertical") {
+                    ColorChannels::Rgba
+                } else {
+                    ColorChannels::Rgb
+                });
             } else {
                 let values: &[&str] = match (*section, key) {
                     ("general", "language") => &["auto", "zh-CN", "en"],
@@ -496,8 +512,23 @@ mod tests {
                 .iter()
                 .any(|field| field.section == "presets" && field.key == "opacity")
         );
-        for tab in [3, 5] {
-            let colors: Vec<_> = fields(tab, 0, &cfg, &doc)
+        let outline = fields(3, 0, &cfg, &doc);
+        assert_eq!(
+            outline
+                .iter()
+                .filter(|field| field.key == "opacity" && matches!(field.kind, Kind::Number))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outline
+                .iter()
+                .filter(|field| matches!(field.kind, Kind::Color(ColorChannels::Rgb)))
+                .count(),
+            2
+        );
+        for axis in 0..3 {
+            let colors: Vec<_> = fields(5, axis, &cfg, &doc)
                 .into_iter()
                 .filter(|field| matches!(field.kind, Kind::Color(_)))
                 .collect();

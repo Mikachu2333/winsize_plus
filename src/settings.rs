@@ -45,6 +45,8 @@ const HOVER: u32 = WM_APP + 83;
 const EDIT_LAYOUT: u32 = WM_APP + 84;
 const APP_EXIT: u32 = WM_APP + 85;
 const ACTIVATE_PREVIEW: u32 = WM_APP + 86;
+#[cfg(test)]
+const PREVIEW_STATE: u32 = WM_APP + 99;
 const TAB_BASE: i32 = 100;
 const AXIS_H: i32 = 500;
 const AXIS_V: i32 = 501;
@@ -311,6 +313,12 @@ fn measured(text: &str, font: &Font, width: i32) -> i32 {
     }
 }
 impl Editor {
+    fn apply_config(&mut self, cfg: Config) {
+        if self.cfg.fps != cfg.fps {
+            self.clock.reset(cfg.fps);
+        }
+        self.cfg = cfg;
+    }
     fn invalidate_pages(&mut self) {
         for (_, (rows, _)) in self.pages.drain() {
             destroy_rows(rows);
@@ -328,7 +336,7 @@ impl Editor {
                 if !hwnd.is_null() {
                     unsafe {
                         ShowWindow(hwnd, SW_HIDE);
-                        SetWindowLongPtrW(hwnd, GWLP_ID, -GetDlgCtrlID(hwnd) as isize);
+                        SetWindowLongPtrW(hwnd, GWLP_ID, -GetDlgCtrlID(hwnd) as _);
                     }
                 }
             }
@@ -349,7 +357,7 @@ impl Editor {
                 for hwnd in row.controls {
                     if !hwnd.is_null() {
                         unsafe {
-                            SetWindowLongPtrW(hwnd, GWLP_ID, -GetDlgCtrlID(hwnd) as isize);
+                            SetWindowLongPtrW(hwnd, GWLP_ID, -GetDlgCtrlID(hwnd) as _);
                             ShowWindow(hwnd, SW_SHOWNOACTIVATE);
                         }
                     }
@@ -427,13 +435,14 @@ impl Editor {
     fn create(
         &self,
         parent: HWND,
-        class: *const u16,
+        class: &str,
         label: &str,
         style: u32,
         id: i32,
     ) -> Result<HWND, String> {
-        let is_edit = unsafe { std::slice::from_raw_parts(class, 5) == [69u16, 68, 73, 84, 0] };
-        let is_combo = unsafe { std::slice::from_raw_parts(class, 5) == [67u16, 79, 77, 66, 79] };
+        let is_edit = class == "EDIT";
+        let is_combo = class == "COMBOBOX";
+        let class = wide(class);
         let style = if is_edit {
             style | ES_MULTILINE as u32 | ES_AUTOVSCROLL as u32
         } else if is_combo {
@@ -444,7 +453,7 @@ impl Editor {
         let hwnd = unsafe {
             CreateWindowExW(
                 0,
-                class,
+                class.as_ptr(),
                 wide(label).as_ptr(),
                 WS_CHILD | WS_VISIBLE | style,
                 0,
@@ -460,21 +469,33 @@ impl Editor {
         if hwnd.is_null() {
             return Err(err());
         }
+        let control = Window(hwnd);
         send(hwnd, WM_SETFONT, self.font.0 as usize, 0);
         unsafe {
-            SetWindowSubclass(hwnd, Some(control_proc), 1, self.window.0 as usize);
+            desktop::check(SetWindowSubclass(
+                hwnd,
+                Some(control_proc),
+                1,
+                self.window.0 as usize,
+            ))?;
             if is_combo {
                 let mut info = COMBOBOXINFO {
                     cbSize: size_of::<COMBOBOXINFO>() as u32,
                     ..Default::default()
                 };
                 if GetComboBoxInfo(hwnd, &mut info) != 0 {
-                    SetPropW(info.hwndList, w!("OwnerCombo"), hwnd);
-                    SetWindowSubclass(info.hwndList, Some(control_proc), 1, self.window.0 as usize);
+                    desktop::check(SetPropW(info.hwndList, w!("OwnerCombo"), hwnd))?;
+                    desktop::check(SetWindowSubclass(
+                        info.hwndList,
+                        Some(control_proc),
+                        1,
+                        self.window.0 as usize,
+                    ))?;
                 }
                 send(hwnd, CB_SETMINVISIBLE, 8, 0);
             }
         }
+        std::mem::forget(control); // The parent HWND now owns this successfully initialized child.
         Ok(hwnd)
     }
     fn control(
@@ -482,7 +503,7 @@ impl Editor {
         row: &mut Row,
         index: usize,
         slot: usize,
-        class: *const u16,
+        class: &str,
         text: &str,
         style: u32,
     ) -> Result<(), String> {
@@ -574,9 +595,9 @@ impl Editor {
             let label = row.field.label.clone();
             let hint = row.field.hint.clone();
             if !matches!(kind, Kind::Bool | Kind::Preview | Kind::Add) {
-                self.control(&mut row, index, 1, w!("STATIC"), &label, SS_LEFT)?;
+                self.control(&mut row, index, 1, "STATIC", &label, SS_LEFT)?;
             }
-            self.control(&mut row, index, 2, w!("STATIC"), &hint, SS_LEFT)?;
+            self.control(&mut row, index, 2, "STATIC", &hint, SS_LEFT)?;
             send(row.c(2), WM_SETFONT, self.hint_font.0 as usize, 0);
             match kind {
                 Kind::Bool | Kind::Preview => {
@@ -584,7 +605,7 @@ impl Editor {
                         &mut row,
                         index,
                         0,
-                        w!("BUTTON"),
+                        "BUTTON",
                         &label,
                         BS_AUTOCHECKBOX as u32 | BS_MULTILINE as u32 | WS_TABSTOP,
                     )?;
@@ -599,7 +620,7 @@ impl Editor {
                     &mut row,
                     index,
                     0,
-                    w!("EDIT"),
+                    "EDIT",
                     &text,
                     WS_BORDER
                         | WS_TABSTOP
@@ -631,7 +652,7 @@ impl Editor {
                         } else {
                             0
                         };
-                    self.control(&mut row, index, 0, w!("COMBOBOX"), "", style)?;
+                    self.control(&mut row, index, 0, "COMBOBOX", "", style)?;
                     if matches!(row.field.kind, Kind::Font) {
                         unsafe {
                             SetPropW(row.c(0), w!("FontPicker"), 1usize as HANDLE);
@@ -646,12 +667,12 @@ impl Editor {
                 }
                 Kind::Mapping => {
                     let key = row.field.key.clone();
-                    self.control(&mut row, index, 3, w!("EDIT"), &key, WS_BORDER | WS_TABSTOP)?;
+                    self.control(&mut row, index, 3, "EDIT", &key, WS_BORDER | WS_TABSTOP)?;
                     self.control(
                         &mut row,
                         index,
                         4,
-                        w!("BUTTON"),
+                        "BUTTON",
                         self.cfg.tr("Delete", "删除"),
                         BS_PUSHBUTTON as u32 | WS_TABSTOP,
                     )?;
@@ -660,7 +681,7 @@ impl Editor {
                             &mut row,
                             index,
                             0,
-                            w!("EDIT"),
+                            "EDIT",
                             &text,
                             WS_BORDER | WS_TABSTOP | ES_MULTILINE as u32 | ES_AUTOVSCROLL as u32,
                         )?;
@@ -668,7 +689,7 @@ impl Editor {
                             &mut row,
                             index,
                             5,
-                            w!("BUTTON"),
+                            "BUTTON",
                             self.cfg.tr("Preview this region", "预览此分区"),
                             BS_AUTORADIOBUTTON as u32 | BS_MULTILINE as u32 | WS_TABSTOP,
                         )?;
@@ -684,7 +705,7 @@ impl Editor {
                             &mut row,
                             index,
                             0,
-                            w!("COMBOBOX"),
+                            "COMBOBOX",
                             "",
                             CBS_DROPDOWNLIST as u32 | WS_TABSTOP | WS_VSCROLL,
                         )?;
@@ -701,7 +722,7 @@ impl Editor {
                         &mut row,
                         index,
                         0,
-                        w!("BUTTON"),
+                        "BUTTON",
                         &text,
                         BS_OWNERDRAW as u32 | WS_TABSTOP,
                     )?;
@@ -725,7 +746,7 @@ impl Editor {
                             &mut row,
                             index,
                             channel + 3,
-                            w!("EDIT"),
+                            "EDIT",
                             &amount.to_string(),
                             WS_BORDER | WS_TABSTOP | ES_NUMBER as u32,
                         )?;
@@ -733,7 +754,7 @@ impl Editor {
                             &mut row,
                             index,
                             channel + 7,
-                            w!("STATIC"),
+                            "STATIC",
                             ["R", "G", "B", "A"][channel],
                             SS_CENTER,
                         )?;
@@ -744,7 +765,7 @@ impl Editor {
                         &mut row,
                         index,
                         0,
-                        w!("LISTBOX"),
+                        "LISTBOX",
                         "",
                         LBS_NOTIFY as u32
                             | LBS_OWNERDRAWFIXED as u32
@@ -772,7 +793,7 @@ impl Editor {
                         &mut row,
                         index,
                         3,
-                        w!("COMBOBOX"),
+                        "COMBOBOX",
                         "",
                         CBS_DROPDOWNLIST as u32
                             | CBS_OWNERDRAWFIXED as u32
@@ -799,7 +820,7 @@ impl Editor {
                             &mut row,
                             index,
                             slot,
-                            w!("BUTTON"),
+                            "BUTTON",
                             self.cfg.tr(en, zh),
                             BS_PUSHBUTTON as u32 | WS_TABSTOP,
                         )?;
@@ -815,7 +836,7 @@ impl Editor {
                     &mut row,
                     index,
                     0,
-                    w!("BUTTON"),
+                    "BUTTON",
                     &label,
                     BS_PUSHBUTTON as u32 | WS_TABSTOP,
                 )?,
@@ -874,8 +895,8 @@ impl Editor {
         let combo_width = (text_width("中文中文中文中文", &self.font) + self.s(30)).min(width);
         let font_width =
             (text_width("中文中文中文中文中文中文中文中文", &self.font) + self.s(30)).min(width);
-        let number_width = text_width("0000", &self.font) + self.s(16);
-        let button_width = self.s(68);
+        let number_width = (text_width("0000", &self.font) + self.s(16)).min(width);
+        let button_width = self.s(68).min(width);
         let name_width = combo_width;
         let expression_width = (combo_width * 2).min(width);
         let mut y = padding;
@@ -922,13 +943,13 @@ impl Editor {
                     };
                     place(row.c(3), padding, y - self.scroll[1], input_width, h);
                     if preset {
-                        place(
-                            row.c(4),
-                            padding + input_width + gap,
-                            y - self.scroll[1],
-                            button_width,
-                            h,
-                        );
+                        let delete_x = if input_width + gap + button_width <= width {
+                            padding + input_width + gap
+                        } else {
+                            y += h + gap;
+                            padding
+                        };
+                        place(row.c(4), delete_x, y - self.scroll[1], button_width, h);
                         y += h + gap;
                         place(row.c(0), padding, y - self.scroll[1], expression_width, h);
                         y += h + gap;
@@ -952,13 +973,13 @@ impl Editor {
                             (h - self.s(4)) as isize,
                         );
                         send(row.c(0), CB_SETDROPPEDWIDTH, combo_width as usize, 0);
-                        place(
-                            row.c(4),
-                            x + combo_width + gap,
-                            y - self.scroll[1],
-                            button_width,
-                            h,
-                        );
+                        let delete_x = if x - padding + combo_width + gap + button_width <= width {
+                            x + combo_width + gap
+                        } else {
+                            y += h + gap;
+                            padding
+                        };
+                        place(row.c(4), delete_x, y - self.scroll[1], button_width, h);
                         y += h;
                     }
                 }
@@ -994,24 +1015,26 @@ impl Editor {
                         (h - self.s(4)) as isize,
                     );
                     send(row.c(3), CB_SETDROPPEDWIDTH, font_width as usize, 0);
-                    place(
-                        row.c(4),
-                        padding + font_width + gap,
-                        y - self.scroll[1],
-                        button_width,
-                        h,
-                    );
+                    let add_x = if font_width + gap + button_width <= width {
+                        padding + font_width + gap
+                    } else {
+                        y += h + gap;
+                        padding
+                    };
+                    place(row.c(4), add_x, y - self.scroll[1], button_width, h);
                     y += h + gap;
+                    let columns = ((width + gap) / (button_width + gap)).clamp(1, 3);
                     for slot in 5..=7 {
+                        let index = slot as i32 - 5;
                         place(
                             row.c(slot),
-                            padding + (slot as i32 - 5) * (button_width + gap),
-                            y - self.scroll[1],
+                            padding + (index % columns) * (button_width + gap),
+                            y + (index / columns) * (h + gap) - self.scroll[1],
                             button_width,
                             h,
                         );
                     }
-                    y += h;
+                    y += ((3 + columns - 1) / columns) * (h + gap) - gap;
                 }
                 Kind::Note => {}
                 Kind::Number => {
@@ -1020,7 +1043,7 @@ impl Editor {
                         padding,
                         y - self.scroll[1],
                         if row.field.key == "duration_ms" {
-                            number_width + self.s(20)
+                            (number_width + self.s(20)).min(width)
                         } else {
                             number_width
                         },
@@ -1054,16 +1077,29 @@ impl Editor {
             }
             y += self.s(12);
             if self.tab == 5 && row.field.section == "crosshair" {
+                let axis_height = self
+                    .axis_controls
+                    .iter()
+                    .map(|control| {
+                        measured(
+                            &caption(*control),
+                            &self.font,
+                            (width / 3 - self.s(24)).max(1),
+                        ) + self.s(10)
+                    })
+                    .max()
+                    .unwrap_or(h)
+                    .max(h);
                 for (i, control) in self.axis_controls.iter().enumerate() {
                     place(
                         *control,
                         padding + i as i32 * (width / 3),
                         y - self.scroll[1],
                         width / 3,
-                        h,
+                        axis_height,
                     );
                 }
-                y += h + self.s(10);
+                y += axis_height + self.s(10);
             }
         }
         self.extent[1] = y + padding;
@@ -1282,7 +1318,6 @@ impl Editor {
                 }
             }
         }
-        Config::parse(&draft)?;
         Ok(draft)
     }
     fn save(&mut self) -> Result<(), String> {
@@ -1291,6 +1326,7 @@ impl Editor {
             return Ok(());
         }
         let draft = self.collect()?;
+        Config::parse(&draft)?;
         let rebuild = self.dirty.iter().any(|i| {
             self.rows
                 .get(*i)
@@ -1307,7 +1343,7 @@ impl Editor {
         let saved = config::save_settings(&self.path, &self.original, &draft)?;
         self.doc = saved.parse::<DocumentMut>().map_err(|e| e.to_string())?;
         self.original = saved;
-        self.cfg = Config::parse(&self.doc)?;
+        self.apply_config(Config::parse(&self.doc)?);
         for row in &mut self.rows {
             if matches!(row.field.kind, Kind::Mapping) {
                 let name = caption(row.c(3)).trim().to_owned();
@@ -1319,7 +1355,6 @@ impl Editor {
             }
         }
         self.dirty.clear();
-        self.clock.reset(self.cfg.fps);
         self.status(self.cfg.tr("Saved", "已保存"));
         self.invalidate_pages();
         if rebuild {
@@ -1478,7 +1513,7 @@ impl Editor {
             .original
             .parse::<DocumentMut>()
             .map_err(|e| e.to_string())?;
-        self.cfg = Config::parse(&self.doc)?;
+        self.apply_config(Config::parse(&self.doc)?);
         self.dirty.clear();
         self.pending = None;
         self.status(self.cfg.tr("Saved", "已保存"));
@@ -1654,7 +1689,7 @@ impl Editor {
                     .original
                     .parse::<DocumentMut>()
                     .map_err(|error| error.to_string())?;
-                self.cfg = Config::parse(&self.doc)?;
+                self.apply_config(Config::parse(&self.doc)?);
                 self.invalidate_pages();
                 self.status(self.cfg.tr("Saved", "已保存"));
             }
@@ -1716,7 +1751,7 @@ impl Editor {
             if let Ok(draft) = self.collect()
                 && let Ok(cfg) = Config::parse(&draft)
             {
-                self.cfg = cfg;
+                self.apply_config(cfg);
                 if self.tab != 0 && self.tab != 4 {
                     self.render()?;
                 }
@@ -1760,7 +1795,7 @@ impl Editor {
                 let loaded = config::load_snapshot(&self.path, None)?;
                 self.original = loaded.text;
                 self.doc = loaded.document;
-                self.cfg = loaded.config;
+                self.apply_config(loaded.config);
                 if self.cfg.warnings.is_empty() {
                     self.status(
                         self.cfg
@@ -1911,6 +1946,14 @@ fn sidebar_size(total: i32, dpi: i32, text_width: i32) -> i32 {
     (text_width + scale(56))
         .clamp(scale(160), scale(240))
         .min(total * 28 / 100)
+}
+fn minimum_window_size(dpi: u32, work: (i32, i32)) -> POINT {
+    let scale =
+        |size: u32| (u64::from(size) * u64::from(dpi.max(96)) / 96).min(i32::MAX as u64) as i32;
+    POINT {
+        x: scale(780).min(work.0.max(1)),
+        y: scale(540).min(work.1.max(1)),
+    }
 }
 fn with_editor(action: impl FnOnce(&mut Editor) -> Result<(), String>) {
     EDITOR.with(|slot| {
@@ -2157,6 +2200,23 @@ unsafe extern "system" fn pane_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: LP
 }
 unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match message {
+        #[cfg(test)]
+        PREVIEW_STATE => EDITOR.with(|slot| {
+            slot.try_borrow()
+                .ok()
+                .and_then(|guard| {
+                    guard.as_ref().map(|editor| {
+                        if editor.preview.focused() {
+                            2
+                        } else if editor.preview.visible() {
+                            1
+                        } else {
+                            0
+                        }
+                    })
+                })
+                .unwrap_or(-1)
+        }),
         WM_SIZE => {
             unsafe {
                 if GetPropW(hwnd, w!("ResizeQueued")).is_null() {
@@ -2177,10 +2237,23 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
             unsafe {
                 let info = &mut *(lp as *mut MINMAXINFO);
                 let dpi = GetDpiForWindow(hwnd).max(96);
-                info.ptMinTrackSize = POINT {
-                    x: (780 * dpi / 96) as i32,
-                    y: (540 * dpi / 96) as i32,
+                let mut monitor = MONITORINFO {
+                    cbSize: size_of::<MONITORINFO>() as u32,
+                    ..Default::default()
                 };
+                if GetMonitorInfoW(
+                    MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST),
+                    &mut monitor,
+                ) != 0
+                {
+                    info.ptMinTrackSize = minimum_window_size(
+                        dpi,
+                        (
+                            monitor.rcWork.right - monitor.rcWork.left,
+                            monitor.rcWork.bottom - monitor.rcWork.top,
+                        ),
+                    );
+                }
             }
             0
         }
@@ -2438,7 +2511,8 @@ pub fn run(path: &Path) -> Result<(), String> {
         if hwnd.is_null() {
             return Err(err());
         }
-        SetPropW(hwnd, w!("PreviewSuspended"), 1usize as HANDLE);
+        let window = Window(hwnd);
+        desktop::check(SetPropW(hwnd, w!("PreviewSuspended"), 1usize as HANDLE))?;
         // Settings may retain an elevated token after the resident is restarted normally.
         // Only this payload-free lifecycle message is allowed across that boundary.
         desktop::check(ChangeWindowMessageFilterEx(
@@ -2475,7 +2549,7 @@ pub fn run(path: &Path) -> Result<(), String> {
             }
         }
         let mut editor = Editor {
-            window: Window(hwnd),
+            window,
             panes,
             tabs: Vec::new(),
             status: null_mut(),
@@ -2509,30 +2583,30 @@ pub fn run(path: &Path) -> Result<(), String> {
         for (index, (en, zh)) in TABS.iter().enumerate() {
             editor.tabs.push(editor.create(
                 panes[0],
-                w!("BUTTON"),
+                "BUTTON",
                 editor.cfg.tr(en, zh),
                 BS_OWNERDRAW as u32 | WS_TABSTOP,
                 TAB_BASE + index as i32,
             )?);
         }
-        editor.status = editor.create(hwnd, w!("STATIC"), "", SS_LEFT, 600)?;
+        editor.status = editor.create(hwnd, "STATIC", "", SS_LEFT, 600)?;
         editor.axis_controls[0] = editor.create(
             panes[1],
-            w!("BUTTON"),
+            "BUTTON",
             "",
             BS_AUTORADIOBUTTON as u32 | BS_MULTILINE as u32 | WS_TABSTOP,
             AXIS_H,
         )?;
         editor.axis_controls[1] = editor.create(
             panes[1],
-            w!("BUTTON"),
+            "BUTTON",
             "",
             BS_AUTORADIOBUTTON as u32 | BS_MULTILINE as u32 | WS_TABSTOP,
             AXIS_V,
         )?;
         editor.axis_controls[2] = editor.create(
             panes[1],
-            w!("BUTTON"),
+            "BUTTON",
             "",
             BS_AUTORADIOBUTTON as u32 | BS_MULTILINE as u32 | WS_TABSTOP,
             AXIS_BOTH,
@@ -2608,6 +2682,21 @@ fn message_loop(hwnd: HWND, timer: HANDLE) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn minimum_window_fits_small_high_dpi_work_areas() {
+        for (dpi, work) in [
+            (144, (1366, 728)),
+            (192, (1366, 728)),
+            (288, (800, 560)),
+            (96, (1920, 1040)),
+        ] {
+            let size = super::minimum_window_size(dpi, work);
+            assert!(size.x > 0 && size.x <= work.0);
+            assert!(size.y > 0 && size.y <= work.1);
+        }
+        let ordinary = super::minimum_window_size(96, (1920, 1040));
+        assert_eq!((ordinary.x, ordinary.y), (780, 540));
+    }
     use super::*;
     #[test]
     #[ignore = "helper process for the tray shutdown integration test"]
@@ -2915,17 +3004,21 @@ mod tests {
                             }
                             // Observe the old focus being cleared before waiting for the new one.
                             // A fixed sleep can still sample the previous region on a busy UI thread.
-                            while overlay_count() == 2 && started.elapsed() < Duration::from_secs(1)
+                            // Query completed UI state; counting individual HWNDs
+                            // can see a transient pair halfway through a grid rebuild.
+                            while send(hwnd, PREVIEW_STATE, 0, 0) == 2
+                                && started.elapsed() < Duration::from_secs(1)
                             {
                                 std::thread::sleep(Duration::from_millis(10));
                             }
-                            if overlay_count() == 2 {
+                            if send(hwnd, PREVIEW_STATE, 0, 0) == 2 {
                                 return Err(
                                     "Moving out of the focused region did not restore the grid"
                                         .into(),
                                 );
                             }
-                            while overlay_count() != 2 && started.elapsed() < Duration::from_secs(5)
+                            while send(hwnd, PREVIEW_STATE, 0, 0) != 2
+                                && started.elapsed() < Duration::from_secs(5)
                             {
                                 std::thread::sleep(Duration::from_millis(10));
                             }
@@ -3228,6 +3321,50 @@ mod tests {
                     || saved["vertical"]["width"].as_integer() != Some(3)
                 {
                     return Err("Unified axis style did not update both lines".into());
+                }
+                // The window manager may offer a work area smaller than our usual
+                // minimum at high scaling. Controls must wrap within a narrow pane.
+                for tab in [1, 2, 4, 5] {
+                    send(hwnd, WM_COMMAND, (TAB_BASE + tab) as usize, 0);
+                    wait_tab(hwnd, tab as usize)?;
+                    unsafe {
+                        SetWindowPos(
+                            hwnd,
+                            null_mut(),
+                            0,
+                            0,
+                            520,
+                            600,
+                            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE,
+                        );
+                        send(hwnd, RESIZE, 0, 0);
+                        let pane = GetDlgItem(hwnd, 2);
+                        let mut area = RECT::default();
+                        GetClientRect(pane, &mut area);
+                        let mut child = GetWindow(pane, GW_CHILD);
+                        while !child.is_null() {
+                            if GetWindowLongW(child, GWL_STYLE) as u32 & WS_VISIBLE != 0 {
+                                let mut rect = RECT::default();
+                                GetWindowRect(child, &mut rect);
+                                MapWindowPoints(
+                                    null_mut(),
+                                    pane,
+                                    (&mut rect as *mut RECT).cast(),
+                                    2,
+                                );
+                                if rect.left < 0 || rect.right > area.right {
+                                    return Err(format!(
+                                        "Tab {tab} control {} exceeds pane width {}: {}..{}",
+                                        GetDlgCtrlID(child),
+                                        area.right,
+                                        rect.left,
+                                        rect.right
+                                    ));
+                                }
+                            }
+                            child = GetWindow(child, GW_HWNDNEXT);
+                        }
+                    }
                 }
                 Ok(())
             })();
