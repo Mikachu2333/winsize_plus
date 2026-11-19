@@ -208,7 +208,8 @@ fn process_description(hwnd: HWND) -> Option<String> {
         if size == 0 || size > 16 * 1024 * 1024 {
             return None;
         }
-        let mut data = vec![0u8; size as usize];
+        // Typed storage guarantees UTF-16 alignment independently of the allocator.
+        let mut data = vec![0u16; (size as usize).div_ceil(2)];
         if GetFileVersionInfoW(path.as_ptr(), 0, size, data.as_mut_ptr().cast()) == 0 {
             return None;
         }
@@ -224,7 +225,7 @@ fn process_description(hwnd: HWND) -> Option<String> {
         {
             return None;
         }
-        let pair = std::slice::from_raw_parts(pointer as *const u16, 2);
+        let pair = version_units(&data, size as usize, pointer.cast(), 2)?;
         let query = wide(format!(
             "\\StringFileInfo\\{:04x}{:04x}\\FileDescription",
             pair[0], pair[1]
@@ -241,14 +242,31 @@ fn process_description(hwnd: HWND) -> Option<String> {
             return None;
         }
         Some(
-            String::from_utf16_lossy(std::slice::from_raw_parts(
-                pointer as *const u16,
+            String::from_utf16_lossy(version_units(
+                &data,
+                size as usize,
+                pointer.cast(),
                 length as usize,
-            ))
+            )?)
             .trim_end_matches('\0')
             .to_owned(),
         )
     }
+}
+fn version_units(
+    storage: &[u16],
+    bytes: usize,
+    pointer: *const u16,
+    length: usize,
+) -> Option<&[u16]> {
+    let start = pointer.addr().checked_sub(storage.as_ptr().addr())?;
+    let count = length.checked_mul(2)?;
+    if start % 2 != 0 || start.checked_add(count)? > bytes {
+        return None;
+    }
+    // Return a slice through the original allocation rather than dereferencing
+    // a foreign pointer. Null/out-of-buffer/misaligned results are rejected.
+    storage.get(start / 2..start / 2 + length)
 }
 pub fn time_text(format: &str) -> String {
     let mut time = SYSTEMTIME::default();
@@ -278,6 +296,8 @@ fn eligible(hwnd: HWND) -> bool {
             || hwnd == GetDesktopWindow()
             || hwnd == GetShellWindow()
             || pid(hwnd) == std::process::id()
+            // Settings run in a separate process; owned native dialogs share its root owner.
+            || class(GetAncestor(hwnd, GA_ROOTOWNER)) == "WinSizeP.Settings"
         {
             return false;
         }
@@ -388,6 +408,24 @@ pub struct Drag {
     resize: bool,
     minimum: (i32, i32),
 }
+fn restore(hwnd: HWND) -> Result<(), String> {
+    // SAFETY: HWND is validated by the caller. Posting a restore never waits for
+    // the target's window procedure; polling only queries window-manager state.
+    unsafe {
+        if IsZoomed(hwnd) == 0 && IsIconic(hwnd) == 0 {
+            return Ok(());
+        }
+        check(ShowWindowAsync(hwnd, SW_RESTORE))?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        while IsZoomed(hwnd) != 0 || IsIconic(hwnd) != 0 {
+            if std::time::Instant::now() >= deadline {
+                return Err("Window restore timed out / 窗口还原超时".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+    Ok(())
+}
 impl Drag {
     pub fn start(hwnd: HWND, origin: POINT, resize: bool, cfg: &Config) -> Result<Self, String> {
         if !allowed(hwnd, &cfg.exclusions) {
@@ -397,9 +435,7 @@ impl Drag {
             if IsHungAppWindow(hwnd) != 0 {
                 return Err(cfg.tr("Window unresponsive", "窗口无响应").into());
             }
-            if IsZoomed(hwnd) != 0 || IsIconic(hwnd) != 0 {
-                ShowWindow(hwnd, SW_RESTORE);
-            }
+            restore(hwnd)?;
             let (outer, frame) = bounds(hwnd)?;
             let mut limits = MINMAXINFO::default();
             let mut result = 0;
@@ -467,9 +503,7 @@ fn position(hwnd: HWND, req: &Request, cfg: &Config, point: POINT) -> Result<(),
         if IsHungAppWindow(hwnd) != 0 {
             return Err("Window unresponsive / 窗口无响应".into());
         }
-        if IsIconic(hwnd) != 0 || IsZoomed(hwnd) != 0 {
-            ShowWindow(hwnd, SW_RESTORE);
-        }
+        restore(hwnd)?;
         let (outer, frame) = bounds(hwnd)?;
         let base = if let Some(layout) = preset {
             layout.resolve(screen(point, layout.monitor)?.work, frame, desktop())?
@@ -485,6 +519,15 @@ fn position(hwnd: HWND, req: &Request, cfg: &Config, point: POINT) -> Result<(),
         };
         let dpi = GetDpiForWindow(hwnd);
         set_frame(hwnd, wanted, outer, frame)?;
+        // Cross-thread positioning is asynchronous. Give the target a bounded
+        // opportunity to update its DPI before correcting its nonclient frame.
+        let until = std::time::Instant::now() + std::time::Duration::from_millis(100);
+        while std::time::Instant::now() < until && GetDpiForWindow(hwnd) == dpi {
+            if bounds(hwnd).is_ok_and(|(_, current)| current != frame || current == wanted) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         if dpi != 0 && GetDpiForWindow(hwnd) != dpi {
             let (outer, frame) = bounds(hwnd)?;
             if frame != wanted {
@@ -522,7 +565,7 @@ fn set_frame(hwnd: HWND, wanted: Rect, outer: Rect, frame: Rect) -> Result<(), S
             y,
             width,
             height,
-            SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER,
+            SWP_ASYNCWINDOWPOS | SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER,
         ))
     }
 }
@@ -563,7 +606,7 @@ pub fn apply(
                 0,
                 0,
                 0,
-                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_NOOWNERZORDER,
+                SWP_ASYNCWINDOWPOS | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_NOOWNERZORDER,
             ))?
         }
     }
@@ -578,7 +621,113 @@ pub fn apply(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn version_resources_reject_unaligned_and_out_of_bounds_results() {
+        let data = [10u16, 20, 30, 40];
+        assert_eq!(
+            super::version_units(&data, 8, data.as_ptr().wrapping_add(1), 2),
+            Some(&data[1..3])
+        );
+        assert!(super::version_units(&data, 8, data.as_ptr().wrapping_add(3), 2).is_none());
+        assert!(super::version_units(&data, 7, data.as_ptr().wrapping_add(3), 1).is_none());
+        assert!(
+            super::version_units(
+                &data,
+                8,
+                data.as_ptr().cast::<u8>().wrapping_add(1).cast(),
+                1
+            )
+            .is_none()
+        );
+        assert!(super::version_units(&data, 8, std::ptr::null(), 1).is_none());
+    }
+    #[test]
+    fn positioning_does_not_wait_for_another_window_thread() {
+        use std::{
+            ptr::{null, null_mut},
+            time::{Duration, Instant},
+        };
+        use windows_sys::{Win32::UI::WindowsAndMessaging::*, core::w};
+        let (send, receive) = std::sync::mpsc::channel();
+        let owner = std::thread::spawn(move || unsafe {
+            let hwnd = CreateWindowExW(
+                0,
+                w!("STATIC"),
+                null(),
+                WS_POPUP,
+                0,
+                0,
+                100,
+                100,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null(),
+            );
+            assert!(!hwnd.is_null());
+            send.send(hwnd as usize).unwrap();
+            // Deliberately stop this test window's pump, never another application's.
+            std::thread::sleep(Duration::from_millis(1000));
+            let mut message = MSG::default();
+            while PeekMessageW(&mut message, null_mut(), 0, 0, PM_REMOVE) != 0 {
+                DispatchMessageW(&message);
+            }
+            DestroyWindow(hwnd);
+        });
+        let hwnd = receive.recv_timeout(Duration::from_secs(5)).unwrap() as _;
+        let original = super::Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        };
+        let started = Instant::now();
+        let result = super::set_frame(hwnd, super::Rect { x: 10, ..original }, original, original);
+        let elapsed = started.elapsed();
+        owner.join().unwrap();
+        result.unwrap();
+        assert!(
+            elapsed < Duration::from_millis(750),
+            "window thread blocked caller for {elapsed:?}"
+        );
+    }
     use super::*;
+    #[test]
+    #[ignore = "read-only exclusion check against an already-open settings window"]
+    fn open_settings_are_excluded() {
+        // SAFETY: only query handles and window metadata; the existing UI is left untouched.
+        let window =
+            unsafe { FindWindowW(windows_sys::core::w!("WinSizeP.Settings"), std::ptr::null()) };
+        assert!(
+            !window.is_null(),
+            "Open settings before this read-only check"
+        );
+        assert_ne!(
+            pid(window),
+            std::process::id(),
+            "Needs a separate settings process"
+        );
+        for hwnd in [window, unsafe { GetLastActivePopup(window) }] {
+            assert!(
+                !allowed(hwnd, &[]),
+                "Settings or its owned dialog was allowed"
+            );
+            assert!(
+                target(&Selector {
+                    hwnd: Some(hwnd as usize),
+                    ..Default::default()
+                })
+                .is_err()
+            );
+        }
+        assert!(
+            target(&Selector {
+                pid: Some(pid(window)),
+                ..Default::default()
+            })
+            .is_err()
+        );
+    }
     #[test]
     fn resizing_preserves_top_left_and_respects_minimum() {
         let frame = Rect {

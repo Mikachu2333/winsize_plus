@@ -653,6 +653,38 @@ mod tests {
                     std::thread::sleep(Duration::from_millis(20));
                 };
                 let page = if modal { 1 } else { 5 };
+                if desktop::allowed(hwnd, &[]) {
+                    return Err("Settings in another process were not excluded".into());
+                }
+                for selector in [
+                    crate::cli::Selector {
+                        hwnd: Some(hwnd as usize),
+                        ..Default::default()
+                    },
+                    crate::cli::Selector {
+                        pid: Some(child.id()),
+                        ..Default::default()
+                    },
+                ] {
+                    if desktop::target(&selector).is_ok() {
+                        return Err("Command-line selection accepted settings".into());
+                    }
+                }
+                if desktop::Drag::start(hwnd, POINT::default(), false, &app.cfg).is_ok()
+                    || desktop::apply(
+                        hwnd,
+                        &Request {
+                            preset: Some("center".into()),
+                            ..Default::default()
+                        },
+                        &app.cfg,
+                        &path,
+                        POINT::default(),
+                    )
+                    .is_ok()
+                {
+                    return Err("Settings accepted a window action".into());
+                }
                 unsafe {
                     PostMessageW(hwnd, WM_COMMAND, 100 + page, 0);
                 }
@@ -683,6 +715,15 @@ mod tests {
                     loop {
                         let popup = unsafe { GetLastActivePopup(hwnd) };
                         if popup != hwnd && unsafe { IsWindowVisible(popup) } != 0 {
+                            if desktop::allowed(popup, &[])
+                                || desktop::target(&crate::cli::Selector {
+                                    hwnd: Some(popup as usize),
+                                    ..Default::default()
+                                })
+                                .is_ok()
+                            {
+                                return Err("Settings color dialog was not excluded".into());
+                            }
                             break;
                         }
                         if Instant::now() > until {
