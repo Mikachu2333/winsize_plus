@@ -52,8 +52,8 @@ struct App {
     hold: Option<(Instant, HWND)>,
     held_window: Option<HWND>,
     window: HWND,
+    drag: Option<desktop::Drag>,
     command: String,
-    help_line: usize,
     hide: Option<Instant>,
     wait: Option<Instant>,
     reload: Option<Instant>,
@@ -147,24 +147,8 @@ impl App {
             "time" | "monitor" => self.status(action),
             "version" => self.notice(concat!("WinSizeP ", env!("CARGO_PKG_VERSION"))),
             "help" => {
-                let lines: Vec<_> = config::help()
-                    .lines()
-                    .filter(|line| !line.trim().is_empty())
-                    .collect();
-                let pages = lines.len().div_ceil(8);
-                let page = self.help_line % pages;
-                self.help_line = page + 1;
-                self.notice(&format!(
-                    "{}  {}/{}\n{}",
-                    self.cfg.tr("Help", "帮助"),
-                    page + 1,
-                    pages,
-                    lines[page * 8..lines.len().min((page + 1) * 8)]
-                        .iter()
-                        .map(|line| line.trim_start_matches('#').trim())
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                ))
+                self.hide = None;
+                self.overlay.tip(&self.cfg.help_text(), &self.cfg)
             }
             "command" => {
                 input::command_mode();
@@ -240,13 +224,7 @@ impl App {
                 if name.is_empty() {
                     return Ok(());
                 }
-                let action = self
-                    .cfg
-                    .commands
-                    .get(name)
-                    .map(String::as_str)
-                    .unwrap_or(name)
-                    .to_string();
+                let action = self.cfg.action(name);
                 return self.act(&action);
             }
             27 => {
@@ -306,10 +284,10 @@ impl App {
                 if self.preview.visible() {
                     self.preview.follow(point, &self.cfg)?;
                 }
-                if self.overlay.mode() != 0
+                if (self.overlay.mode() != 0 || self.drag.is_some())
                     && let Some(frame) = self.frames.moved(point)?
                 {
-                    self.overlay.follow(frame, &self.cfg)?;
+                    self.follow_frame(frame)?;
                 }
                 Ok(())
             }
@@ -331,7 +309,32 @@ impl App {
                 }
                 Ok(())
             }
+            input::DRAG_START => {
+                self.drag = Some(desktop::Drag::start(
+                    msg.wParam as HWND,
+                    input::drag_origin(),
+                    msg.lParam != 0,
+                    &self.cfg,
+                )?);
+                self.hold = None;
+                self.held_window = None;
+                self.wait = None;
+                self.preview.hide();
+                self.clear();
+                self.frames.reset(self.cfg.fps);
+                self.follow_frame(desktop::cursor()?)
+            }
+            input::DRAG_END => {
+                self.follow_frame(input::moved())?;
+                self.drag = None;
+                self.frames.reset(self.cfg.fps);
+                Ok(())
+            }
             input::CANCEL => {
+                input::cancel();
+                self.drag = None;
+                self.hold = None;
+                self.held_window = None;
                 self.wait = None;
                 self.refresh_preview()?;
                 self.clear();
@@ -349,6 +352,12 @@ impl App {
                 Ok(())
             }
         }
+    }
+    fn follow_frame(&mut self, point: POINT) -> Result<(), String> {
+        if let Some(drag) = &self.drag {
+            drag.follow(point)?;
+        }
+        self.overlay.follow(point, &self.cfg)
     }
     fn deadlines(&mut self) -> Result<(), String> {
         let now = Instant::now();
@@ -442,8 +451,8 @@ pub fn run(path: &Path) -> Result<crate::ResidentExit, String> {
             hold: None,
             held_window: None,
             window: null_mut(),
+            drag: None,
             command: String::new(),
-            help_line: 0,
             hide: None,
             wait: None,
             reload: None,
@@ -476,7 +485,7 @@ pub fn run(path: &Path) -> Result<crate::ResidentExit, String> {
                 }
                 value if value == WAIT_OBJECT_0 + 1 => {
                     if let Some(point) = app.frames.tick()
-                        && let Err(problem) = app.overlay.follow(point, &app.cfg)
+                        && let Err(problem) = app.follow_frame(point)
                     {
                         let _ = app.notice(&problem);
                     }

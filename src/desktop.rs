@@ -190,6 +190,10 @@ fn eligible(hwnd: HWND) -> bool {
         )
     }
 }
+pub fn allowed(hwnd: HWND, exclusions: &[Identity]) -> bool {
+    eligible(hwnd)
+        && (exclusions.is_empty() || !exclusions.iter().any(|rule| rule.matches(&identity(hwnd))))
+}
 fn matches(hwnd: HWND, selector: &Selector) -> bool {
     eligible(hwnd)
         && selector.pid.is_none_or(|id| id == pid(hwnd))
@@ -272,6 +276,77 @@ pub fn bounds(hwnd: HWND) -> Result<(Rect, Rect), String> {
             frame = outer
         }
         Ok((rect(outer), rect(frame)))
+    }
+}
+
+pub struct Drag {
+    hwnd: HWND,
+    origin: POINT,
+    frame: Rect,
+    resize: bool,
+    minimum: (i32, i32),
+}
+impl Drag {
+    pub fn start(hwnd: HWND, origin: POINT, resize: bool, cfg: &Config) -> Result<Self, String> {
+        if !allowed(hwnd, &cfg.exclusions) {
+            return Err(cfg.tr("Window unavailable", "窗口不可操作").into());
+        }
+        unsafe {
+            if IsHungAppWindow(hwnd) != 0 {
+                return Err(cfg.tr("Window unresponsive", "窗口无响应").into());
+            }
+            if IsZoomed(hwnd) != 0 || IsIconic(hwnd) != 0 {
+                ShowWindow(hwnd, SW_RESTORE);
+            }
+            let (outer, frame) = bounds(hwnd)?;
+            let mut limits = MINMAXINFO::default();
+            let mut result = 0;
+            SendMessageTimeoutW(
+                hwnd,
+                WM_GETMINMAXINFO,
+                0,
+                from_mut(&mut limits) as isize,
+                SMTO_ABORTIFHUNG,
+                100,
+                &mut result,
+            );
+            let minimum = (
+                (limits.ptMinTrackSize.x - (outer.width - frame.width)).max(1),
+                (limits.ptMinTrackSize.y - (outer.height - frame.height)).max(1),
+            );
+            Ok(Self {
+                hwnd,
+                origin,
+                frame,
+                resize,
+                minimum,
+            })
+        }
+    }
+    pub fn follow(&self, point: POINT) -> Result<(), String> {
+        let wanted = drag_rect(self.frame, self.origin, point, self.resize, self.minimum);
+        let (outer, frame) = bounds(self.hwnd)?;
+        if wanted != frame {
+            set_frame(self.hwnd, wanted, outer, frame)?;
+        }
+        Ok(())
+    }
+}
+fn drag_rect(frame: Rect, origin: POINT, point: POINT, resize: bool, minimum: (i32, i32)) -> Rect {
+    let dx = point.x.saturating_sub(origin.x);
+    let dy = point.y.saturating_sub(origin.y);
+    if resize {
+        Rect {
+            width: frame.width.saturating_add(dx).max(minimum.0),
+            height: frame.height.saturating_add(dy).max(minimum.1),
+            ..frame
+        }
+    } else {
+        Rect {
+            x: frame.x.saturating_add(dx),
+            y: frame.y.saturating_add(dy),
+            ..frame
+        }
     }
 }
 fn position(hwnd: HWND, req: &Request, cfg: &Config, point: POINT) -> Result<(), String> {
@@ -397,4 +472,37 @@ pub fn apply(
         config::load(path, Some((&id, mode)))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn resizing_preserves_top_left_and_respects_minimum() {
+        let frame = Rect {
+            x: -800,
+            y: 20,
+            width: 640,
+            height: 480,
+        };
+        let origin = POINT { x: 20, y: 20 };
+        let resized = drag_rect(frame, origin, POINT { x: -900, y: 80 }, true, (120, 90));
+        assert_eq!(
+            resized,
+            Rect {
+                width: 120,
+                height: 540,
+                ..frame
+            }
+        );
+        let moved = drag_rect(frame, origin, POINT { x: 100, y: -20 }, false, (1, 1));
+        assert_eq!(
+            moved,
+            Rect {
+                x: -720,
+                y: -20,
+                ..frame
+            }
+        );
+    }
 }

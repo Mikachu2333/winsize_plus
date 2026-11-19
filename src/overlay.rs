@@ -186,10 +186,12 @@ impl Overlay {
         }
     }
     pub fn hide_tip(&self) {
+        crate::input::tip_visible(false);
         self.tip.hide();
         self.shadow.hide()
     }
     pub fn tip(&mut self, text: &str, cfg: &Config) -> Result<(), String> {
+        crate::input::tip_visible(true);
         unsafe {
             let screen = desktop::screen(desktop::cursor()?, 0)?;
             let dpi = screen.dpi;
