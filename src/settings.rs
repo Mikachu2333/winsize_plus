@@ -283,8 +283,12 @@ impl Editor {
             (LIVE, _) => self.render(),
             (IDOK, _) => {
                 self.edit()?;
-                config::save_settings(&self.path, &self.original, &self.doc)?;
-                self.original = self.doc.to_string();
+                self.original = config::save_settings(&self.path, &self.original, &self.doc)?;
+                self.doc = self
+                    .original
+                    .parse::<DocumentMut>()
+                    .map_err(|error| error.to_string())?;
+                self.cfg = Config::parse(&self.doc)?;
                 if !crate::resident::running() {
                     crate::launch(self.cfg.elevate)?;
                 }

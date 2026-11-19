@@ -1,58 +1,64 @@
-# WinSizeP configuration and keyboard reference
-# Run winsizep to start. Double-tap the same Alt, then press QWE / ASD / ZXC.
-# S centers the foreground window at 80% of the work area. Hold Alt and right-click
-# a cell on any display to place the window that was active when you pressed Alt.
-# Double-tap Alt and press grave to enter a command. Enter runs it, Esc cancels.
-# winsizep --pid 123 -l 100 200 --size 900,600
-# winsizep --name notepad.exe --preset w --x -1200 --top on
-# Combine --pid, --class, --name, --hwnd and --title filters or use the foreground window.
-# --preset accepts names and active layout keys. Explicit coordinates override the preset.
-# --size and --location accept comma or space separated pairs. --top and --ignore accept on/off/toggle.
-# --help prints this example. --check validates the configuration. --version prints the version.
-# Open Settings from the tray or use --settings to edit with a live desktop preview.
-# Choose auto, zh-CN or en for the interface. Tap the same left/right Alt twice (both permits either).
+# Changes are saved and applied automatically. Esc is reserved.
 [general]
 language = "auto"
-alt = "left"
-double_ms = 350
-wait_ms = 4000
-gesture = "left"
-preview = true # Show preset outlines while holding gesture Alt or waiting for a key after double Alt.
-# gesture selects the Alt side for right-click placement: left, right, both or off.
 elevate = false
-autostart = false # Register the current user's logon task. Turn off to remove it.
-restart_on_change = false
-# Times are in ms. elevate requests administrator rights. restart_on_change restarts after a valid edit.
+autostart = false
+preview = true
 
-# Show monitor, time or off. Duration is in ms. Choose system, light or dark colors. Font size is in logical pixels.
+[shortcuts]
+alt = "left"
+gesture = "left"
+move_enabled = true
+move_button = "left"
+resize_enabled = true
+resize_button = "right"
+
 [tip]
-show = "monitor"
-duration_ms = 4000
+show = "window"
+duration_ms = 3000 # Also the delay before showing region outlines.
+window_format = "{title}" # {hwnd}, {title}, {pid}, {process}, {display_name}, {class}
+time_format = "hh:mm" # YYYY, MM, DD, hh, mm, ss
 theme = "system"
 background = "#F2F2F2"
 foreground = "#000000"
 dark_background = "#303030"
 dark_foreground = "#F2F2F2"
-font = "Microsoft YaHei UI"
+font = "SystemFont"
+font_fallbacks = [] # Up to three readable family names, in order.
 font_size = 16
+font_bold = false
+font_italic = false
+
+[regions]
+font = "SystemFont"
+font_fallbacks = []
+font_size = 14
+font_bold = false
+font_italic = false
+
+[outline]
+width = 2
+color = "#808080"
+dark_color = "#FFFFFF"
+opacity = 120
+highlight_opacity = 255
 
 [crosshair]
-fps = 60.0 # Target refresh rate while moving, from 1 to 1000. Fractional values such as 59.94 are supported.
+fps = 30 # Integer, clamped to 24..1000.
 
-# Each crosshair axis has its own DPI-scaled width and gap radius, RGB color and opacity from 0 to 255.
 [horizontal]
 width = 2
 color = "#CCCC00"
 opacity = 160
 gap = 12
+
 [vertical]
 width = 2
 color = "#CCCC00"
 opacity = 160
 gap = 12
 
-# Format x|y|width|height[|monitor]. sw/sh = work area, ww/wh = window, vw/vh = virtual desktop.
-# 50sw-8 means half the width minus 8 px. vw/vh use the virtual desktop origin. Monitor 0 follows the pointer.
+# x|y|width|height[|monitor]; sw/sh = work area %, ww/wh = window %, vw/vh = desktop %.
 [presets]
 LeftTop = "0|0|50sw|50sh"
 FullTop = "0|0|100sw|50sh"
@@ -64,41 +70,35 @@ LeftBottom = "0|50sh|50sw|50sh"
 FullBottom = "0|50sh|100sw|50sh"
 RightBottom = "50sw|50sh|50sw|50sh"
 
-# After double Alt use letters, digits, F1..F24, keyboard vk:XX or punctuation names. An empty value disables the key.
+# Alt + key, or double-tap Alt then key. Empty values disable bindings.
 [keys]
-q = "LeftTop"
-w = "FullTop"
-e = "RightTop"
-a = "FullLeft"
-s = "Center"
-d = "FullRight"
-z = "LeftBottom"
-x = "FullBottom"
-c = "RightBottom"
-p = "top"
-u = "ignore"
-g = "guide"
-minus = "horizontal"
-equal = "cross"
-backslash = "vertical"
-grave = "command"
-F1 = "help"
+Q = "LeftTop"
+W = "FullTop"
+E = "RightTop"
+A = "FullLeft"
+S = "Center"
+D = "FullRight"
+Z = "LeftBottom"
+X = "FullBottom"
+C = "RightBottom"
+P = "Top"
+U = "Ignore"
+G = "Guide"
+Minus = "Horizontal"
+Equal = "Cross"
+Backslash = "Vertical"
+Grave = "Command"
+F1 = "Help"
 
-# Map an ASCII command word to a preset or action. You can also type a preset name directly.
 [commands]
-asdf = "Center"
-version = "version"
-help = "help"
-reload = "reload"
-reboot = "restart"
-quit = "quit"
-pin = "top"
-exclude = "ignore"
-time = "time"
-screen = "monitor"
-g = "guide"
+ASDF = "Center"
+Reboot = "Restart"
+Pin = "Top"
+Exclude = "Ignore"
+Screen = "Monitor"
+G = "Guide"
 
-# Grid lookup order: display number × 10, then that number + cell, then the cell alone (1..9).
+# Monitor-specific cell: monitor * 10 + cell; e.g. monitor 3, bottom-left: 3*10+7=37.
 [grid]
 1 = "LeftTop"
 2 = "FullTop"
@@ -110,7 +110,7 @@ g = "guide"
 8 = "FullBottom"
 9 = "RightBottom"
 
-# Exclusions match every nonempty field. --ignore on records the process name, class and title.
+# All nonempty fields must match. Remove exclusions here to allow a window again.
 # [[exclusions]]
 # name = "notepad.exe"
 # class = "Notepad"

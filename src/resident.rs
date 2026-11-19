@@ -125,7 +125,21 @@ impl App {
         if sync_task {
             crate::logon::sync(self.cfg.autostart, self.cfg.elevate)?;
         }
-        self.notice(self.cfg.tr("Configuration reloaded", "配置已重载"))
+        self.config_notice()
+    }
+    fn config_notice(&mut self) -> Result<(), String> {
+        if self.cfg.warnings.is_empty() {
+            self.notice(self.cfg.tr("Configuration reloaded", "配置已重载"))
+        } else {
+            self.notice(&format!(
+                "{}: {}",
+                self.cfg.tr(
+                    "Invalid fields restored to defaults",
+                    "以下字段有误，已恢复默认值"
+                ),
+                self.cfg.warnings.join(", ")
+            ))
+        }
     }
     fn act(&mut self, action: &str) -> Result<(), String> {
         match action {
@@ -432,6 +446,8 @@ pub fn run(path: &Path) -> Result<bool, String> {
         let mut msg = MSG::default();
         if let Err(problem) = crate::logon::sync(app.cfg.autostart, app.cfg.elevate) {
             app.notice(&problem)?;
+        } else if !app.cfg.warnings.is_empty() {
+            app.config_notice()?;
         }
         loop {
             if let Err(problem) = app.deadlines() {
