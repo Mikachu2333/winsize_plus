@@ -60,35 +60,18 @@ unsafe extern "system" fn paint(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
                 if !layout.is_null() {
                     // SAFETY: the owning overlay removes this property before dropping the boxed layout.
                     let layout = &*layout;
-                    let padding = GetPropW(hwnd, w!("Padding")) as usize as i32;
+                    let border = GetPropW(hwnd, w!("BorderWidth")) as usize as i32;
+                    let radius = GetPropW(hwnd, w!("CornerDiameter")) as usize as i32;
+                    let outline = CreateRoundRectRgn(0, 0, area.right, area.bottom, radius, radius);
+                    if !outline.is_null() {
+                        SetDCBrushColor(dc, GetPropW(hwnd, w!("BorderColor")) as usize as u32);
+                        FrameRgn(dc, outline, GetStockObject(DC_BRUSH), border, border);
+                        DeleteObject(outline);
+                    }
+                    let left = GetPropW(hwnd, w!("PaddingX")) as usize as i32;
+                    let top = GetPropW(hwnd, w!("PaddingTop")) as usize as i32;
                     let color = GetPropW(hwnd, w!("TextColor")) as usize as u32;
-                    layout.draw(
-                        dc,
-                        padding * 2,
-                        padding,
-                        color,
-                        GetPropW(hwnd, w!("Centered")) as usize != 0,
-                    );
-                }
-                let font = GetPropW(hwnd, w!("Font"));
-                if !font.is_null() {
-                    let mut text = vec![0; GetWindowTextLengthW(hwnd) as usize + 1];
-                    let len = GetWindowTextW(hwnd, text.as_mut_ptr(), text.len() as i32);
-                    let old = SelectObject(dc, font);
-                    SetBkMode(dc, TRANSPARENT as i32);
-                    SetTextColor(dc, GetPropW(hwnd, w!("TextColor")) as usize as u32);
-                    let padding = GetPropW(hwnd, w!("Padding")) as usize as i32;
-                    area.left += padding * 2;
-                    area.right -= padding * 2;
-                    area.top += padding;
-                    DrawTextW(
-                        dc,
-                        text.as_ptr(),
-                        len,
-                        &mut area,
-                        DT_LEFT | DT_NOPREFIX | DT_WORDBREAK,
-                    );
-                    SelectObject(dc, old);
+                    layout.draw(dc, left, top, color, false);
                 }
                 EndPaint(hwnd, &paint);
                 0
@@ -190,7 +173,7 @@ impl Panel {
     }
     fn round(&self, width: i32, height: i32, radius: i32) -> Result<(), String> {
         unsafe {
-            let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, radius, radius);
+            let region = CreateRoundRectRgn(0, 0, width, height, radius, radius);
             if region.is_null() {
                 return Err(err());
             }
@@ -272,7 +255,11 @@ impl Overlay {
     pub fn tip(&mut self, text: &str, cfg: &Config) -> Result<(), String> {
         let screen = desktop::screen(desktop::cursor()?, 0)?;
         let dpi = screen.dpi;
-        let padding = scale(8, dpi);
+        let border = scale(1, dpi).max(1);
+        let horizontal = scale(10, dpi) + border;
+        let top = scale(4, dpi) + border;
+        let bottom = scale(6, dpi) + border;
+        let radius = scale(12, dpi);
         let fonts = Fonts::opaque(
             &cfg.font,
             &cfg.font_fallbacks,
@@ -284,10 +271,10 @@ impl Overlay {
         let text = Box::new(TextLayout::new(
             text,
             fonts,
-            (screen.work.width - 4 * padding).max(1),
+            (screen.work.width - 2 * horizontal).max(1),
         )?);
-        let width = (text.width + 4 * padding).min(screen.work.width);
-        let height = (text.height + 2 * padding).min(screen.work.height);
+        let width = (text.width + 2 * horizontal).min(screen.work.width);
+        let height = (text.height + top + bottom).min(screen.work.height);
         let index = if cfg.theme == "dark" || (cfg.theme == "system" && dark()) {
             2
         } else {
@@ -299,7 +286,18 @@ impl Overlay {
                 w!("TextLayout"),
                 (&*text as *const TextLayout) as HANDLE,
             ))?;
-            SetPropW(self.tip.0, w!("Padding"), padding as usize as HANDLE);
+            for (property, value) in [
+                (w!("PaddingX"), horizontal as usize),
+                (w!("PaddingTop"), top as usize),
+                (w!("BorderWidth"), border as usize),
+                (w!("CornerDiameter"), radius as usize),
+                (
+                    w!("BorderColor"),
+                    crate::colors::tip_border(cfg.colors[index]) as usize,
+                ),
+            ] {
+                SetPropW(self.tip.0, property, value as HANDLE);
+            }
             SetPropW(
                 self.tip.0,
                 w!("TextColor"),
@@ -314,7 +312,6 @@ impl Overlay {
             width,
             height,
         };
-        let radius = scale(12, dpi);
         self.tip.round(width, height, radius)?;
         self.shadow.round(width, height, radius)?;
         self.shadow.style(

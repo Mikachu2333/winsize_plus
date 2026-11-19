@@ -52,6 +52,14 @@ pub fn contrast(a: u32, b: u32) -> f64 {
     let (a, b) = (luminance(a), luminance(b));
     (a.max(b) + 0.05) / (a.min(b) + 0.05)
 }
+pub fn tip_border(background: u32) -> u32 {
+    let edge = if contrast(BLACK, background) > contrast(WHITE, background) {
+        BLACK
+    } else {
+        WHITE
+    };
+    composite(edge, background, 72)
+}
 pub fn swatch_text(color: u32, alpha: u8) -> u32 {
     let backgrounds = [CHECKER_LIGHT, CHECKER_SHADE].map(|base| composite(color, base, alpha));
     [TEXT_PRIMARY_LIGHT, WHITE, BLACK]
