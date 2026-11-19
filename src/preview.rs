@@ -197,7 +197,7 @@ impl Preview {
         self.begin(hwnd, cfg, false, None)
     }
     pub fn select(&mut self, hwnd: HWND, name: &str, cfg: &Config) -> Result<(), String> {
-        self.begin(hwnd, cfg, false, Some(name.to_lowercase()))
+        self.begin(hwnd, cfg, false, Some(crate::config::command_name(name)))
     }
     pub fn grid(&mut self, hwnd: HWND, cfg: &Config) -> Result<(), String> {
         self.begin(hwnd, cfg, true, None)

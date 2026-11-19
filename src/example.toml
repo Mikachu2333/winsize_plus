@@ -1,4 +1,4 @@
-# Changes are saved and applied automatically. Esc is reserved.
+# Changes are saved and applied automatically. System/internal shortcuts are reserved.
 [general]
 language = "auto"
 elevate = false
@@ -48,14 +48,14 @@ fps = 30 # Integer, clamped to 24..1000.
 
 [horizontal]
 width = 2
-color = "#0F6CBD"
-opacity = 160
+color = "#C80000"
+opacity = 200
 gap = 12
 
 [vertical]
 width = 2
-color = "#0F6CBD"
-opacity = 160
+color = "#C80000"
+opacity = 200
 gap = 12
 
 # x|y|width|height[|monitor]; sw/sh = work area %, ww/wh = window %, vw/vh = desktop %.
@@ -71,6 +71,8 @@ FullBottom = "0|50sh|100sw|50sh"
 RightBottom = "50sw|50sh|50sw|50sh"
 
 # Alt + key, or double-tap Alt then key. Empty values disable bindings.
+# Reserved: Tab, F4, Space, Enter, PrintScreen, arrows, PgUp/PgDn, Home/End,
+# Esc and modifier keys. VK:xx cannot bypass these restrictions.
 [keys]
 Q = "LeftTop"
 W = "FullTop"
@@ -91,6 +93,7 @@ Grave = "Command"
 H = "Help"
 
 [commands]
+# Names cannot shadow regions, built-in actions, or aliases. Identical built-in mappings are allowed.
 Reboot = "Restart"
 Pin = "Top"
 Exclude = "Ignore"

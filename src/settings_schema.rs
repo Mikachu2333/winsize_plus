@@ -421,8 +421,8 @@ pub fn fields(tab: usize, axis: usize, cfg: &Config, doc: &DocumentMut) -> Vec<F
             let (label, hint) = if mapping {
                 (key.to_owned(), match *section {
                 "presets" => "",
-                "keys" => cfg.tr("Key and action. Esc is reserved. Clear the action to disable this key.", "按键与动作；Esc 已保留。清空动作可禁用该按键。"),
-                "commands" => cfg.tr("Command name and action. Names are case-insensitive.", "命令名称与动作，名称不区分大小写。"),
+                "keys" => cfg.tr("Key and action. System Alt shortcuts, modifiers, Esc and tip navigation keys are reserved. Clear the action to disable a binding.", "按键与动作；系统常用 Alt 快捷键、修饰键、Esc 和提示滚动键已保留。清空动作可禁用绑定。"),
+                "commands" => cfg.tr("Command name and action. Names are case-insensitive and cannot shadow regions or redefine built-in actions/aliases.", "命令名称与动作；名称不区分大小写，不可与分区重名或改写内置动作及别名。"),
                 _ => cfg.tr("Cell number and region. General cells are 1–9.", "格子编号与区域名称，通用格子编号为 1–9。"),
             }.to_owned())
             } else {

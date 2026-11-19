@@ -1,11 +1,12 @@
 use crate::{cli::Switch, layout::Layout};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     io::{self, Write},
     path::{Path, PathBuf},
 };
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value};
+use unicode_width::UnicodeWidthStr;
 use windows_sys::Win32::{
     Foundation::*, Globalization::GetUserDefaultUILanguage, System::Threading::*,
 };
@@ -14,7 +15,7 @@ fn system_zh() -> bool {
     (unsafe { GetUserDefaultUILanguage() } & 0x3ff) == 4
 }
 pub fn help() -> &'static str {
-    include_str!("example.en.toml")
+    include_str!("example.toml")
 }
 pub fn path() -> Result<PathBuf, String> {
     Ok(std::env::current_exe()
@@ -103,6 +104,9 @@ pub fn vk(text: &str) -> Option<u32> {
         "minus" | "-" | "－" | "—" => 0xbd,
         "equal" | "=" | "＝" => 0xbb,
         "backslash" | "\\" | "、" | "＼" => 0xdc,
+        "leftbracket" | "[" | "【" => 0xdb,
+        "rightbracket" | "]" | "】" => 0xdd,
+        "quote" | "'" => 0xde,
         "space" => 0x20,
         "tab" => 9,
         "semicolon" | ";" | "；" | "：" => 0xba,
@@ -112,6 +116,18 @@ pub fn vk(text: &str) -> Option<u32> {
         "insert" => 0x2d,
         _ => return None,
     })
+}
+
+pub(crate) fn reserved_key(key: u32) -> bool {
+    matches!(key,
+        // System Alt shortcuts, modifiers, and the tip's navigation/cancel keys.
+        0x09 | 0x0d | 0x10..=0x12 | 0x1b | 0x20..=0x28 | 0x2c
+        | 0x5b..=0x5c | 0x73 | 0xa0..=0xa5
+        // Mouse/gamepad input, undefined/reserved codes, and synthetic IME/Unicode input.
+        | 0x00..=0x07 | 0x0a..=0x0b | 0x0e..=0x0f | 0x3a..=0x40
+        | 0x5e | 0x88..=0x8f | 0x97..=0x9f | 0xb8..=0xb9
+        | 0xc1..=0xda | 0xe0 | 0xe5..=0xe8 | 0xfc | 0xff..=u32::MAX
+    )
 }
 
 fn merge(table: &mut Table, defaults: &Table, named: bool) -> bool {
@@ -128,11 +144,7 @@ fn merge(table: &mut Table, defaults: &Table, named: bool) -> bool {
                     matches!(key, "presets" | "keys" | "commands" | "grid"),
                 )
             }
-        } else if !named
-            || !table
-                .iter()
-                .any(|(existing, _)| existing.eq_ignore_ascii_case(key))
-        {
+        } else {
             table.insert(key, item.clone());
             changed = true
         }
@@ -194,6 +206,27 @@ pub fn standard_name(name: &str) -> String {
         .map(|first| first.to_uppercase().chain(chars).collect())
         .unwrap_or_default()
 }
+fn key_name(key: u32) -> String {
+    match key {
+        9 => "Tab".into(),
+        32 => "Space".into(),
+        0x2d => "Insert".into(),
+        0xc0 => "`".into(),
+        0xbd => "-".into(),
+        0xbb => "=".into(),
+        0xdc => "\\".into(),
+        0xdb => "[".into(),
+        0xdd => "]".into(),
+        0xde => "'".into(),
+        0xba => ";".into(),
+        0xbc => ",".into(),
+        0xbe => ".".into(),
+        0xbf => "/".into(),
+        0x70..=0x87 => format!("F{}", key - 0x6f),
+        0x30..=0x39 | 0x41..=0x5a => char::from_u32(key).unwrap().to_string(),
+        _ => format!("VK:{key:02X}"),
+    }
+}
 fn is_builtin_action(name: &str) -> bool {
     ACTIONS.contains(&name)
 }
@@ -202,20 +235,56 @@ fn reserved_preset_name(name: &str) -> bool {
     is_builtin_action(&name) || ALIASES.iter().any(|(alias, _)| *alias == name)
 }
 
+fn validate_command_names(doc: &DocumentMut) -> Result<(), String> {
+    let presets: HashSet<_> = doc
+        .get("presets")
+        .and_then(Item::as_table)
+        .into_iter()
+        .flat_map(|table| table.iter().map(|(key, _)| command_name(key)))
+        .collect();
+    let mut names = HashSet::new();
+    if let Some(table) = doc.get("commands").and_then(Item::as_table) {
+        for (key, item) in table {
+            let name = command_name(key);
+            if !names.insert(name.clone()) {
+                return Err(format!("commands.{key}: duplicate name / 命令名称重复"));
+            }
+            if presets.contains(&name) {
+                return Err(format!(
+                    "commands.{key}: name conflicts with a preset / 命令名与分区名冲突"
+                ));
+            }
+            let builtin = ALIASES
+                .iter()
+                .find(|(alias, _)| *alias == name)
+                .map(|(_, action)| *action)
+                .or_else(|| is_builtin_action(&name).then_some(name.as_str()));
+            if let Some(builtin) = builtin
+                && item.as_str().map(command_name).as_deref() != Some(builtin)
+            {
+                return Err(format!(
+                    "commands.{key}: reserved action name / 不可覆盖内置动作或别名"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn canonicalize(doc: &mut DocumentMut) {
     let names: HashMap<String, String> = doc
         .get("presets")
         .and_then(Item::as_table)
         .into_iter()
         .flat_map(|table| table.iter())
-        .map(|(key, _)| (key.to_ascii_lowercase(), key.to_owned()))
+        .map(|(key, _)| (command_name(key), key.to_owned()))
         .collect();
     // Preserve custom names as authored; normalize action references and built-in spelling.
     for section in ["keys", "commands", "grid"] {
         if let Some(table) = doc.get_mut(section).and_then(Item::as_table_mut) {
             for (_, item) in table.iter_mut() {
                 if let Some(text) = item.as_str() {
-                    let lower = text.to_ascii_lowercase();
+                    let lower = command_name(text);
                     let canonical = if is_builtin_action(&lower) {
                         Some(standard_name(&lower))
                     } else {
@@ -243,15 +312,13 @@ impl Config {
             .map(String::as_str)
     }
     pub fn preset(&self, name_or_key: &str) -> Option<&Layout> {
-        self.presets
-            .get(&name_or_key.to_ascii_lowercase())
-            .or_else(|| {
-                let action = self.keys.get(&vk(name_or_key)?)?;
-                if is_builtin_action(action) {
-                    return None;
-                }
-                self.presets.get(action)
-            })
+        self.presets.get(&command_name(name_or_key)).or_else(|| {
+            let action = self.keys.get(&vk(name_or_key)?)?;
+            if is_builtin_action(action) {
+                return None;
+            }
+            self.presets.get(action)
+        })
     }
 
     pub fn tr<'a>(&self, en: &'a str, zh: &'a str) -> &'a str {
@@ -259,7 +326,7 @@ impl Config {
     }
     pub fn display_name<'a>(&'a self, name: &'a str) -> &'a str {
         self.preset_names
-            .get(&name.to_ascii_lowercase())
+            .get(&command_name(name))
             .map(String::as_str)
             .unwrap_or(name)
     }
@@ -282,13 +349,15 @@ impl Config {
             Some(6) => self.tr("side button 2", "侧键 2"),
             _ => "",
         };
-        let mut lines = vec![
+        // Content is organized as sections of lines; only the final join adds spacing.
+        let mut sections = vec![vec![
             self.tr(
-                "WinSizeP — Esc closes; PgUp/PgDn, Up/Down, Home/End scroll long tips",
-                "WinSizeP 帮助：Esc 关闭；内容过长时用翻页键、上下键、Home/End 滚动",
+                "WinSizeP HELP: (Esc to close)",
+                "WinSizeP 帮助：（按 Esc 关闭）",
             )
             .to_owned(),
-        ];
+        ]];
+        let mut mouse = Vec::new();
         for (button_id, en, zh) in [
             (self.move_button, "move window", "移动窗口"),
             (
@@ -297,8 +366,8 @@ impl Config {
                 "调整窗口大小（固定左上角）",
             ),
         ] {
-            if button_id.is_some() {
-                lines.push(format!(
+            if button_id.is_some() && self.gesture != "off" {
+                mouse.push(format!(
                     "Alt + {} {} = {}",
                     button(button_id),
                     self.tr("drag", "拖动"),
@@ -306,48 +375,169 @@ impl Config {
                 ));
             }
         }
-        lines.push(
-            self.tr(
-                "Alt + right click = place by the 3×3 grid",
-                "Alt + 右键点击屏幕位置 = 九宫格位置调整",
-            )
-            .into(),
-        );
-        lines.push(
+        if self.gesture != "off" {
+            mouse.push(
+                self.tr(
+                    "Alt + right click = place by the 3×3 grid",
+                    "Alt + 右键点击屏幕位置 = 九宫格位置调整",
+                )
+                .into(),
+            );
+        }
+        sections.push(mouse);
+        let mut regions = vec![
             self.tr(
                 "Hold Alt + a key, or double-tap Alt then press a key:",
                 "按住 Alt + 按键，或双击 Alt 后按键：",
             )
             .into(),
-        );
+        ];
+        // Only region bindings form the keyboard diagram. Empty physical rows take no space.
+        let keyboard_rows: [Vec<u32>; 5] = [
+            (0x70..=0x87).collect(),
+            "`1234567890-="
+                .chars()
+                .filter_map(|ch| vk(&ch.to_string()))
+                .collect(),
+            "QWERTYUIOP[]\\"
+                .chars()
+                .filter_map(|ch| vk(&ch.to_string()))
+                .collect(),
+            "ASDFGHJKL;'"
+                .chars()
+                .filter_map(|ch| vk(&ch.to_string()))
+                .collect(),
+            "ZXCVBNM,./"
+                .chars()
+                .filter_map(|ch| vk(&ch.to_string()))
+                .collect(),
+        ];
+        let rows: Vec<Vec<_>> = keyboard_rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .filter_map(|key| {
+                        let action = self.keys.get(key)?;
+                        self.presets.contains_key(action).then_some((*key, action))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .filter(|row| !row.is_empty())
+            .collect();
+        let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
+        let mut shown = HashSet::new();
+        for (index, row) in rows.iter().enumerate() {
+            let mut cells: Vec<_> = row.iter().map(|(key, _)| key_name(*key)).collect();
+            cells.resize(columns, String::new());
+            cells.push(if index == rows.len() / 2 { "->" } else { "" }.into());
+            for (key, action) in row {
+                shown.insert(*key);
+                cells.push(self.display_name(action).to_owned());
+            }
+            regions.push(cells.join("\t"));
+        }
+        sections.push(regions);
         let mut bindings: Vec<_> = self.keys.iter().collect();
         bindings.sort_by_key(|(key, _)| **key);
+        let mut crosshair = Vec::new();
+        for (name, en, zh) in [
+            ("guide", "toggle crosshair", "显示或隐藏十字线"),
+            ("cross", "both axes", "双线"),
+            ("vertical", "vertical", "竖线"),
+            ("horizontal", "horizontal", "横线"),
+        ] {
+            let keys: Vec<_> = bindings
+                .iter()
+                .filter(|(_, action)| action.as_str() == name)
+                .map(|(key, _)| {
+                    shown.insert(**key);
+                    key_name(**key)
+                })
+                .collect();
+            if !keys.is_empty() {
+                crosshair.push(format!(
+                    "{} {}",
+                    keys.join(self.tr(" / ", "、")),
+                    self.tr(en, zh)
+                ));
+            }
+        }
+        if !crosshair.is_empty() {
+            sections.push(vec![crosshair.join(self.tr(";  ", "；"))]);
+        }
+        let mut other = Vec::new();
         for (key, action) in bindings {
-            let key = match *key {
-                0xc0 => "`".into(),
-                0xbd => "-".into(),
-                0xbb => "=".into(),
-                0xdc => "\\".into(),
-                0x70..=0x87 => format!("F{}", key - 0x6f),
-                _ => char::from_u32(*key)
-                    .map(|c| c.to_string())
-                    .unwrap_or_default(),
-            };
+            if shown.contains(key) {
+                continue;
+            }
+            let key = key_name(*key);
             let title = match action.as_str() {
-                "top" => self.tr("toggle topmost", "置顶 / 取消置顶"),
+                "top" => self.tr("toggle topmost", "置顶或取消置顶"),
                 "ignore" => self.tr("exclude window", "忽略窗口"),
-                "guide" | "cross" => self.tr("toggle crosshair", "显示 / 隐藏十字线"),
-                "horizontal" => self.tr("horizontal crosshair", "水平十字线"),
-                "vertical" => self.tr("vertical crosshair", "垂直十字线"),
-                "borders" => self.tr("toggle region outlines", "显示 / 隐藏框线"),
+                "borders" => self.tr("toggle region outlines", "显示或隐藏框线"),
                 "command" => self.tr("run command", "运行指令"),
                 "help" => self.tr("help", "帮助"),
                 _ => self.display_name(action),
             };
-            lines.push(format!("Alt + {key} = {title}"));
+            other.push(format!("Alt + {key} = {title}"));
         }
-        lines.push(self.tr("Aliases: Version = Ver; Help = H; Quit = Exit; Restart = Reboot; Top = Pin; Ignore = Exclude; Monitor = Screen", "内置别名：Version = Ver；Help = H；Quit = Exit；Restart = Reboot；Top = Pin；Ignore = Exclude；Monitor = Screen").into());
-        lines.join("\n")
+        sections.push(other);
+        let mut aliases = vec![self.tr("Aliases:", "内置别名：").to_owned()];
+        for row in [
+            &["Version = Ver", "Help = H"][..],
+            &["Quit = Exit", "Restart = Reboot"][..],
+            &["Top = Pin", "Ignore = Exclude", "Monitor = Screen"][..],
+        ] {
+            aliases.push(row.join(self.tr("; ", "；")));
+        }
+        sections.push(aliases);
+        sections
+            .into_iter()
+            .filter(|section| !section.is_empty())
+            .map(|section| section.join("\n"))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+    pub fn console_help_text(&self) -> String {
+        // Console tabs have fixed stops. Expand the same cells using Unicode display widths.
+        let text = self.help_text();
+        let lines: Vec<_> = text.lines().collect();
+        let mut output = Vec::new();
+        let mut start = 0;
+        while start < lines.len() {
+            if !lines[start].contains('\t') {
+                output.push(lines[start].to_owned());
+                start += 1;
+                continue;
+            }
+            let end = start
+                + lines[start..]
+                    .iter()
+                    .take_while(|line| line.contains('\t'))
+                    .count();
+            let rows: Vec<Vec<_>> = lines[start..end]
+                .iter()
+                .map(|line| line.split('\t').collect())
+                .collect();
+            let mut widths = vec![0; rows.iter().map(Vec::len).max().unwrap_or(0)];
+            for row in &rows {
+                for (column, cell) in row.iter().enumerate() {
+                    widths[column] = widths[column].max(cell.width());
+                }
+            }
+            for row in rows {
+                let mut line = String::new();
+                for (column, cell) in row.iter().enumerate() {
+                    line.push_str(cell);
+                    if column + 1 < row.len() {
+                        line.extend(std::iter::repeat_n(' ', widths[column] - cell.width() + 2));
+                    }
+                }
+                output.push(line);
+            }
+            start = end;
+        }
+        output.join("\n")
     }
     pub fn parse(doc: &DocumentMut) -> Result<Self, String> {
         let field = |section: &str, key: &str| {
@@ -403,15 +593,13 @@ impl Config {
         let mut presets = HashMap::new();
         let mut preset_names = HashMap::new();
         for (key, item) in entries("presets")? {
+            let name = command_name(key);
             if reserved_preset_name(key) {
                 return Err(format!(
                     "presets.{key}: reserved action name / 分区名与内置动作冲突"
                 ));
             }
-            if key.eq_ignore_ascii_case("esc")
-                || key.eq_ignore_ascii_case("escape")
-                || key.is_empty()
-            {
+            if matches!(name.as_str(), "esc" | "escape" | "") || key.chars().any(char::is_control) {
                 return Err(format!("presets.{key}: reserved name"));
             }
             let layout = item
@@ -419,16 +607,14 @@ impl Config {
                 .ok_or_else(|| format!("presets.{key}"))?
                 .parse()
                 .map_err(|err: String| format!("presets.{key}: {err}"))?;
-            if presets.insert(key.to_ascii_lowercase(), layout).is_some() {
+            if presets.insert(name.clone(), layout).is_some() {
                 return Err(format!("presets.{key}: duplicate name"));
             }
-            preset_names.insert(key.to_ascii_lowercase(), key.to_owned());
+            preset_names.insert(name, key.to_owned());
         }
+        validate_command_names(doc)?;
         let action = |item: &Item| {
-            let name = item
-                .as_str()
-                .ok_or_else(|| item.to_string())?
-                .to_ascii_lowercase();
+            let name = command_name(item.as_str().ok_or_else(|| item.to_string())?);
             if name.is_empty() || presets.contains_key(&name) || is_builtin_action(&name) {
                 Ok(name)
             } else {
@@ -436,35 +622,43 @@ impl Config {
             }
         };
         let mut keys = HashMap::new();
+        let mut used_keys = HashSet::new();
         for (key, item) in entries("keys")? {
             let name = action(item).map_err(|err| format!("keys.{key}: {err}"))?;
             let vk = vk(key).ok_or_else(|| format!("keys.{key}: invalid or reserved key"))?;
-            if !name.is_empty() && keys.insert(vk, name).is_some() {
+            if reserved_key(vk) {
+                return Err(format!(
+                    "keys.{key}: system or internal reserved key / 系统或程序保留键"
+                ));
+            }
+            if !used_keys.insert(vk) {
                 return Err(format!("keys.{key}: duplicate key"));
+            }
+            if !name.is_empty() {
+                keys.insert(vk, name);
             }
         }
         let mut commands = HashMap::new();
         for (key, item) in entries("commands")? {
-            if !key
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b' '))
+            let name = command_name(key);
+            if name.is_empty()
+                || !key
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b' '))
             {
                 return Err(format!("commands.{key}"));
             }
-            if key.eq_ignore_ascii_case("esc") || key.eq_ignore_ascii_case("escape") {
+            if matches!(name.as_str(), "esc" | "escape") {
                 return Err(format!("commands.{key}: reserved name"));
             }
             commands.insert(
-                key.to_ascii_lowercase(),
+                name,
                 action(item).map_err(|err| format!("commands.{key}: {err}"))?,
             );
         }
         let mut grid = HashMap::new();
         for (key, item) in entries("grid")? {
-            let name = item
-                .as_str()
-                .ok_or_else(|| format!("grid.{key}"))?
-                .to_ascii_lowercase();
+            let name = command_name(item.as_str().ok_or_else(|| format!("grid.{key}"))?);
             if !name.is_empty() && !presets.contains_key(&name) {
                 return Err(format!("grid.{key}: {name}"));
             }
@@ -813,6 +1007,8 @@ fn recover(doc: &mut DocumentMut) -> Result<Config, String> {
             "presets.{key}: reserved action name / 分区名与内置动作冲突"
         ));
     }
+    // Removing a conflicting command could expose an unintended built-in action.
+    validate_command_names(doc)?;
     let defaults = help()
         .parse::<DocumentMut>()
         .map_err(|err| err.to_string())?;
@@ -1137,6 +1333,198 @@ pub fn load_snapshot(path: &Path, edit: Option<(&Identity, Switch)>) -> Result<L
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn help_omits_disabled_mouse_actions_and_uses_readable_key_names() {
+        let mut doc = help().parse::<DocumentMut>().unwrap();
+        doc["general"]["language"] = value("en");
+        doc["shortcuts"]["gesture"] = value("off");
+        doc["keys"]["F12"] = value("Help");
+        doc["keys"]["Insert"] = value("Version");
+        doc["keys"]["Comma"] = value("Help");
+        let text = Config::parse(&doc).unwrap().help_text();
+        assert!(!text.contains("drag =") && !text.contains("right click"));
+        for key in ["F12", "Insert", ","] {
+            assert!(text.contains(&format!("Alt + {key} =")));
+        }
+    }
+    #[test]
+    fn help_groups_regions_in_keyboard_order_then_crosshair_then_other_actions() {
+        let mut doc = help().parse::<DocumentMut>().unwrap();
+        doc["general"]["language"] = value("en");
+        let text = Config::parse(&doc).unwrap().help_text();
+        assert!(
+            text.contains(concat!(
+                "Q\tW\tE\t\tLeftTop\tFullTop\tRightTop\n",
+                "A\tS\tD\t->\tFullLeft\tCenter\tFullRight\n",
+                "Z\tX\tC\t\tLeftBottom\tFullBottom\tRightBottom\n\n",
+                "L toggle crosshair;  = both axes;  \\ vertical;  - horizontal\n\n",
+            )),
+            "{text}"
+        );
+        assert!(text.find("horizontal\n").unwrap() < text.find("Alt + H = help").unwrap());
+        assert!(!text.contains("Alt + Q =") && !text.contains("Alt + L ="));
+    }
+    #[test]
+    fn help_sections_have_consistent_spacing_and_localized_punctuation() {
+        for language in ["en", "zh-CN"] {
+            let mut doc = help().parse::<DocumentMut>().unwrap();
+            doc["general"]["language"] = value(language);
+            let text = Config::parse(&doc).unwrap().help_text();
+            let sections: Vec<_> = text.split("\n\n").collect();
+            assert_eq!(sections.len(), 6, "{text}");
+            assert!(sections.iter().all(|section| !section.is_empty()
+                && !section.starts_with('\n')
+                && !section.ends_with('\n')));
+            assert_eq!(sections[3].lines().count(), 1);
+            assert!(!sections[3].contains([':', '：']));
+            if language == "zh-CN" {
+                assert!(sections[3].contains("L 显示或隐藏十字线；= 双线；\\ 竖线；- 横线"));
+                assert!(sections[5].starts_with("内置别名：\n"));
+                assert!(!text.contains([':', ';', ',', '(', ')']));
+            } else {
+                assert!(
+                    sections[3]
+                        .contains("L toggle crosshair;  = both axes;  \\ vertical;  - horizontal")
+                );
+                assert!(sections[5].starts_with("Aliases:\n"));
+                assert!(!text.contains(['：', '；', '，', '（', '）', '、']));
+            }
+            doc["shortcuts"]["gesture"] = value("off");
+            doc["keys"] = Item::Table(Table::new());
+            let text = Config::parse(&doc).unwrap().help_text();
+            assert_eq!(text.split("\n\n").count(), 3);
+            assert!(!text.contains("\n\n\n"));
+        }
+    }
+    #[test]
+    fn help_includes_all_five_keyboard_rows_and_unusual_region_keys_once() {
+        let mut doc = help().parse::<DocumentMut>().unwrap();
+        doc["keys"] = Item::Table(Table::new());
+        for key in [
+            "F12", "F2", "0", "1", "Grave", "Equal", "P", "Q", "Quote", "A", "Slash", "Z", "Insert",
+        ] {
+            doc["keys"][key] = value("Center");
+        }
+        let text = Config::parse(&doc).unwrap().help_text();
+        let rows: Vec<_> = text.lines().filter(|line| line.contains('\t')).collect();
+        assert_eq!(rows.len(), 5);
+        for (row, expected) in
+            rows.iter()
+                .zip(["F2\tF12\t", "`\t1\t0\t=\t", "Q\tP\t", "A\t'\t", "Z\t/\t"])
+        {
+            assert!(row.starts_with(expected), "{row}");
+        }
+        assert_eq!(text.matches("Alt + Insert = Center").count(), 1);
+        doc["keys"] = Item::Table(Table::new());
+        assert!(!Config::parse(&doc).unwrap().help_text().contains('\t'));
+    }
+    #[test]
+    fn console_help_aligns_wide_region_names_without_widening_key_columns() {
+        let mut doc = help().parse::<DocumentMut>().unwrap();
+        doc["presets"]["左上角区域名称"] = value("0|0|100|100");
+        doc["keys"]["Q"] = value("左上角区域名称");
+        let text = Config::parse(&doc).unwrap().console_help_text();
+        assert!(!text.contains('\t'));
+        let rows: Vec<_> = text
+            .lines()
+            .filter(|line| {
+                line.starts_with("Q  W  E")
+                    || line.starts_with("A  S  D")
+                    || line.starts_with("Z  X  C")
+            })
+            .collect();
+        assert_eq!(rows.len(), 3);
+        for names in [
+            ["左上角区域名称", "FullLeft", "LeftBottom"],
+            ["FullTop", "Center", "FullBottom"],
+            ["RightTop", "FullRight", "RightBottom"],
+        ] {
+            let starts: Vec<_> = rows
+                .iter()
+                .zip(names)
+                .map(|(row, name)| row[..row.find(name).unwrap()].width())
+                .collect();
+            assert_eq!(starts[0], starts[1]);
+            assert_eq!(starts[0], starts[2]);
+        }
+    }
+    #[test]
+    fn system_and_internal_keys_cannot_be_bound_even_by_virtual_key_code() {
+        for key in [
+            "Tab", "F4", "Space", "Esc", "VK:09", "VK:0D", "VK:10", "VK:11", "VK:12", "VK:1B",
+            "VK:20", "VK:21", "VK:22", "VK:23", "VK:24", "VK:25", "VK:26", "VK:27", "VK:28",
+            "VK:2C", "VK:5B", "VK:5C", "VK:73", "VK:A0", "VK:A1", "VK:A2", "VK:A3", "VK:A4",
+            "VK:A5", "VK:E5", "VK:E7",
+        ] {
+            let mut doc = help().parse::<DocumentMut>().unwrap();
+            doc["keys"][key] = value("Help");
+            let error = Config::parse(&doc)
+                .err()
+                .unwrap_or_else(|| panic!("accepted {key}"));
+            assert!(error.starts_with(&format!("keys.{key}:")), "{error}");
+        }
+        let mut doc = help().parse::<DocumentMut>().unwrap();
+        for key in [
+            "F1",
+            "F12",
+            "F24",
+            "Insert",
+            "VK:60",
+            "LeftBracket",
+            "RightBracket",
+            "Quote",
+        ] {
+            doc["keys"][key] = value("Help");
+        }
+        assert!(Config::parse(&doc).is_ok());
+    }
+    #[test]
+    fn command_conflicts_are_rejected_without_rewriting_the_document() {
+        for (key, target) in [
+            ("Help", "Quit"),
+            ("Pin", "Quit"),
+            ("LeftTop", "Help"),
+            ("reboot", "Restart"),
+            (" G ", "Help"),
+        ] {
+            let mut doc = help().parse::<DocumentMut>().unwrap();
+            doc["commands"][key] = value(target);
+            let before = doc.to_string();
+            assert!(Config::parse(&doc).is_err(), "{key}");
+            assert!(recover(&mut doc).is_err(), "{key}");
+            assert_eq!(doc.to_string(), before);
+        }
+        let mut doc = help().parse::<DocumentMut>().unwrap();
+        doc["commands"]["Help"] = value("Help");
+        doc["commands"][" My Command "] = value("Center");
+        let cfg = Config::parse(&doc).unwrap();
+        assert_eq!(cfg.action("MY COMMAND"), "center");
+        assert_eq!(cfg.action("Pin"), "top");
+    }
+    #[test]
+    fn normalized_names_and_disabled_key_aliases_cannot_hide_duplicates() {
+        let mut doc = help().parse::<DocumentMut>().unwrap();
+        doc["presets"][" Ｃｅｎｔｅｒ "] = value("0|0|100|100");
+        assert!(
+            Config::parse(&doc)
+                .err()
+                .unwrap()
+                .contains("duplicate name")
+        );
+        let mut doc = help().parse::<DocumentMut>().unwrap();
+        doc["keys"]["Q"] = value("");
+        doc["keys"]["VK:51"] = value("Center");
+        assert!(Config::parse(&doc).err().unwrap().contains("duplicate key"));
+        let mut doc = help().parse::<DocumentMut>().unwrap();
+        doc["presets"]["大区域"] = value("0|0|100|100");
+        doc["keys"]["Q"] = value("大区域");
+        assert!(Config::parse(&doc).unwrap().help_text().contains("大区域"));
+        for name in ["", "   ", " Escape ", "Ｅｓｃ", "two\nlines", "a\tb"] {
+            let mut doc = help().parse::<DocumentMut>().unwrap();
+            doc["presets"][name] = value("0|0|100|100");
+            assert!(Config::parse(&doc).is_err(), "{name:?}");
+        }
+    }
     #[test]
     fn built_in_actions_and_aliases_cannot_be_reinterpreted_as_presets() {
         for name in ACTIONS

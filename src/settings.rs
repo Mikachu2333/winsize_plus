@@ -1288,7 +1288,8 @@ impl Editor {
                             .unwrap()
                             .iter()
                             .any(|(existing, _)| {
-                                existing != key && existing.eq_ignore_ascii_case(&name)
+                                existing != key
+                                    && config::command_name(existing) == config::command_name(&name)
                             })
                         {
                             return Err(self.cfg.tr("Name already exists", "名称已存在").into());
@@ -1298,7 +1299,9 @@ impl Editor {
                             for bindings in ["keys", "commands", "grid"] {
                                 for (_, item) in draft[bindings].as_table_mut().unwrap().iter_mut()
                                 {
-                                    if item.as_str().is_some_and(|v| v.eq_ignore_ascii_case(key)) {
+                                    if item.as_str().is_some_and(|v| {
+                                        config::command_name(v) == config::command_name(key)
+                                    }) {
                                         *item = value(&name);
                                     }
                                 }
@@ -1535,7 +1538,10 @@ impl Editor {
         self.save()?;
         let mut draft = self.doc.clone();
         let names: Vec<String> = match section {
-            "keys" => (2..=24).map(|n| format!("F{n}")).collect(),
+            "keys" => (2..=24)
+                .filter(|n| !config::reserved_key(0x6f + n))
+                .map(|n| format!("F{n}"))
+                .collect(),
             "grid" => (1..=999)
                 .filter(|n| n % 10 != 0)
                 .map(|n| n.to_string())
@@ -1546,11 +1552,16 @@ impl Editor {
         let name = names
             .into_iter()
             .find(|n| {
-                !draft[section]
-                    .as_table()
-                    .unwrap()
-                    .iter()
-                    .any(|(k, _)| k.eq_ignore_ascii_case(n))
+                !draft[section].as_table().unwrap().iter().any(|(k, _)| {
+                    if section == "keys" {
+                        config::vk(k) == config::vk(n)
+                    } else {
+                        config::command_name(k) == config::command_name(n)
+                    }
+                }) && (section != "commands"
+                    || !self.cfg.presets.contains_key(&config::command_name(n)))
+                    && (section != "presets"
+                        || !self.cfg.commands.contains_key(&config::command_name(n)))
             })
             .ok_or("No free name")?;
         let text = if section == "presets" {
@@ -1582,7 +1593,10 @@ impl Editor {
         if section == "presets" {
             for section in ["keys", "commands", "grid"] {
                 for (_, item) in draft[section].as_table_mut().unwrap().iter_mut() {
-                    if item.as_str().is_some_and(|n| n.eq_ignore_ascii_case(&key)) {
+                    if item
+                        .as_str()
+                        .is_some_and(|n| config::command_name(n) == config::command_name(&key))
+                    {
                         *item = value("");
                     }
                 }

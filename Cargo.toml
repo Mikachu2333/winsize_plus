@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.88"
 
 [dependencies]
+unicode-width = { version = "0.2.3", default-features = false }
 windows = { version = "0.62.2", default-features = false, features = [
     "Win32_Graphics_Direct2D_Common",
     "Win32_Graphics_DirectWrite",

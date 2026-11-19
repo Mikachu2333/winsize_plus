@@ -357,7 +357,7 @@ fn execute(args: &[String]) -> Result<(), String> {
         ["--help" | "-h"] => {
             println!(
                 "{}\n\nwinsizep --pid 123 --preset Center\nwinsizep --name notepad.exe --size 900,600\nwinsizep --stdin [shared options]\n--settings  --check  --version",
-                config::load(&path, None)?.help_text()
+                config::load(&path, None)?.console_help_text()
             );
         }
         ["--settings"] => return settings::run(&path),
