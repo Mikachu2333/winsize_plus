@@ -1539,14 +1539,14 @@ impl Editor {
                 for y in (rect.top..rect.bottom).step_by(tile as usize) {
                     for x in (rect.left..rect.right).step_by(tile as usize) {
                         let base = if (x / tile + y / tile) % 2 == 0 {
-                            230
+                            crate::colors::CHECKER_LIGHT
                         } else {
-                            180
+                            crate::colors::CHECKER_SHADE
                         };
-                        let mix = |c: u32| (c * channels[3] + base * (255 - channels[3])) / 255;
+                        let foreground = channels[0] | (channels[1] << 8) | (channels[2] << 16);
                         SetDCBrushColor(
                             dc,
-                            mix(channels[0]) | (mix(channels[1]) << 8) | (mix(channels[2]) << 16),
+                            crate::colors::composite(foreground, base, channels[3] as u8),
                         );
                         FillRect(
                             dc,
@@ -1572,11 +1572,10 @@ impl Editor {
                 SetBkMode(dc, TRANSPARENT as i32);
                 SetTextColor(
                     dc,
-                    if channels[3] > 180 && channels[..3].iter().sum::<u32>() < 300 {
-                        0xffffff
-                    } else {
-                        0
-                    },
+                    crate::colors::swatch_text(
+                        channels[0] | (channels[1] << 8) | (channels[2] << 16),
+                        channels[3] as u8,
+                    ),
                 );
                 DrawTextW(
                     dc,
@@ -1799,7 +1798,7 @@ unsafe extern "system" fn pane_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: LP
                 SetTextColor(
                     wp as HDC,
                     if hint {
-                        0x707070
+                        crate::colors::secondary_text()
                     } else {
                         GetSysColor(COLOR_WINDOWTEXT)
                     },
@@ -2278,13 +2277,26 @@ mod tests {
                     return Err("FPS control missing".into());
                 }
                 unsafe {
-                    let mut client = RECT::default(); GetClientRect(fps, &mut client);
-                    let mut format = RECT::default(); send(fps, EM_GETRECT, 0, (&mut format as *mut RECT) as isize);
-                    let dc = GetDC(fps); let old = SelectObject(dc, send(fps, WM_GETFONT, 0, 0) as HFONT);
-                    let mut metrics = TEXTMETRICW::default(); GetTextMetricsW(dc, &mut metrics); SelectObject(dc, old); ReleaseDC(fps, dc);
-                    let top = format.top; let bottom = client.bottom - top - metrics.tmHeight;
-                    if (top - bottom).abs() > 2 { return Err(format!("Edit text not vertically centered: top={top}, bottom={bottom}")); }
-                    if client.right > 100 { return Err("Numeric edit is unnecessarily wide".into()); }
+                    let mut client = RECT::default();
+                    GetClientRect(fps, &mut client);
+                    let mut format = RECT::default();
+                    send(fps, EM_GETRECT, 0, (&mut format as *mut RECT) as isize);
+                    let dc = GetDC(fps);
+                    let old = SelectObject(dc, send(fps, WM_GETFONT, 0, 0) as HFONT);
+                    let mut metrics = TEXTMETRICW::default();
+                    GetTextMetricsW(dc, &mut metrics);
+                    SelectObject(dc, old);
+                    ReleaseDC(fps, dc);
+                    let top = format.top;
+                    let bottom = client.bottom - top - metrics.tmHeight;
+                    if (top - bottom).abs() > 2 {
+                        return Err(format!(
+                            "Edit text not vertically centered: top={top}, bottom={bottom}"
+                        ));
+                    }
+                    if client.right > 100 {
+                        return Err("Numeric edit is unnecessarily wide".into());
+                    }
                 }
                 send(fps, EM_SETSEL, 0, -1);
                 send(fps, EM_REPLACESEL, 1, w!("2000") as isize);
@@ -2312,9 +2324,13 @@ mod tests {
                 if merged["crosshair"]["fps"].as_integer() != Some(75) {
                     return Err("External edit lost to GUI debounce".into());
                 }
-                if caption(unsafe { GetDlgItem(hwnd, 600) }) != "已保存" { return Err("Saved status is missing".into()); }
+                if caption(unsafe { GetDlgItem(hwnd, 600) }) != "已保存" {
+                    return Err("Saved status is missing".into());
+                }
                 std::thread::sleep(Duration::from_millis(3300));
-                if !caption(unsafe { GetDlgItem(hwnd, 600) }).is_empty() { return Err("Saved status did not expire".into()); }
+                if !caption(unsafe { GetDlgItem(hwnd, 600) }).is_empty() {
+                    return Err("Saved status did not expire".into());
+                }
                 Ok(())
             })();
             unsafe {

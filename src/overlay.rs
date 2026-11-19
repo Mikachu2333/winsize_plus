@@ -313,7 +313,14 @@ impl Overlay {
         let radius = scale(12, dpi);
         self.tip.round(width, height, radius)?;
         self.shadow.round(width, height, radius)?;
-        self.shadow.style(0, 70);
+        self.shadow.style(
+            crate::colors::BLACK,
+            if index == 2 {
+                crate::colors::SHADOW_DARK_ALPHA
+            } else {
+                crate::colors::SHADOW_LIGHT_ALPHA
+            },
+        );
         self.shadow.show(Rect {
             y: rect.y + scale(3, dpi),
             ..rect
@@ -469,8 +476,10 @@ impl Label {
             ))?;
             SetPropW(self.panel.0, w!("Centered"), 1usize as HANDLE);
             SetPropW(self.panel.0, w!("TextColor"), color as usize as HANDLE);
-            SetWindowLongPtrW(self.panel.0, GWLP_USERDATA, 0x010101);
-            SetLayeredWindowAttributes(self.panel.0, 0x010101, 255, LWA_COLORKEY);
+            // Transparency key is an implementation detail, deliberately different from text.
+            let key = color ^ 0x00ffffff;
+            SetWindowLongPtrW(self.panel.0, GWLP_USERDATA, key as isize);
+            SetLayeredWindowAttributes(self.panel.0, key, 255, LWA_COLORKEY);
             InvalidateRect(self.panel.0, null(), 0);
         }
         self.text = Some(text);

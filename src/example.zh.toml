@@ -28,10 +28,10 @@ restart_on_change = false
 show = "monitor"
 duration_ms = 4000
 theme = "system"
-background = "#F2F2F2"
-foreground = "#000000"
-dark_background = "#303030"
-dark_foreground = "#F2F2F2"
+background = "#FFFFFF"
+foreground = "#242424"
+dark_background = "#292929"
+dark_foreground = "#FFFFFF"
 font = "Microsoft YaHei UI"
 font_size = 16
 
@@ -41,12 +41,12 @@ fps = 60.0 # 移动时的目标刷新率，范围 1 到 1000，可填 59.94 等�
 # 十字线两轴可分别设置随 DPI 缩放的宽度、缺口半径、RGB 颜色和透明度（0 到 255）。
 [horizontal]
 width = 2
-color = "#CCCC00"
+color = "#0F6CBD"
 opacity = 160
 gap = 12
 [vertical]
 width = 2
-color = "#CCCC00"
+color = "#0F6CBD"
 opacity = 160
 gap = 12
 

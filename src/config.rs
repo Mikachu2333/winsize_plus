@@ -384,7 +384,7 @@ impl Config {
                 .ok()
                 .filter(|_| hex.len() == 6)
                 .ok_or_else(|| format!("{section}.{key}"))?;
-            Ok::<_, String>((rgb >> 16) | (rgb & 0xff00) | ((rgb & 255) << 16))
+            Ok::<_, String>(crate::colors::colorref(rgb))
         };
         let line = |section: &str| {
             Ok::<_, String>(Line {
