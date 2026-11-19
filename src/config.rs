@@ -161,6 +161,42 @@ pub const ACTIONS: &[&str] = &[
     "settings",
     "borders",
 ];
+pub const ALIASES: &[(&str, &str)] = &[
+    ("ver", "version"),
+    ("h", "help"),
+    ("exit", "quit"),
+    ("reboot", "restart"),
+    ("pin", "top"),
+    ("exclude", "ignore"),
+    ("screen", "monitor"),
+];
+
+pub fn command_name(text: &str) -> String {
+    let text: String = text
+        .chars()
+        .map(|ch| match ch {
+            'Ａ'..='Ｚ' | 'ａ'..='ｚ' | '０'..='９' => {
+                char::from_u32(ch as u32 - 0xfee0).unwrap_or(ch)
+            }
+            '，' | '－' | '—' => '-',
+            '＿' => '_',
+            '　' => ' ',
+            _ => ch,
+        })
+        .collect();
+    text.trim().to_lowercase()
+}
+
+pub fn standard_name(name: &str) -> String {
+    if let Some((_, action)) = ALIASES.iter().find(|(alias, _)| *alias == name) {
+        return standard_name(action);
+    }
+    let mut chars = name.chars();
+    chars
+        .next()
+        .map(|first| first.to_uppercase().chain(chars).collect())
+        .unwrap_or_default()
+}
 fn is_builtin_action(name: &str) -> bool {
     ACTIONS.contains(&name)
 }
@@ -193,6 +229,92 @@ impl Config {
             .get(&name.to_ascii_lowercase())
             .map(String::as_str)
             .unwrap_or(name)
+    }
+    pub fn action(&self, text: &str) -> String {
+        let name = command_name(text);
+        self.commands.get(&name).cloned().unwrap_or_else(|| {
+            ALIASES
+                .iter()
+                .find(|(alias, _)| *alias == name)
+                .map(|(_, action)| (*action).to_owned())
+                .unwrap_or(name)
+        })
+    }
+    pub fn help_text(&self) -> String {
+        let button = |button| match button {
+            Some(1) => self.tr("left button", "左键"),
+            Some(2) => self.tr("right button", "右键"),
+            Some(4) => self.tr("middle button", "中键"),
+            Some(5) => self.tr("side button 1", "侧键 1"),
+            Some(6) => self.tr("side button 2", "侧键 2"),
+            _ => "",
+        };
+        let mut lines = vec![
+            self.tr(
+                "WinSizeP — Esc closes this help",
+                "WinSizeP 帮助：按 Esc 关闭",
+            )
+            .to_owned(),
+        ];
+        for (button_id, en, zh) in [
+            (self.move_button, "move window", "移动窗口"),
+            (
+                self.resize_button,
+                "resize from bottom right",
+                "调整窗口大小（固定左上角）",
+            ),
+        ] {
+            if button_id.is_some() {
+                lines.push(format!(
+                    "Alt + {} {} = {}",
+                    button(button_id),
+                    self.tr("drag", "拖动"),
+                    self.tr(en, zh)
+                ));
+            }
+        }
+        lines.push(
+            self.tr(
+                "Alt + right click = place by the 3×3 grid",
+                "Alt + 右键点击屏幕位置 = 九宫格位置调整",
+            )
+            .into(),
+        );
+        lines.push(
+            self.tr(
+                "Hold Alt + a key, or double-tap Alt then press a key:",
+                "按住 Alt + 按键，或双击 Alt 后按键：",
+            )
+            .into(),
+        );
+        let mut bindings: Vec<_> = self.keys.iter().collect();
+        bindings.sort_by_key(|(key, _)| **key);
+        for (key, action) in bindings {
+            let key = match *key {
+                0xc0 => "`".into(),
+                0xbd => "-".into(),
+                0xbb => "=".into(),
+                0xdc => "\\".into(),
+                0x70..=0x87 => format!("F{}", key - 0x6f),
+                _ => char::from_u32(*key)
+                    .map(|c| c.to_string())
+                    .unwrap_or_default(),
+            };
+            let title = match action.as_str() {
+                "top" => self.tr("toggle topmost", "置顶 / 取消置顶"),
+                "ignore" => self.tr("exclude window", "忽略窗口"),
+                "guide" | "cross" => self.tr("toggle crosshair", "显示 / 隐藏十字线"),
+                "horizontal" => self.tr("horizontal crosshair", "水平十字线"),
+                "vertical" => self.tr("vertical crosshair", "垂直十字线"),
+                "borders" => self.tr("toggle region outlines", "显示 / 隐藏框线"),
+                "command" => self.tr("run command", "运行指令"),
+                "help" => self.tr("help", "帮助"),
+                _ => self.display_name(action),
+            };
+            lines.push(format!("Alt + {key} = {title}"));
+        }
+        lines.push(self.tr("Aliases: Version = Ver; Help = H; Quit = Exit; Restart = Reboot; Top = Pin; Ignore = Exclude; Monitor = Screen", "内置别名：Version = Ver；Help = H；Quit = Exit；Restart = Reboot；Top = Pin；Ignore = Exclude；Monitor = Screen").into());
+        lines.join("\n")
     }
     pub fn parse(doc: &DocumentMut) -> Result<Self, String> {
         let field = |section: &str, key: &str| {
