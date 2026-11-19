@@ -1,5 +1,4 @@
-use crate::{config::encode, desktop::err};
-use std::{fs::OpenOptions, io::Write, path::Path};
+use crate::desktop::err;
 use windows::{
     Win32::System::{Com::*, TaskScheduler::*, Variant::VARIANT},
     core::BSTR,
@@ -109,16 +108,6 @@ pub fn sync(enabled: bool, elevated: bool) -> Result<(), String> {
         }
         Err(error) => Err(format!("Autostart / 自动启动: {error}")),
     }
-}
-
-pub fn export(path: &Path) -> Result<(), String> {
-    let task = definition(&account()?, false)?;
-    OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .and_then(|mut file| file.write_all(&encode(&task)))
-        .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]

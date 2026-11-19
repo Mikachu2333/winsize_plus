@@ -97,13 +97,21 @@ impl App {
         if automatic && bytes.is_some() && bytes == self.snapshot {
             return Ok(());
         }
-        let cfg = config::load(&self.path, None)?;
+        let mut cfg = config::load(&self.path, None)?;
         self.snapshot = fs::read(&self.path).ok();
         let sync_task =
             !automatic || (cfg.autostart, cfg.elevate) != (self.cfg.autostart, self.cfg.elevate);
-        let restart = automatic && cfg.elevate != self.cfg.elevate;
+        let mut restart = automatic && cfg.elevate != self.cfg.elevate;
+        let mut startup_error = None;
         if sync_task {
-            crate::logon::sync(cfg.autostart, cfg.elevate)?;
+            if let Err(error) = crate::logon::sync(cfg.autostart, cfg.elevate) {
+                // Keep independent settings working when consent is canceled; retry startup on
+                // the next explicit reload/edit instead of repeatedly prompting for UAC.
+                cfg.autostart = self.cfg.autostart;
+                cfg.elevate = self.cfg.elevate;
+                restart = false;
+                startup_error = Some(error);
+            }
         }
         input::configure(&cfg)?;
         self.frames.reset(cfg.fps);
@@ -117,7 +125,7 @@ impl App {
             self.exit = Some(crate::ResidentExit::Restart(Some(self.cfg.elevate)));
             return Ok(());
         }
-        self.config_notice()
+        if let Some(error) = startup_error { self.notice(&error) } else { self.config_notice() }
     }
     fn config_notice(&mut self) -> Result<(), String> {
         if self.cfg.warnings.is_empty() {

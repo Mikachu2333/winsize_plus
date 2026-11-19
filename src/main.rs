@@ -288,22 +288,24 @@ fn execute(args: &[String]) -> Result<(), String> {
             return logon::sync_direct(*enabled == "1", *elevated == "1", owner)
                 .map_err(|error| error.to_string());
         }
-        ["--export-logon-task", file] => {
-            logon::export(std::path::Path::new(file))?;
-            println!("Import in Task Scheduler / 请在任务计划程序中导入 {file}");
-        }
         ["--check"] => {
             let cfg = config::load(&path, None)?;
+            if !cfg.warnings.is_empty() {
+                eprintln!(
+                    "{}: {}",
+                    cfg.tr("Fields restored to defaults", "已恢复默认值的字段"),
+                    cfg.warnings.join(", ")
+                );
+            }
             println!(
                 "{} {}",
                 cfg.tr("Valid configuration", "配置有效"),
                 path.display()
             )
         }
-        [] => return launch(config::load(&path, None)?.elevate),
+        [] => return launch(false),
         ["--resident"] => {
-            let cfg = config::load(&path, None)?;
-            if cfg.elevate && unsafe { IsUserAnAdmin() } == 0 {
+            if config::requested_elevation(&path)? && unsafe { IsUserAnAdmin() } == 0 {
                 return launch(true);
             }
             unsafe {

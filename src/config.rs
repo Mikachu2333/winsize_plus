@@ -201,6 +201,38 @@ fn is_builtin_action(name: &str) -> bool {
     ACTIONS.contains(&name)
 }
 
+fn canonicalize(doc: &mut DocumentMut) {
+    let names: HashMap<String, String> = doc
+        .get("presets")
+        .and_then(Item::as_table)
+        .into_iter()
+        .flat_map(|table| table.iter())
+        .map(|(key, _)| (key.to_ascii_lowercase(), key.to_owned()))
+        .collect();
+    // Preserve custom names as authored; normalize action references and built-in spelling.
+    for section in ["keys", "commands", "grid"] {
+        if let Some(table) = doc.get_mut(section).and_then(Item::as_table_mut) {
+            for (_, item) in table.iter_mut() {
+                if let Some(text) = item.as_str() {
+                    let lower = text.to_ascii_lowercase();
+                    let canonical = if is_builtin_action(&lower) {
+                        Some(standard_name(&lower))
+                    } else {
+                        names.get(&lower).cloned()
+                    };
+                    if let Some(canonical) = canonical
+                        && canonical != text
+                    {
+                        let decor = item.as_value().unwrap().decor().clone();
+                        *item = value(canonical);
+                        *item.as_value_mut().unwrap().decor_mut() = decor;
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl Config {
     pub fn cell(&self, monitor: u32, cell: u32) -> Option<&str> {
         [monitor * 10 + cell, cell]
@@ -557,6 +589,7 @@ impl Config {
     }
 }
 
+#[cfg(test)]
 pub fn encode(text: &str) -> Vec<u8> {
     std::iter::once(0xfeffu16)
         .chain(text.encode_utf16())
@@ -675,16 +708,72 @@ fn repair_punctuation(text: &str) -> String {
 
 fn document(text: &str) -> Result<(DocumentMut, bool), String> {
     let spaces = text.replace('\t', "    ");
-    match spaces.parse::<DocumentMut>() {
-        Ok(doc) => Ok((doc, spaces != text)),
+    let source = match spaces.parse::<DocumentMut>() {
+        Ok(_) => spaces,
         Err(original) => {
             let repaired = repair_punctuation(&spaces);
             repaired
                 .parse::<DocumentMut>()
-                .map(|doc| (doc, true))
-                .map_err(|_| original.to_string())
+                .map_err(|_| original.to_string())?;
+            repaired
         }
+    };
+    let clean = english_comments(&source);
+    let doc = clean
+        .parse::<DocumentMut>()
+        .map_err(|err| err.to_string())?;
+    Ok((doc, clean != text))
+}
+
+fn english_comments(text: &str) -> String {
+    let chars: Vec<_> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut index = 0;
+    let mut quote = None;
+    let mut triple = false;
+    let mut escaped = false;
+    while index < chars.len() {
+        let ch = chars[index];
+        if let Some(end) = quote {
+            out.push(ch);
+            if ch == end
+                && !escaped
+                && (!triple || chars.get(index..index + 3) == Some(&[end, end, end]))
+            {
+                if triple {
+                    out.push(end);
+                    out.push(end);
+                    index += 2;
+                }
+                quote = None;
+            }
+            escaped = end == '"' && ch == '\\' && !escaped;
+        } else if matches!(ch, '"' | '\'') {
+            quote = Some(ch);
+            triple = chars.get(index..index + 3) == Some(&[ch, ch, ch]);
+            escaped = false;
+            out.push(ch);
+            if triple {
+                out.push(ch);
+                out.push(ch);
+                index += 2;
+            }
+        } else if ch == '#' {
+            let end = chars[index..]
+                .iter()
+                .position(|ch| *ch == '\n')
+                .map_or(chars.len(), |n| index + n);
+            if chars[index..end].iter().all(char::is_ascii) {
+                out.extend(&chars[index..end]);
+            }
+            index = end;
+            continue;
+        } else {
+            out.push(ch);
+        }
+        index += 1;
     }
+    out
 }
 
 fn migrate(doc: &mut DocumentMut) {
@@ -728,6 +817,7 @@ fn recover(doc: &mut DocumentMut) -> Result<Config, String> {
         }
     }
     merge(doc.as_table_mut(), defaults.as_table(), false);
+    canonicalize(doc);
     if let Some(rate) = doc
         .get("crosshair")
         .and_then(|s| s.get("fps"))
@@ -745,7 +835,23 @@ fn recover(doc: &mut DocumentMut) -> Result<Config, String> {
                 return Ok(cfg);
             }
             Err(error) => {
-                let field = error.split([':', ' ', '(']).next().unwrap_or_default();
+                let matched = doc
+                    .as_table()
+                    .iter()
+                    .flat_map(|(section, item)| {
+                        item.as_table().into_iter().flat_map(move |table| {
+                            table.iter().map(move |(key, _)| format!("{section}.{key}"))
+                        })
+                    })
+                    .filter(|field| {
+                        error.strip_prefix(field).is_some_and(|rest| {
+                            rest.is_empty() || rest.starts_with([':', ' ', '('])
+                        })
+                    })
+                    .max_by_key(String::len);
+                let field = matched
+                    .as_deref()
+                    .unwrap_or_else(|| error.split([':', ' ', '(']).next().unwrap_or_default());
                 if field.starts_with("exclusions") || field == "[[exclusions]]" || field == "empty"
                 {
                     doc.remove("exclusions");
@@ -755,6 +861,13 @@ fn recover(doc: &mut DocumentMut) -> Result<Config, String> {
                 let Some((section, key)) = field.split_once('.') else {
                     return Err(error);
                 };
+                if error.contains("duplicate")
+                    && let Some(table) = doc.get_mut(section).and_then(Item::as_table_mut)
+                {
+                    table.remove(key);
+                    warnings.push(field.to_owned());
+                    continue;
+                }
                 let replacement = defaults.get(section).and_then(|s| s.get(key)).cloned();
                 if let Some(default) = replacement {
                     if doc
@@ -870,6 +983,16 @@ pub fn read_settings(path: &Path) -> Result<String, String> {
     let _lock = lock()?;
     decode(&fs::read(path).map_err(|err| err.to_string())?)
 }
+pub fn requested_elevation(path: &Path) -> Result<bool, String> {
+    let text = match fs::read(path) {
+        Ok(bytes) => decode(&bytes)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => help().to_owned(),
+        Err(error) => return Err(error.to_string()),
+    };
+    let (mut doc, _) = document(&text)?;
+    migrate(&mut doc);
+    Ok(recover(&mut doc)?.elevate)
+}
 
 pub fn save_settings(path: &Path, original: &str, doc: &DocumentMut) -> Result<String, String> {
     Config::parse(doc)?;
@@ -960,7 +1083,8 @@ mod tests {
         assert!(repaired);
         assert_eq!(doc["tip"]["font"].as_str(), Some("微软雅黑"));
         assert_eq!(doc["tip"]["window_format"].as_str(), Some("中文，。‘’【】"));
-        assert!(doc.to_string().contains("# 注释：，"));
+        assert!(!doc.to_string().contains("# 注释：，"));
+        assert!(repair_punctuation(text).contains("# 注释：，"));
         let valid = "[tip]\nfont = '“微软雅黑”'\n";
         assert!(!document(valid).unwrap().1);
     }
@@ -1009,5 +1133,26 @@ mod tests {
         assert!(!cfg.presets.contains_key("escape"));
         assert!(!cfg.keys.contains_key(&27));
         assert_eq!(vk("vk:1B"), None);
+    }
+    #[test]
+    fn recovery_handles_names_with_spaces_and_normalizes_action_spelling() {
+        let mut doc = help().parse::<DocumentMut>().unwrap();
+        doc["presets"]["My Region"] = value("broken");
+        doc["keys"]["P"] = value("tOP");
+        let cfg = recover(&mut doc).unwrap();
+        assert!(!cfg.presets.contains_key("my region"));
+        assert_eq!(doc["keys"]["P"].as_str(), Some("Top"));
+        assert_eq!(cfg.warnings, ["presets.My Region"]);
+    }
+    #[test]
+    fn comment_migration_preserves_hashes_and_multiline_strings() {
+        let source = "# 旧注释\n[tip]\nwindow_format = '''中文 # 注释不是注释\n下一行''' # 删除\nfont = \"SystemFont\" # English\n";
+        let (doc, _) = document(source).unwrap();
+        assert_eq!(
+            doc["tip"]["window_format"].as_str(),
+            Some("中文 # 注释不是注释\n下一行")
+        );
+        assert!(doc.to_string().contains("# English"));
+        assert!(!doc.to_string().contains("# 旧注释"));
     }
 }
