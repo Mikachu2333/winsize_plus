@@ -50,14 +50,15 @@ impl Drop for Apartment {
     }
 }
 
-pub fn sync(enabled: bool, elevated: bool) -> Result<(), String> {
-    let owner = account()?;
+pub fn sync_direct(enabled: bool, elevated: bool, owner: &str) -> Result<(), windows::core::Error> {
     let name = BSTR::from(format!(
         "WinSizeP-{}",
         owner.replace('!', "!!").replace('\\', "!")
     ));
     let task = if enabled {
-        Some(definition(&owner, elevated)?)
+        Some(definition(owner, elevated).map_err(|message| {
+            windows::core::Error::new(windows::core::HRESULT(0x80004005u32 as i32), message)
+        })?)
     } else {
         None
     };
@@ -88,7 +89,26 @@ pub fn sync(enabled: bool, elevated: bool) -> Result<(), String> {
             Ok(())
         }
     };
-    update().map_err(|error| format!("WinSizeP autostart: {error}"))
+    update()
+}
+
+pub fn sync(enabled: bool, elevated: bool) -> Result<(), String> {
+    let owner = account()?;
+    match sync_direct(enabled, elevated, &owner) {
+        Ok(()) => Ok(()),
+        Err(error)
+            if error.code() == windows::core::HRESULT::from_win32(5)
+                && unsafe { windows_sys::Win32::UI::Shell::IsUserAnAdmin() } == 0 =>
+        {
+            crate::elevated_helper(&format!(
+                "--sync-logon-task {} {} {}",
+                u8::from(enabled),
+                u8::from(elevated),
+                crate::quote_argument(&owner)
+            ))
+        }
+        Err(error) => Err(format!("Autostart / 自动启动: {error}")),
+    }
 }
 
 pub fn export(path: &Path) -> Result<(), String> {
@@ -99,4 +119,17 @@ pub fn export(path: &Path) -> Result<(), String> {
         .open(path)
         .and_then(|mut file| file.write_all(&encode(&task)))
         .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn task_definition_changes_run_level_and_preserves_owner() {
+        for (elevated, level) in [(false, "LeastPrivilege"), (true, "HighestAvailable")] {
+            let xml = super::definition("DOMAIN\\User & Name", elevated).unwrap();
+            assert!(xml.contains(&format!("<RunLevel>{level}</RunLevel>")));
+            assert!(xml.contains("DOMAIN\\User &amp; Name"));
+            assert!(xml.contains("<Arguments>--resident</Arguments>"));
+        }
+    }
 }

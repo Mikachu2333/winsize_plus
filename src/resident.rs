@@ -58,7 +58,7 @@ struct App {
     wait: Option<Instant>,
     reload: Option<Instant>,
     snapshot: Option<Vec<u8>>,
-    exit: Option<bool>,
+    exit: Option<crate::ResidentExit>,
 }
 impl App {
     fn refresh_preview(&mut self) -> Result<(), String> {
@@ -109,7 +109,10 @@ impl App {
         self.snapshot = fs::read(&self.path).ok();
         let sync_task =
             !automatic || (cfg.autostart, cfg.elevate) != (self.cfg.autostart, self.cfg.elevate);
-        let restart = automatic && (cfg.restart || cfg.elevate != self.cfg.elevate);
+        let restart = automatic && cfg.elevate != self.cfg.elevate;
+        if sync_task {
+            crate::logon::sync(cfg.autostart, cfg.elevate)?;
+        }
         input::configure(&cfg)?;
         self.frames.reset(cfg.fps);
         self.overlay.guides(self.overlay.mode(), &cfg)?;
@@ -119,11 +122,8 @@ impl App {
         self.held_window = None;
         self.refresh_preview()?;
         if restart {
-            self.exit = Some(true);
+            self.exit = Some(crate::ResidentExit::Restart(Some(self.cfg.elevate)));
             return Ok(());
-        }
-        if sync_task {
-            crate::logon::sync(self.cfg.autostart, self.cfg.elevate)?;
         }
         self.config_notice()
     }
@@ -174,7 +174,11 @@ impl App {
             }
             "reload" => self.load(false),
             "restart" | "quit" => {
-                self.exit = Some(action == "restart");
+                self.exit = Some(if action == "restart" {
+                    crate::ResidentExit::Restart(None)
+                } else {
+                    crate::ResidentExit::Quit
+                });
                 Ok(())
             }
             "guide" | "cross" | "horizontal" | "vertical" => {
@@ -334,7 +338,7 @@ impl App {
                 Ok(())
             }
             WM_QUIT => {
-                self.exit = Some(false);
+                self.exit = Some(crate::ResidentExit::Quit);
                 Ok(())
             }
             _ => {
@@ -392,7 +396,7 @@ pub fn running() -> bool {
         let handle = OpenMutexW(
             SYNCHRONIZATION_SYNCHRONIZE,
             0,
-            w!("Local\\WinSizeP.Resident.v1"),
+            w!("Local\\D5C9A59069D907909B153C76CEBDC023"),
         );
         if handle.is_null() {
             return GetLastError() == ERROR_ACCESS_DENIED;
@@ -401,16 +405,19 @@ pub fn running() -> bool {
         true
     }
 }
-pub fn run(path: &Path) -> Result<bool, String> {
+pub fn run(path: &Path) -> Result<crate::ResidentExit, String> {
     unsafe {
-        let handle = CreateMutexW(null(), 0, w!("Local\\WinSizeP.Resident.v1"));
+        let handle = CreateMutexW(null(), 0, w!("Local\\D5C9A59069D907909B153C76CEBDC023"));
         if handle.is_null() {
+            if GetLastError() == ERROR_ACCESS_DENIED && running() {
+                return Ok(crate::ResidentExit::Quit);
+            }
             return Err(err());
         }
         let status = GetLastError();
         let _instance = Instance(handle);
         if status == ERROR_ALREADY_EXISTS {
-            return Ok(false);
+            return Ok(crate::ResidentExit::Quit);
         }
         let watch = FindFirstChangeNotificationW(
             wide(path.parent().ok_or("Config directory")?).as_ptr(),
@@ -453,7 +460,7 @@ pub fn run(path: &Path) -> Result<bool, String> {
             if let Err(problem) = app.deadlines() {
                 let _ = app.notice(&problem);
             }
-            if let Some(restart) = app.exit {
+            if let Some(restart) = app.exit.take() {
                 return Ok(restart);
             }
             match MsgWaitForMultipleObjectsEx(
