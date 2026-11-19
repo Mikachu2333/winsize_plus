@@ -252,6 +252,10 @@ impl Overlay {
         self.tip.hide();
         self.shadow.hide()
     }
+    #[cfg(test)]
+    pub fn tip_visible(&self) -> bool {
+        self.tip.1.get().is_some()
+    }
     pub fn tip(&mut self, text: &str, cfg: &Config) -> Result<(), String> {
         let screen = desktop::screen(desktop::cursor()?, 0)?;
         let dpi = screen.dpi;

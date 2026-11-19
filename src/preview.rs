@@ -164,10 +164,15 @@ pub struct Preview {
     grid: bool,
     focused: bool,
     hover: Option<(u32, Instant)>,
+    pointer: Option<(i32, i32)>,
 }
 impl Preview {
     pub fn visible(&self) -> bool {
         self.display.is_some()
+    }
+    #[cfg(test)]
+    pub fn focused(&self) -> bool {
+        self.focused
     }
     pub fn new() -> Result<Self, String> {
         Ok(Self {
@@ -183,6 +188,7 @@ impl Preview {
             grid: false,
             focused: false,
             hover: None,
+            pointer: None,
         })
     }
     pub fn start(&mut self, hwnd: HWND, cfg: &Config) -> Result<(), String> {
@@ -221,6 +227,7 @@ impl Preview {
         self.selected = None;
         self.hover = None;
         self.focused = false;
+        self.pointer = None;
     }
     fn color(cfg: &Config) -> u32 {
         if overlay::dark() {
@@ -331,11 +338,19 @@ impl Preview {
     }
     pub fn tick(&mut self, cfg: &Config) -> Result<(), String> {
         if self.visible() {
-            self.follow(desktop::cursor()?, cfg)?;
+            let point = desktop::cursor()?;
+            // Mouse hooks can miss moves while a native UI operation is running. Polling
+            // only changed coordinates avoids starting a fresh dwell at the old deadline.
+            if self.pointer != Some((point.x, point.y))
+                || self.deadline().is_some_and(|when| Instant::now() >= when)
+            {
+                self.follow(point, cfg)?;
+            }
         }
         Ok(())
     }
     pub fn follow(&mut self, point: POINT, cfg: &Config) -> Result<(), String> {
+        self.pointer = Some((point.x, point.y));
         let monitor = unsafe { MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST) };
         if self.display.as_ref().is_none_or(|(old, _)| *old != monitor) {
             self.rebuild(monitor, point, cfg)?;

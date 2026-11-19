@@ -15,7 +15,7 @@ resize_button = "right"
 
 [tip]
 show = "window"
-duration_ms = 3000 # Also the delay before showing region outlines.
+duration_ms = 3000 # Shared display duration for the tip and Alt region preview.
 window_format = "{title}" # {hwnd}, {title}, {pid}, {process}, {display_name}, {class}
 time_format = "hh:mm" # YYYY, MM, DD, hh, mm, ss
 theme = "system"

@@ -1752,9 +1752,7 @@ impl Editor {
         if self.pending.is_some_and(|when| now >= when) {
             self.save()?;
         }
-        if self.preview.deadline().is_some_and(|when| now >= when) {
-            self.preview.tick(&self.cfg)?;
-        }
+        self.preview.tick(&self.cfg)?;
         if self.dirty.is_empty() && now.duration_since(self.disk_check) >= Duration::from_secs(1) {
             self.disk_check = now;
             let disk = config::read_settings(&self.path)?;
@@ -2869,6 +2867,35 @@ mod tests {
                     send(hwnd, ACTIVATE_PREVIEW, 0, 0);
                     if overlay_count() == 0 {
                         return Err(format!("Preview did not resume on tab {tab}"));
+                    }
+                    if tab == 6 {
+                        let original = desktop::cursor()?;
+                        let screen = desktop::screen(original, 0)?.full;
+                        for cell in [1, 9, 1] {
+                            let point = POINT {
+                                x: screen.x + screen.width * if cell == 1 { 1 } else { 5 } / 6,
+                                y: screen.y + screen.height * if cell == 1 { 1 } else { 5 } / 6,
+                            };
+                            let started = Instant::now();
+                            unsafe {
+                                SetCursorPos(point.x, point.y);
+                            }
+                            std::thread::sleep(Duration::from_millis(100));
+                            while overlay_count() != 2 && started.elapsed() < Duration::from_secs(5)
+                            {
+                                std::thread::sleep(Duration::from_millis(10));
+                            }
+                            let elapsed = started.elapsed();
+                            println!("grid cell={cell} dwell_ms={}", elapsed.as_millis());
+                            if elapsed < Duration::from_millis(1900)
+                                || elapsed > Duration::from_millis(2300)
+                            {
+                                return Err(format!("Grid dwell took {elapsed:?} for cell {cell}"));
+                            }
+                        }
+                        unsafe {
+                            SetCursorPos(original.x, original.y);
+                        }
                     }
                 }
                 // Change FPS through the native edit notification, then confirm persisted clamping.

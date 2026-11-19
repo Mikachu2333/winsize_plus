@@ -137,8 +137,8 @@ fn describe(section: &str, key: &str) -> (&'static str, &'static str, &'static s
         ("general", "preview") => (
             "Show region outlines after Alt",
             "Alt 触发后显示分区框线",
-            "The delay follows the tip duration.",
-            "显示延迟跟随提示框停留时间。",
+            "Show immediately with the tip and hide together. Releasing held Alt closes both.",
+            "与提示框立即同步显示、隐藏；长按时松开 Alt 即关闭。",
         ),
         ("shortcuts", "alt") => (
             "Alt key for shortcuts",
@@ -185,8 +185,8 @@ fn describe(section: &str, key: &str) -> (&'static str, &'static str, &'static s
         ("tip", "duration_ms") => (
             "Display time (milliseconds)",
             "停留时间（毫秒）",
-            "Also controls the delay before region outlines appear. Help stays until Esc.",
-            "同时决定分区框线的显示延迟。帮助保持显示，直到按 Esc。",
+            "Also controls how long Alt region previews stay visible. Help stays until Esc.",
+            "同时决定 Alt 分区预览的停留时间。帮助保持显示，直到按 Esc。",
         ),
         ("tip", "window_format") => (
             "Window information format",

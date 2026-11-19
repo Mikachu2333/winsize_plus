@@ -46,7 +46,6 @@ struct App {
     tray: crate::tray::Tray,
     frames: FrameClock,
     preview: Preview,
-    hold: Option<(Instant, HWND)>,
     held_window: Option<HWND>,
     preview_latched: bool,
     preview_until: Option<Instant>,
@@ -55,7 +54,6 @@ struct App {
     drag: Option<desktop::Drag>,
     command: String,
     hide: Option<Instant>,
-    wait: Option<Instant>,
     reload: Option<Instant>,
     snapshot: Option<Vec<u8>>,
     exit: Option<crate::ResidentExit>,
@@ -73,14 +71,25 @@ impl App {
         Ok(())
     }
     fn close_preview(&mut self) -> Result<(), String> {
-        self.hold = None;
-        self.wait = None;
         self.held_window = None;
         self.preview_until = None;
         self.preview_check = None;
         self.preview_latched = false;
         self.preview.hide();
         input::track_preview(false)
+    }
+    fn begin_alt_preview(&mut self, window: HWND, latched: bool) -> Result<(), String> {
+        self.close_preview()?;
+        self.clear();
+        self.window = window;
+        self.held_window = Some(window);
+        self.preview_latched = latched;
+        self.refresh_preview()?;
+        self.status(&self.cfg.show.clone())?;
+        // The default tip and outlines share one deadline, including a hidden default tip.
+        self.preview_until = Some(self.hide.unwrap_or_else(|| later(self.cfg.duration)));
+        self.preview_check = Some(later(100));
+        Ok(())
     }
     fn notice(&mut self, text: &str) -> Result<(), String> {
         self.hide = Some(later(self.cfg.duration));
@@ -294,30 +303,14 @@ impl App {
                 }
                 Ok(())
             }
-            input::ARMED => {
-                self.close_preview()?;
-                self.window = msg.wParam as HWND;
-                self.wait = Some(later(self.cfg.duration));
-                self.hold = None;
-                self.held_window = None;
-                self.preview_latched = true;
-                self.refresh_preview()?;
-                self.status(&self.cfg.show.clone())
-            }
-            input::ALT_HOLD => {
-                self.close_preview()?;
-                self.window = msg.wParam as HWND;
-                self.hold = Some((later(self.cfg.duration), self.window));
-                self.wait = None;
-                self.held_window = None;
-                self.preview_latched = false;
-                self.refresh_preview()?;
-                self.status(&self.cfg.show.clone())
-            }
+            input::ARMED => self.begin_alt_preview(msg.wParam as HWND, true),
+            input::ALT_HOLD => self.begin_alt_preview(msg.wParam as HWND, false),
             input::ALT_RELEASE => {
-                self.hold = None;
-                if !self.preview_latched {
+                if !self.preview_latched
+                    && (self.preview_until.is_some() || self.preview_check.is_some())
+                {
                     self.close_preview()?;
+                    self.clear();
                 }
                 Ok(())
             }
@@ -344,6 +337,7 @@ impl App {
             }
             input::CLICK => {
                 self.close_preview()?;
+                self.clear();
                 let point = input::click_point(msg.lParam);
                 let screen = desktop::screen(point, 0)?;
                 let cell = screen.full.grid(point.x, point.y) as u32 + 1;
@@ -363,8 +357,8 @@ impl App {
             }
             input::GRID_SHOW => {
                 self.close_preview()?;
+                self.clear();
                 self.window = msg.wParam as HWND;
-                self.hold = None;
                 self.preview.grid(self.window, &self.cfg)?;
                 self.preview_check = Some(later(100));
                 input::track_preview(true)
@@ -376,13 +370,7 @@ impl App {
                     msg.lParam != 0,
                     &self.cfg,
                 )?);
-                self.hold = None;
-                self.held_window = None;
-                self.wait = None;
-                self.preview.hide();
-                self.preview_until = None;
-                self.preview_check = None;
-                input::track_preview(false)?;
+                self.close_preview()?;
                 self.clear();
                 self.frames.reset(self.cfg.fps);
                 self.follow_frame(desktop::cursor()?)
@@ -397,9 +385,7 @@ impl App {
                 input::cancel();
                 self.drag = None;
                 self.clear();
-                self.wait = None;
-                self.hold = None;
-                if self.preview.reset(&self.cfg)? {
+                if self.preview_until.is_none() && self.preview.reset(&self.cfg)? {
                     self.preview_until = Some(later(self.cfg.duration));
                     return Ok(());
                 }
@@ -427,24 +413,10 @@ impl App {
     }
     fn deadlines(&mut self) -> Result<(), String> {
         let now = Instant::now();
-        if let Some((when, hwnd)) = self.hold
-            && now >= when
-        {
-            self.hold = None;
-            self.held_window = Some(hwnd);
-            self.refresh_preview()?;
-            self.preview_check = Some(later(100));
-        }
-        if self.wait.is_some_and(|when| now >= when) {
-            self.wait = None;
-            self.held_window = Some(self.window);
-            self.refresh_preview()?;
-            self.preview_until = Some(later(self.cfg.duration));
-            self.preview_check = Some(later(100));
-        }
         if self.preview_until.is_some_and(|when| now >= when) {
             input::cancel();
             self.close_preview()?;
+            self.clear();
         }
         if self.preview_check.is_some_and(|when| now >= when) {
             if unsafe { IsWindow(self.window) } == 0
@@ -453,7 +425,9 @@ impl App {
             {
                 input::cancel();
                 self.close_preview()?;
+                self.clear();
             } else {
+                self.preview.tick(&self.cfg)?;
                 self.preview_check = Some(later(100));
             }
         }
@@ -471,10 +445,8 @@ impl App {
     }
     fn timeout(&self) -> u32 {
         [
-            self.wait,
             self.hide,
             self.reload,
-            self.hold.map(|(when, _)| when),
             self.preview.deadline(),
             self.preview_until,
             self.preview_check,
@@ -536,7 +508,6 @@ pub fn run(path: &Path) -> Result<crate::ResidentExit, String> {
             overlay,
             tray: crate::tray::Tray::new()?,
             preview: Preview::new()?,
-            hold: None,
             held_window: None,
             preview_latched: false,
             preview_until: None,
@@ -545,7 +516,6 @@ pub fn run(path: &Path) -> Result<crate::ResidentExit, String> {
             drag: None,
             command: String::new(),
             hide: None,
-            wait: None,
             reload: None,
             snapshot,
             exit: None,
@@ -643,7 +613,6 @@ mod tests {
             overlay,
             tray: crate::tray::Tray::new().unwrap(),
             preview: Preview::new().unwrap(),
-            hold: None,
             held_window: None,
             preview_latched: false,
             preview_until: None,
@@ -652,7 +621,6 @@ mod tests {
             drag: None,
             command: String::new(),
             hide: None,
-            wait: None,
             reload: None,
             snapshot: None,
             exit: None,
@@ -857,7 +825,8 @@ mod tests {
             .spawn()
             .unwrap();
         let mut doc = config::help().parse::<toml_edit::DocumentMut>().unwrap();
-        doc["tip"]["duration_ms"] = toml_edit::value(300);
+        doc["tip"]["duration_ms"] = toml_edit::value(900);
+        doc["shortcuts"]["resize_enabled"] = toml_edit::value(false);
         let cfg = Config::parse(&doc).unwrap();
         let overlay = Overlay::new().unwrap();
         let _hooks = input::Hooks::start(&cfg).unwrap();
@@ -868,7 +837,6 @@ mod tests {
             overlay,
             tray: crate::tray::Tray::new().unwrap(),
             preview: Preview::new().unwrap(),
-            hold: None,
             held_window: None,
             preview_latched: false,
             preview_until: None,
@@ -877,7 +845,6 @@ mod tests {
             drag: None,
             command: String::new(),
             hide: None,
-            wait: None,
             reload: None,
             snapshot: None,
             exit: None,
@@ -885,6 +852,10 @@ mod tests {
         let state = Arc::new(AtomicBool::new(false));
         let done = Arc::new(AtomicBool::new(false));
         let observed = state.clone();
+        let tips = Arc::new(AtomicBool::new(false));
+        let observed_tips = tips.clone();
+        let focused = Arc::new(AtomicBool::new(false));
+        let observed_focus = focused.clone();
         let finished = done.clone();
         let controller = std::thread::spawn(move || {
             let result = (|| {
@@ -961,11 +932,33 @@ mod tests {
                         ));
                     }
                 }
+                let started = Instant::now();
                 key(VK_LMENU, true);
                 visible(&observed, true)?;
+                println!(
+                    "held Alt first_preview_ms={}",
+                    started.elapsed().as_millis()
+                );
+                assert!(
+                    started.elapsed() < Duration::from_millis(450),
+                    "Alt preview was delayed"
+                );
                 key(VK_LMENU, false);
                 visible(&observed, false)?;
+                visible(&observed_tips, false)?;
                 println!("held Alt preview appeared and released cleanly");
+                std::thread::sleep(Duration::from_millis(650));
+                let started = Instant::now();
+                key(VK_LMENU, true);
+                visible(&observed, true)?;
+                visible(&observed, false)?;
+                visible(&observed_tips, false)?;
+                assert!(
+                    started.elapsed() < Duration::from_millis(1200),
+                    "Held preview outlived the tip"
+                );
+                key(VK_LMENU, false);
+                println!("held Alt preview and tip expired together");
                 std::thread::sleep(Duration::from_millis(650));
                 key(VK_LMENU, true);
                 std::thread::sleep(Duration::from_millis(30));
@@ -973,9 +966,23 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(50));
                 key(VK_LMENU, true);
                 std::thread::sleep(Duration::from_millis(30));
+                let started = Instant::now();
                 key(VK_LMENU, false);
                 visible(&observed, true)?;
+                println!(
+                    "double Alt first_preview_ms={}",
+                    started.elapsed().as_millis()
+                );
+                assert!(
+                    started.elapsed() < Duration::from_millis(450),
+                    "Double Alt preview was delayed"
+                );
                 visible(&observed, false)?;
+                visible(&observed_tips, false)?;
+                assert!(
+                    started.elapsed() < Duration::from_millis(1200),
+                    "Double Alt preview outlived the tip"
+                );
                 println!("double Alt preview appeared and expired without Escape");
                 std::thread::sleep(Duration::from_millis(650));
                 key(VK_LMENU, true);
@@ -985,13 +992,76 @@ mod tests {
                 visible(&observed, false)?;
                 key(VK_LMENU, false);
                 println!("Escape canceled held preview");
+                std::thread::sleep(Duration::from_millis(650));
+                key(VK_LMENU, true);
+                visible(&observed, true)?;
+                key(b'H' as u16, true);
+                key(b'H' as u16, false);
+                key(VK_LMENU, false);
+                visible(&observed, false)?;
+                visible(&observed_tips, true)?;
+                std::thread::sleep(Duration::from_millis(1100));
+                if !observed_tips.load(Ordering::SeqCst) {
+                    return Err("Releasing Alt or the default timer dismissed Help".into());
+                }
+                key(VK_ESCAPE, true);
+                key(VK_ESCAPE, false);
+                visible(&observed_tips, false)?;
+                println!("Help stays visible after Alt release until Escape");
+                std::thread::sleep(Duration::from_millis(650));
+                key(VK_LMENU, true);
+                visible(&observed, true)?;
+                let mouse = |flags| unsafe {
+                    let event = INPUT {
+                        r#type: INPUT_MOUSE,
+                        Anonymous: INPUT_0 {
+                            mi: MOUSEINPUT {
+                                dwFlags: flags,
+                                ..Default::default()
+                            },
+                        },
+                    };
+                    SendInput(1, &event, size_of::<INPUT>() as i32);
+                };
+                mouse(MOUSEEVENTF_RIGHTDOWN);
+                visible(&observed_tips, false)?;
+                let area = desktop::screen(desktop::cursor()?, 0)?.full;
+                for cell in [1, 9] {
+                    let started = Instant::now();
+                    // SetCursorPos deliberately exercises the polling path even when no
+                    // low-level mouse notification reaches the preview.
+                    unsafe {
+                        SetCursorPos(
+                            area.x + area.width * if cell == 1 { 1 } else { 5 } / 6,
+                            area.y + area.height * if cell == 1 { 1 } else { 5 } / 6,
+                        );
+                    }
+                    visible(&observed_focus, false)?;
+                    while !observed_focus.load(Ordering::SeqCst)
+                        && started.elapsed() < Duration::from_secs(5)
+                    {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    let elapsed = started.elapsed();
+                    println!("resident grid cell={cell} dwell_ms={}", elapsed.as_millis());
+                    if elapsed < Duration::from_millis(1900)
+                        || elapsed > Duration::from_millis(2300)
+                    {
+                        return Err(format!("Resident grid dwell took {elapsed:?}"));
+                    }
+                }
+                key(VK_ESCAPE, true);
+                key(VK_ESCAPE, false);
+                mouse(MOUSEEVENTF_RIGHTUP);
+                key(VK_LMENU, false);
+                visible(&observed, false)?;
                 Ok::<_, String>(())
             })();
             key(VK_LMENU, false);
             finished.store(true, Ordering::SeqCst);
             result
         });
-        let until = Instant::now() + Duration::from_secs(15);
+        let until = Instant::now() + Duration::from_secs(20);
         let mut failure = None;
         while !done.load(Ordering::SeqCst) && Instant::now() < until {
             if let Err(err) = app.deadlines() {
@@ -1014,6 +1084,15 @@ mod tests {
                     }
                 }
             }
+            if app.held_window.is_some()
+                && app.preview_until.is_some()
+                && app.preview.visible() != app.overlay.tip_visible()
+            {
+                failure = Some("Alt preview and tip visibility differed".into());
+                break;
+            }
+            tips.store(app.overlay.tip_visible(), Ordering::SeqCst);
+            focused.store(app.preview.focused(), Ordering::SeqCst);
             state.store(app.preview.visible(), Ordering::SeqCst);
         }
         let result = controller.join().unwrap();
