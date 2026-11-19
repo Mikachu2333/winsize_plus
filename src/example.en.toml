@@ -25,7 +25,7 @@ dark_background = "#292929"
 dark_foreground = "#FFFFFF"
 font = "SystemFont"
 font_fallbacks = [] # Up to three readable family names, in order.
-font_size = 16
+font_size = 12
 font_bold = false
 font_italic = false
 
@@ -41,7 +41,7 @@ width = 2
 color = "#616161"
 dark_color = "#FFFFFF"
 opacity = 120
-highlight_opacity = 255
+fill_opacity = 48 # Translucent selection fill.
 
 [crosshair]
 fps = 30 # Integer, clamped to 24..1000.
@@ -91,7 +91,6 @@ Grave = "Command"
 H = "Help"
 
 [commands]
-ASDF = "Center"
 Reboot = "Restart"
 Pin = "Top"
 Exclude = "Ignore"

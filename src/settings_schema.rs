@@ -265,11 +265,11 @@ fn describe(section: &str, key: &str) -> (&'static str, &'static str, &'static s
             "Radius in logical pixels.",
             "空隙半径，单位为逻辑像素。",
         ),
-        (_, "highlight_opacity") => (
-            "Highlight opacity",
-            "高亮不透明度",
-            "0 is transparent; 255 is opaque.",
-            "0 为完全透明，255 为完全不透明。",
+        (_, "fill_opacity") => (
+            "Selection fill opacity",
+            "选区填充不透明度",
+            "Translucent system accent fill; 0 is transparent and 255 is opaque.",
+            "使用半透明系统强调色填充；0 为完全透明，255 为完全不透明。",
         ),
         ("crosshair", "fps") => (
             "Maximum frames per second",
@@ -294,7 +294,7 @@ pub fn fields(tab: usize, axis: usize, cfg: &Config, doc: &DocumentMut) -> Vec<F
         2 => &["presets", "regions"],
         3 => &["outline"],
         4 => &["keys", "commands", "shortcuts"],
-        5 if axis == 0 => &["crosshair", "horizontal"],
+        5 if axis != 1 => &["crosshair", "horizontal"],
         5 => &["crosshair", "vertical"],
         _ => &["grid"],
     };

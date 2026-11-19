@@ -564,7 +564,7 @@ impl Config {
                 opacity: number("outline", "opacity", 0, 255)? as u8,
             },
             outline_dark: color("outline", "dark_color")?,
-            highlight_opacity: number("outline", "highlight_opacity", 0, 255)? as u8,
+            highlight_opacity: number("outline", "fill_opacity", 0, 255)? as u8,
             move_button: button("move")?,
             resize_button: button("resize")?,
             warnings: Vec::new(),
@@ -773,6 +773,28 @@ fn english_comments(text: &str) -> String {
 }
 
 fn migrate(doc: &mut DocumentMut) {
+    // Convert the old edge-highlight schema once, so later deliberate font/alpha edits survive.
+    if let Some(legacy) = doc
+        .get_mut("outline")
+        .and_then(Item::as_table_mut)
+        .and_then(|table| table.remove("highlight_opacity"))
+    {
+        if doc["outline"].get("fill_opacity").is_none() {
+            let alpha = legacy
+                .as_integer()
+                .filter(|n| *n >= 0 && *n < 255)
+                .unwrap_or(48);
+            doc["outline"]["fill_opacity"] = value(alpha);
+        }
+        if doc
+            .get("tip")
+            .and_then(|v| v.get("font_size"))
+            .and_then(Item::as_integer)
+            == Some(16)
+        {
+            doc["tip"]["font_size"] = value(12);
+        }
+    }
     if let Some(keys) = doc.get_mut("keys").and_then(Item::as_table_mut) {
         let old = keys
             .iter()
@@ -945,6 +967,31 @@ fn merge_edits(base: &Table, draft: &Table, disk: &mut Table) {
             }
         }
     }
+    // GUI renames keep the row's original position. Respect manual reordering if it changed.
+    let disk_existing: Vec<_> = disk
+        .iter()
+        .filter(|(key, _)| base.contains_key(key))
+        .map(|(key, _)| key.to_owned())
+        .collect();
+    let base_existing: Vec<_> = base
+        .iter()
+        .filter(|(key, _)| disk.contains_key(key))
+        .map(|(key, _)| key.to_owned())
+        .collect();
+    if disk_existing == base_existing {
+        let ranks: HashMap<_, _> = draft
+            .iter()
+            .enumerate()
+            .map(|(index, (key, _))| (key.to_owned(), index))
+            .collect();
+        disk.sort_values_by(|a, _, b, _| {
+            ranks
+                .get(a.get())
+                .copied()
+                .unwrap_or(usize::MAX)
+                .cmp(&ranks.get(b.get()).copied().unwrap_or(usize::MAX))
+        });
+    }
 }
 
 struct Lock(HANDLE);
@@ -1077,6 +1124,25 @@ pub fn load(path: &Path, edit: Option<(&Identity, Switch)>) -> Result<Config, St
 mod tests {
     use super::*;
     #[test]
+    fn new_defaults_and_migration_do_not_override_later_user_edits() {
+        let mut doc = help().parse::<DocumentMut>().unwrap();
+        assert_eq!(Config::parse(&doc).unwrap().font_size, 12);
+        assert!(doc["commands"].get("ASDF").is_none());
+        doc["outline"]
+            .as_table_mut()
+            .unwrap()
+            .remove("fill_opacity");
+        doc["outline"]["highlight_opacity"] = value(255);
+        doc["tip"]["font_size"] = value(16);
+        migrate(&mut doc);
+        assert_eq!(doc["outline"]["fill_opacity"].as_integer(), Some(48));
+        doc["tip"]["font_size"] = value(16);
+        doc["outline"]["fill_opacity"] = value(255);
+        migrate(&mut doc);
+        assert_eq!(doc["tip"]["font_size"].as_integer(), Some(16));
+        assert_eq!(doc["outline"]["fill_opacity"].as_integer(), Some(255));
+    }
+    #[test]
     fn default_help_key_is_h_and_legacy_migration_respects_custom_bindings() {
         let mut doc = help().parse::<DocumentMut>().unwrap();
         assert_eq!(
@@ -1127,7 +1193,7 @@ mod tests {
         doc["general"]["autostart"] = value(true);
         doc["crosshair"]["fps"] = value(2000);
         let cfg = recover(&mut doc).unwrap();
-        assert_eq!(cfg.font_size, 16);
+        assert_eq!(cfg.font_size, 12);
         assert!(cfg.autostart);
         assert_eq!(cfg.fps, 1000.0);
         assert_eq!(cfg.warnings, ["tip.font_size"]);

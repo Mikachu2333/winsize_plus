@@ -6,7 +6,7 @@ use windows_sys::Win32::{
     UI::{HiDpi::SystemParametersInfoForDpi, WindowsAndMessaging::*},
 };
 
-pub struct Font(pub HFONT);
+pub struct Font(pub HFONT, i32);
 impl Drop for Font {
     fn drop(&mut self) {
         unsafe {
@@ -77,19 +77,20 @@ impl Font {
         if handle.is_null() {
             Err(err())
         } else {
-            Ok(Self(handle))
+            let height = unsafe {
+                let dc = GetDC(null_mut());
+                let old = SelectObject(dc, handle);
+                let mut metrics = TEXTMETRICW::default();
+                GetTextMetricsW(dc, &mut metrics);
+                SelectObject(dc, old);
+                ReleaseDC(null_mut(), dc);
+                (metrics.tmHeight + metrics.tmExternalLeading).max(1)
+            };
+            Ok(Self(handle, height))
         }
     }
     pub fn height(&self) -> i32 {
-        unsafe {
-            let dc = GetDC(null_mut());
-            let old = SelectObject(dc, self.0);
-            let mut metrics = TEXTMETRICW::default();
-            GetTextMetricsW(dc, &mut metrics);
-            SelectObject(dc, old);
-            ReleaseDC(null_mut(), dc);
-            (metrics.tmHeight + metrics.tmExternalLeading).max(1)
-        }
+        self.1
     }
 }
 
@@ -130,6 +131,24 @@ pub fn families() -> Vec<String> {
 
 pub struct Fonts(Vec<Font>);
 impl Fonts {
+    pub fn opaque(
+        primary: &str,
+        fallbacks: &[String],
+        size: i32,
+        dpi: i32,
+        bold: bool,
+        italic: bool,
+    ) -> Result<Self, String> {
+        Self::create(
+            primary,
+            fallbacks,
+            size,
+            dpi,
+            bold,
+            italic,
+            CLEARTYPE_QUALITY,
+        )
+    }
     pub fn new(
         primary: &str,
         fallbacks: &[String],
@@ -138,20 +157,32 @@ impl Fonts {
         bold: bool,
         italic: bool,
     ) -> Result<Self, String> {
+        Self::create(
+            primary,
+            fallbacks,
+            size,
+            dpi,
+            bold,
+            italic,
+            ANTIALIASED_QUALITY,
+        )
+    }
+    fn create(
+        primary: &str,
+        fallbacks: &[String],
+        size: i32,
+        dpi: i32,
+        bold: bool,
+        italic: bool,
+        quality: u8,
+    ) -> Result<Self, String> {
         let mut fonts = Vec::new();
         for name in std::iter::once(primary)
             .chain(fallbacks.iter().take(3).map(String::as_str))
             .chain(std::iter::once("SystemFont"))
         {
             // Transparent overlay text needs grayscale edges; opaque settings use ClearType.
-            fonts.push(Font::with_quality(
-                name,
-                size,
-                dpi,
-                bold,
-                italic,
-                ANTIALIASED_QUALITY,
-            )?);
+            fonts.push(Font::with_quality(name, size, dpi, bold, italic, quality)?);
         }
         Ok(Self(fonts))
     }
@@ -256,6 +287,23 @@ impl TextLayout {
             ReleaseDC(null_mut(), dc);
         }
         layout.lines.push(line);
+        // Measure complete runs using the same shaping/kerning as TextOutW.
+        unsafe {
+            let dc = GetDC(null_mut());
+            let old = SelectObject(dc, layout.fonts.0[0].0);
+            for line in &mut layout.lines {
+                line.width = 0;
+                for run in &mut line.runs {
+                    SelectObject(dc, layout.fonts.0[run.font].0);
+                    let mut size = SIZE::default();
+                    GetTextExtentPoint32W(dc, run.text.as_ptr(), run.text.len() as i32, &mut size);
+                    run.width = size.cx;
+                    line.width += size.cx;
+                }
+            }
+            SelectObject(dc, old);
+            ReleaseDC(null_mut(), dc);
+        }
         layout.width = layout
             .lines
             .iter()

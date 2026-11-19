@@ -46,10 +46,12 @@ const EDIT_LAYOUT: u32 = WM_APP + 84;
 const TAB_BASE: i32 = 100;
 const AXIS_H: i32 = 500;
 const AXIS_V: i32 = 501;
+const AXIS_BOTH: i32 = 502;
 const SS_LEFT: u32 = 0;
 const SS_CENTER: u32 = 1;
 thread_local! { static EDITOR: RefCell<Option<Editor>> = const { RefCell::new(None) }; }
 thread_local! { static UPDATING: Cell<bool> = const { Cell::new(false) }; }
+thread_local! { static MEASUREMENTS: RefCell<HashMap<(usize,i32,String),i32>> = RefCell::new(HashMap::new()); }
 pub fn open() -> Result<(), String> {
     unsafe {
         let existing = FindWindowW(CLASS, null());
@@ -85,6 +87,46 @@ impl Drop for MutexHandle {
         }
     }
 }
+struct RedrawGuard(HWND, bool);
+impl RedrawGuard {
+    fn new(hwnd: HWND) -> Self {
+        unsafe {
+            let first = GetPropW(hwnd, w!("LayoutBusy")).is_null();
+            if first {
+                SetPropW(hwnd, w!("LayoutBusy"), 1usize as HANDLE);
+                SendMessageW(hwnd, WM_SETREDRAW, 0, 0);
+            }
+            Self(hwnd, first)
+        }
+    }
+}
+impl Drop for RedrawGuard {
+    fn drop(&mut self) {
+        if self.1 {
+            unsafe {
+                RemovePropW(self.0, w!("LayoutBusy"));
+                SendMessageW(self.0, WM_SETREDRAW, 1, 0);
+                RedrawWindow(
+                    self.0,
+                    null(),
+                    null_mut(),
+                    RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_FRAME,
+                );
+            }
+        }
+    }
+}
+fn destroy_rows(rows: Vec<Row>) {
+    for row in rows {
+        for hwnd in row.controls {
+            if !hwnd.is_null() {
+                unsafe {
+                    DestroyWindow(hwnd);
+                }
+            }
+        }
+    }
+}
 struct Row {
     field: Field,
     controls: [HWND; 16],
@@ -101,7 +143,7 @@ struct Editor {
     tabs: Vec<HWND>,
     status: HWND,
     status_until: Cell<Option<Instant>>,
-    axis_controls: [HWND; 2],
+    axis_controls: [HWND; 3],
     path: PathBuf,
     original: String,
     doc: DocumentMut,
@@ -109,13 +151,13 @@ struct Editor {
     tab: usize,
     axis: usize,
     rows: Vec<Row>,
+    pages: HashMap<(usize, usize), (Vec<Row>, i32)>,
     scroll: [i32; 2],
     extent: [i32; 2],
     dpi: i32,
     font: Font,
     hint_font: Font,
     families: Vec<String>,
-    family_fonts: HashMap<usize, Font>,
     live: bool,
     selected: Option<String>,
     pending: Option<Instant>,
@@ -125,6 +167,7 @@ struct Editor {
     preview: Preview,
     clock: FrameClock,
     tooltip: HoverTip,
+    active_combo: Option<HWND>,
 }
 fn text_width(text: &str, font: &Font) -> i32 {
     unsafe {
@@ -158,6 +201,23 @@ fn set_text(hwnd: HWND, text: &str) {
 fn place(hwnd: HWND, x: i32, y: i32, width: i32, height: i32) {
     if !hwnd.is_null() {
         unsafe {
+            let mut old = RECT::default();
+            GetWindowRect(hwnd, &mut old);
+            MapWindowPoints(
+                null_mut(),
+                GetParent(hwnd),
+                (&mut old as *mut RECT).cast(),
+                2,
+            );
+            if (
+                old.left,
+                old.top,
+                old.right - old.left,
+                old.bottom - old.top,
+            ) == (x, y, width.max(1), height.max(1))
+            {
+                return;
+            }
             SetWindowPos(
                 hwnd,
                 null_mut(),
@@ -165,12 +225,16 @@ fn place(hwnd: HWND, x: i32, y: i32, width: i32, height: i32) {
                 y,
                 width.max(1),
                 height.max(1),
-                SWP_NOACTIVATE | SWP_NOZORDER,
+                SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOCOPYBITS,
             );
         }
     }
 }
 fn measured(text: &str, font: &Font, width: i32) -> i32 {
+    let key = (font.0 as usize, width, text.to_owned());
+    if let Some(height) = MEASUREMENTS.with_borrow(|cache| cache.get(&key).copied()) {
+        return height;
+    }
     unsafe {
         let dc = GetDC(null_mut());
         let old = SelectObject(dc, font.0);
@@ -188,10 +252,90 @@ fn measured(text: &str, font: &Font, width: i32) -> i32 {
         );
         SelectObject(dc, old);
         ReleaseDC(null_mut(), dc);
-        rect.bottom.max(font.height())
+        let height = rect.bottom.max(font.height());
+        MEASUREMENTS.with_borrow_mut(|cache| {
+            cache.insert(key, height);
+        });
+        height
     }
 }
 impl Editor {
+    fn invalidate_pages(&mut self) {
+        for (_, (rows, _)) in self.pages.drain() {
+            destroy_rows(rows);
+        }
+    }
+    fn switch_page(&mut self, tab: usize, axis: usize) -> Result<(), String> {
+        if self.tab == tab && self.axis == axis {
+            return Ok(());
+        }
+        let _redraw = RedrawGuard::new(self.panes[1]);
+        let old_key = (self.tab, if self.tab == 5 { self.axis } else { 0 });
+        let rows = std::mem::take(&mut self.rows);
+        for row in &rows {
+            for hwnd in row.controls {
+                if !hwnd.is_null() {
+                    unsafe {
+                        ShowWindow(hwnd, SW_HIDE);
+                        SetWindowLongPtrW(hwnd, GWLP_ID, -GetDlgCtrlID(hwnd) as isize);
+                    }
+                }
+            }
+        }
+        self.pages.insert(old_key, (rows, self.scroll[1]));
+        self.tab = tab;
+        self.axis = axis;
+        self.selected = None;
+        self.preview.hide();
+        self.overlay.hide_tip();
+        self.tooltip.hide();
+        self.active_combo = None;
+        let key = (tab, if tab == 5 { axis } else { 0 });
+        if let Some((rows, scroll)) = self.pages.remove(&key) {
+            self.rows = rows;
+            self.scroll[1] = scroll;
+            for row in &self.rows {
+                for hwnd in row.controls {
+                    if !hwnd.is_null() {
+                        unsafe {
+                            SetWindowLongPtrW(hwnd, GWLP_ID, -GetDlgCtrlID(hwnd) as isize);
+                            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                        }
+                    }
+                }
+            }
+            for (index, hwnd) in self.tabs.iter().enumerate() {
+                unsafe {
+                    SetPropW(
+                        *hwnd,
+                        w!("SelectedTab"),
+                        usize::from(index == tab) as HANDLE,
+                    );
+                    InvalidateRect(*hwnd, null(), 0);
+                }
+            }
+            for (index, hwnd) in self.axis_controls.iter().enumerate() {
+                unsafe {
+                    ShowWindow(*hwnd, if tab == 5 { SW_SHOW } else { SW_HIDE });
+                }
+                send(*hwnd, BM_SETCHECK, usize::from(axis == index), 0);
+            }
+            self.update_values();
+            self.layout()?;
+            self.render()?;
+        } else {
+            self.scroll[1] = 0;
+            let cache = std::mem::take(&mut self.pages);
+            let result = self.rebuild();
+            self.pages = cache;
+            result?;
+        }
+        #[cfg(test)]
+        unsafe {
+            SetPropW(self.window.0, w!("ReadyTab"), (self.tab + 1) as HANDLE);
+        }
+        Ok(())
+    }
     fn s(&self, n: i32) -> i32 {
         (n * self.dpi + 48) / 96
     }
@@ -207,6 +351,12 @@ impl Editor {
             GetClientRect(self.window.0, &mut client);
         }
         let text = caption(self.status);
+        if text.is_empty() {
+            unsafe {
+                ShowWindow(self.status, SW_HIDE);
+            }
+            return;
+        }
         let width = (text_width(&text, &self.font) + self.s(4))
             .min(client.right - self.s(32))
             .max(1);
@@ -219,7 +369,8 @@ impl Editor {
             height,
         );
         unsafe {
-            InvalidateRect(self.window.0, null(), 1);
+            ShowWindow(self.status, SW_SHOWNOACTIVATE);
+            InvalidateRect(self.status, null(), 1);
         }
     }
     fn create(
@@ -231,8 +382,11 @@ impl Editor {
         id: i32,
     ) -> Result<HWND, String> {
         let is_edit = unsafe { std::slice::from_raw_parts(class, 5) == [69u16, 68, 73, 84, 0] };
+        let is_combo = unsafe { std::slice::from_raw_parts(class, 5) == [67u16, 79, 77, 66, 79] };
         let style = if is_edit {
             style | ES_MULTILINE as u32 | ES_AUTOVSCROLL as u32
+        } else if is_combo {
+            style | CBS_OWNERDRAWFIXED as u32 | CBS_HASSTRINGS as u32
         } else {
             style
         };
@@ -280,7 +434,16 @@ impl Editor {
         Ok(())
     }
     fn rebuild(&mut self) -> Result<(), String> {
+        let _redraw = RedrawGuard::new(self.panes[1]);
+        for (_, (rows, _)) in self.pages.drain() {
+            destroy_rows(rows);
+        }
+        #[cfg(test)]
+        unsafe {
+            RemovePropW(self.window.0, w!("ReadyTab"));
+        }
         self.tooltip.hide();
+        self.active_combo = None;
         self.preview.hide();
         self.overlay.hide_tip();
         self.overlay.guides(0, &self.cfg)?;
@@ -296,6 +459,11 @@ impl Editor {
         for (i, hwnd) in self.tabs.iter().enumerate() {
             set_text(*hwnd, self.cfg.tr(TABS[i].0, TABS[i].1));
             unsafe {
+                SetPropW(
+                    *hwnd,
+                    w!("SelectedTab"),
+                    usize::from(i == self.tab) as HANDLE,
+                );
                 InvalidateRect(*hwnd, null(), 1);
             }
         }
@@ -308,8 +476,10 @@ impl Editor {
                 *hwnd,
                 if i == 0 {
                     self.cfg.tr("Horizontal line", "横线")
-                } else {
+                } else if i == 1 {
                     self.cfg.tr("Vertical line", "竖线")
+                } else {
+                    self.cfg.tr("Both axes", "统一设置")
                 },
             );
             unsafe {
@@ -400,6 +570,11 @@ impl Editor {
                             0
                         };
                     self.control(&mut row, index, 0, w!("COMBOBOX"), "", style)?;
+                    if matches!(row.field.kind, Kind::Font) {
+                        unsafe {
+                            SetPropW(row.c(0), w!("FontPicker"), 1usize as HANDLE);
+                        }
+                    }
                     populate(
                         row.c(0),
                         &row.options,
@@ -548,6 +723,9 @@ impl Editor {
                         "SystemFont",
                         self.font.height() + self.s(14),
                     );
+                    unsafe {
+                        SetPropW(row.c(3), w!("FontPicker"), 1usize as HANDLE);
+                    }
                     for (slot, en, zh) in [
                         (4, "Add", "添加"),
                         (5, "Remove", "删除"),
@@ -583,9 +761,22 @@ impl Editor {
             self.rows.push(row);
         }
         self.layout()?;
-        self.render()
+        for row in &self.rows {
+            for hwnd in row.controls {
+                if !hwnd.is_null() {
+                    send(hwnd, EDIT_LAYOUT, 0, 0);
+                }
+            }
+        }
+        self.render()?;
+        #[cfg(test)]
+        unsafe {
+            SetPropW(self.window.0, w!("ReadyTab"), (self.tab + 1) as HANDLE);
+        }
+        Ok(())
     }
     fn layout(&mut self) -> Result<(), String> {
+        let _redraw = RedrawGuard::new(self.panes[1]);
         let mut client = RECT::default();
         unsafe {
             GetClientRect(self.window.0, &mut client);
@@ -618,23 +809,13 @@ impl Editor {
         let width = (rect.right - padding * 2).max(1);
         let h = self.font.height() + self.s(10);
         let combo_width = (text_width("中文中文中文中文", &self.font) + self.s(30)).min(width);
+        let font_width =
+            (text_width("中文中文中文中文中文中文中文中文", &self.font) + self.s(30)).min(width);
         let number_width = text_width("0000", &self.font) + self.s(16);
         let button_width = self.s(68);
         let name_width = combo_width;
         let expression_width = (combo_width * 2).min(width);
         let mut y = padding;
-        if self.tab == 5 {
-            for (i, control) in self.axis_controls.iter().enumerate() {
-                place(
-                    *control,
-                    padding + i as i32 * combo_width,
-                    y - self.scroll[1],
-                    combo_width,
-                    h,
-                );
-            }
-            y += h + self.s(10);
-        }
         for row in &self.rows {
             let hint = if row.field.hint.is_empty() {
                 0
@@ -654,14 +835,19 @@ impl Editor {
                     y += height;
                 }
                 Kind::Choice(_) | Kind::Font => {
-                    place(row.c(0), padding, y - self.scroll[1], combo_width, h * 10);
+                    let control_width = if matches!(row.field.kind, Kind::Font) {
+                        font_width
+                    } else {
+                        combo_width
+                    };
+                    place(row.c(0), padding, y - self.scroll[1], control_width, h * 10);
                     send(
                         row.c(0),
                         CB_SETITEMHEIGHT,
                         usize::MAX,
                         (h - self.s(4)) as isize,
                     );
-                    send(row.c(0), CB_SETDROPPEDWIDTH, combo_width as usize, 0);
+                    send(row.c(0), CB_SETDROPPEDWIDTH, control_width as usize, 0);
                     y += h;
                 }
                 Kind::Mapping => {
@@ -737,17 +923,17 @@ impl Editor {
                     let list_width = (combo_width * 2).min(width);
                     place(row.c(0), padding, y - self.scroll[1], list_width, h * 3);
                     y += h * 3 + gap;
-                    place(row.c(3), padding, y - self.scroll[1], combo_width, h * 10);
+                    place(row.c(3), padding, y - self.scroll[1], font_width, h * 10);
                     send(
                         row.c(3),
                         CB_SETITEMHEIGHT,
                         usize::MAX,
                         (h - self.s(4)) as isize,
                     );
-                    send(row.c(3), CB_SETDROPPEDWIDTH, combo_width as usize, 0);
+                    send(row.c(3), CB_SETDROPPEDWIDTH, font_width as usize, 0);
                     place(
                         row.c(4),
-                        padding + combo_width + gap,
+                        padding + font_width + gap,
                         y - self.scroll[1],
                         button_width,
                         h,
@@ -804,6 +990,18 @@ impl Editor {
                 y += hint;
             }
             y += self.s(12);
+            if self.tab == 5 && row.field.section == "crosshair" {
+                for (i, control) in self.axis_controls.iter().enumerate() {
+                    place(
+                        *control,
+                        padding + i as i32 * (width / 3),
+                        y - self.scroll[1],
+                        width / 3,
+                        h,
+                    );
+                }
+                y += h + self.s(10);
+            }
         }
         self.extent[1] = y + padding;
         let mut adjusted = false;
@@ -822,7 +1020,6 @@ impl Editor {
             };
             unsafe {
                 SetScrollInfo(self.panes[pane], SB_VERT, &info, 1);
-                InvalidateRect(self.panes[pane], null(), 1);
             }
         }
         unsafe {
@@ -850,6 +1047,7 @@ impl Editor {
         sidebar_size(total, self.dpi, widest)
     }
     fn scroll_by(&mut self, pane: usize, command: u16, delta: i32) -> Result<(), String> {
+        let before = self.scroll[pane];
         let mut rect = RECT::default();
         unsafe {
             GetClientRect(self.panes[pane], &mut rect);
@@ -874,7 +1072,46 @@ impl Editor {
         } else {
             self.scroll[pane] = self.scroll[pane].saturating_add(amount);
         }
-        self.layout()
+        self.scroll[pane] = self.scroll[pane].clamp(0, (self.extent[pane] - rect.bottom).max(0));
+        if before == self.scroll[pane] {
+            return Ok(());
+        }
+        // Move existing child controls only; measurements and row layout stay unchanged.
+        let _redraw = RedrawGuard::new(self.panes[pane]);
+        unsafe {
+            let mut child = GetWindow(self.panes[pane], GW_CHILD);
+            let mut batch = BeginDeferWindowPos(64);
+            while !child.is_null() {
+                if GetWindowLongW(child, GWL_STYLE) as u32 & WS_VISIBLE == 0 {
+                    child = GetWindow(child, GW_HWNDNEXT);
+                    continue;
+                }
+                let mut position = RECT::default();
+                GetWindowRect(child, &mut position);
+                MapWindowPoints(
+                    null_mut(),
+                    self.panes[pane],
+                    (&mut position as *mut RECT).cast(),
+                    2,
+                );
+                batch = DeferWindowPos(
+                    batch,
+                    child,
+                    null_mut(),
+                    position.left,
+                    position.top + before - self.scroll[pane],
+                    0,
+                    0,
+                    SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOSIZE | SWP_NOCOPYBITS,
+                );
+                child = GetWindow(child, GW_HWNDNEXT);
+            }
+            if !batch.is_null() {
+                EndDeferWindowPos(batch);
+            }
+            SetScrollPos(self.panes[pane], SB_VERT, self.scroll[pane], 1);
+        }
+        Ok(())
     }
     fn selected_value(row: &Row, slot: usize) -> String {
         let i = send(row.c(slot), CB_GETCURSEL, 0, 0);
@@ -955,7 +1192,7 @@ impl Editor {
                         {
                             return Err(self.cfg.tr("Name already exists", "名称已存在").into());
                         }
-                        draft[section].as_table_mut().unwrap().remove(key);
+                        rename_entry(draft[section].as_table_mut().unwrap(), key, &name);
                         if section == "presets" {
                             for bindings in ["keys", "commands", "grid"] {
                                 for (_, item) in draft[bindings].as_table_mut().unwrap().iter_mut()
@@ -973,6 +1210,12 @@ impl Editor {
                 _ => continue,
             };
             draft[section][key] = replacement;
+            if self.tab == 5 && self.axis == 2 && section == "horizontal" {
+                draft["vertical"][key] = draft[section][key].clone();
+                if key == "color" {
+                    draft["vertical"]["opacity"] = draft[section]["opacity"].clone();
+                }
+            }
         }
         Config::parse(&draft)?;
         Ok(draft)
@@ -984,10 +1227,9 @@ impl Editor {
         }
         let draft = self.collect()?;
         let rebuild = self.dirty.iter().any(|i| {
-            self.rows.get(*i).is_some_and(|r| {
-                (matches!(r.field.kind, Kind::Mapping) && caption(r.c(3)).trim() != r.field.key)
-                    || (r.field.section == "general" && r.field.key == "language")
-            })
+            self.rows
+                .get(*i)
+                .is_some_and(|r| r.field.section == "general" && r.field.key == "language")
         });
         for &index in &self.dirty {
             if let Some(row) = self.rows.get(index)
@@ -1001,14 +1243,27 @@ impl Editor {
         self.doc = saved.parse::<DocumentMut>().map_err(|e| e.to_string())?;
         self.original = saved;
         self.cfg = Config::parse(&self.doc)?;
+        for row in &mut self.rows {
+            if matches!(row.field.kind, Kind::Mapping) {
+                let name = caption(row.c(3)).trim().to_owned();
+                if self.doc[&row.field.section].get(&name).is_some() && name != row.field.key {
+                    row.field.key = name.clone();
+                    row.field.label = name.clone();
+                    set_text(row.c(1), &name);
+                }
+            }
+        }
         self.dirty.clear();
         self.clock.reset(self.cfg.fps);
         self.status(self.cfg.tr("Saved", "已保存"));
+        self.invalidate_pages();
         if rebuild {
             self.rebuild()?;
         } else {
             self.update_values();
-            self.render()?;
+            if self.tab != 0 && self.tab != 4 {
+                self.render()?;
+            }
         }
         Ok(())
     }
@@ -1038,6 +1293,7 @@ impl Editor {
                     }
                 }
                 Kind::Mapping => {
+                    set_text(row.c(3), &row.field.key);
                     if let Some(text) = item.and_then(Item::as_str) {
                         if row.field.section == "presets" {
                             set_text(row.c(0), text);
@@ -1056,6 +1312,18 @@ impl Editor {
                             row.options.iter().position(|o| o.0.eq_ignore_ascii_case(v))
                     {
                         send(row.c(0), CB_SETCURSEL, i, 0);
+                    }
+                }
+                Kind::Fallbacks => {
+                    let selected = send(row.c(0), LB_GETCURSEL, 0, 0);
+                    send(row.c(0), LB_RESETCONTENT, 0, 0);
+                    if let Some(array) = item.and_then(Item::as_array) {
+                        for name in array.iter().filter_map(Value::as_str) {
+                            send(row.c(0), LB_ADDSTRING, 0, wide(name).as_ptr() as isize);
+                        }
+                    }
+                    if selected >= 0 {
+                        send(row.c(0), LB_SETCURSEL, selected as usize, 0);
                     }
                 }
                 Kind::Color => {
@@ -1086,7 +1354,11 @@ impl Editor {
         self.preview.hide();
         self.overlay.hide_tip();
         let guides = if self.tab == 5 && self.live {
-            if self.axis == 0 { 1 } else { 2 }
+            match self.axis {
+                0 => 1,
+                1 => 2,
+                _ => 3,
+            }
         } else {
             0
         };
@@ -1128,7 +1400,19 @@ impl Editor {
         self.dirty.clear();
         self.pending = None;
         self.status(self.cfg.tr("Saved", "已保存"));
-        self.rebuild()
+        let expected = schema::fields(self.tab, self.axis, &self.cfg, &self.doc);
+        if expected.len() == self.rows.len()
+            && expected
+                .iter()
+                .zip(&self.rows)
+                .all(|(a, b)| a.section == b.field.section && a.key == b.field.key)
+        {
+            self.invalidate_pages();
+            self.update_values();
+            self.render()
+        } else {
+            self.rebuild()
+        }
     }
     fn add(&mut self, section: &str) -> Result<(), String> {
         self.save()?;
@@ -1268,6 +1552,7 @@ impl Editor {
     }
     fn command(&mut self, id: i32, event: u32, sender: HWND) -> Result<(), String> {
         if event == CBN_DROPDOWN && id >= BASE {
+            self.active_combo = Some(sender);
             unsafe {
                 let mut info = COMBOBOXINFO {
                     cbSize: size_of::<COMBOBOXINFO>() as u32,
@@ -1280,19 +1565,28 @@ impl Editor {
             }
         }
         if event == CBN_CLOSEUP {
+            self.active_combo = None;
             self.tooltip.hide();
         }
         if (TAB_BASE..TAB_BASE + 7).contains(&id) && event == BN_CLICKED {
             self.save()?;
-            self.tab = (id - TAB_BASE) as usize;
-            self.scroll[1] = 0;
-            self.selected = None;
-            return self.rebuild();
+            return self.switch_page((id - TAB_BASE) as usize, self.axis);
         }
-        if matches!(id, AXIS_H | AXIS_V) && event == BN_CLICKED {
+        if matches!(id, AXIS_H | AXIS_V | AXIS_BOTH) && event == BN_CLICKED {
             self.save()?;
-            self.axis = usize::from(id == AXIS_V);
-            return self.rebuild();
+            if id == AXIS_BOTH && self.axis != 2 {
+                let mut draft = self.doc.clone();
+                draft["vertical"] = draft["horizontal"].clone();
+                self.original = config::save_settings(&self.path, &self.original, &draft)?;
+                self.doc = self
+                    .original
+                    .parse::<DocumentMut>()
+                    .map_err(|error| error.to_string())?;
+                self.cfg = Config::parse(&self.doc)?;
+                self.invalidate_pages();
+                self.status(self.cfg.tr("Saved", "已保存"));
+            }
+            return self.switch_page(self.tab, (id - AXIS_H) as usize);
         }
         if id < BASE {
             return Ok(());
@@ -1351,7 +1645,9 @@ impl Editor {
                 && let Ok(cfg) = Config::parse(&draft)
             {
                 self.cfg = cfg;
-                self.render()?;
+                if self.tab != 0 && self.tab != 4 {
+                    self.render()?;
+                }
                 if matches!(kind, Kind::Color) {
                     unsafe {
                         InvalidateRect(self.rows[index].c(0), null(), 1);
@@ -1363,6 +1659,11 @@ impl Editor {
     }
     fn tick(&mut self) -> Result<(), String> {
         let now = Instant::now();
+        // Native combo popups capture the pointer and do not reliably deliver list mouse-move
+        // messages to subclasses. Hit-test the open list on the existing UI timer as well.
+        if let Some(combo) = self.active_combo {
+            self.hover(combo, -1);
+        }
         self.tooltip.tick();
         if self
             .status_until
@@ -1383,18 +1684,42 @@ impl Editor {
             self.disk_check = now;
             let disk = config::read_settings(&self.path)?;
             if disk != self.original {
-                config::load(&self.path, None)?;
+                let loaded = config::load(&self.path, None)?;
                 self.original = config::read_settings(&self.path)?;
                 self.doc = self
                     .original
                     .parse::<DocumentMut>()
                     .map_err(|e| e.to_string())?;
-                self.cfg = Config::parse(&self.doc)?;
-                self.status(
-                    self.cfg
-                        .tr("Manual file changes applied", "已应用配置文件中的修改"),
-                );
-                self.rebuild()?;
+                self.cfg = loaded;
+                if self.cfg.warnings.is_empty() {
+                    self.status(
+                        self.cfg
+                            .tr("Manual file changes applied", "已应用配置文件中的修改"),
+                    );
+                } else {
+                    self.status(&format!(
+                        "{}: {}",
+                        self.cfg.tr(
+                            "Invalid fields restored to defaults",
+                            "以下字段有误，已恢复默认值"
+                        ),
+                        self.cfg.warnings.join(", ")
+                    ));
+                }
+                let expected = schema::fields(self.tab, self.axis, &self.cfg, &self.doc);
+                if expected.len() != self.rows.len()
+                    || expected.iter().zip(&self.rows).any(|(a, b)| {
+                        a.section != b.field.section
+                            || a.key != b.field.key
+                            || a.label != b.field.label
+                    })
+                {
+                    self.rebuild()?;
+                } else {
+                    self.invalidate_pages();
+                    self.update_values();
+                    self.render()?;
+                }
             }
         }
         Ok(())
@@ -1426,7 +1751,31 @@ impl Editor {
             self.tooltip.hide();
             return;
         };
-        let selected = if item < 0 {
+        let selected = if item < 0 && send(control, CB_GETDROPPEDSTATE, 0, 0) != 0 {
+            let mut info = COMBOBOXINFO {
+                cbSize: size_of::<COMBOBOXINFO>() as u32,
+                ..Default::default()
+            };
+            let Ok(mut point) = desktop::cursor() else {
+                self.tooltip.hide();
+                return;
+            };
+            unsafe {
+                GetComboBoxInfo(control, &mut info);
+                ScreenToClient(info.hwndList, &mut point);
+            }
+            let hit = send(
+                info.hwndList,
+                LB_ITEMFROMPOINT,
+                0,
+                ((point.x as u16 as u32) | ((point.y as u16 as u32) << 16)) as isize,
+            );
+            if hit >> 16 != 0 {
+                self.tooltip.hide();
+                return;
+            }
+            hit & 0xffff
+        } else if item < 0 {
             send(control, CB_GETCURSEL, 0, 0)
         } else {
             item
@@ -1439,19 +1788,14 @@ impl Editor {
         unsafe {
             GetClientRect(control, &mut rect);
         }
-        let font = if matches!(row.field.kind, Kind::Font | Kind::Fallbacks) {
-            self.family_fonts
-                .get(&(selected as usize))
-                .unwrap_or(&self.font)
-        } else {
-            &self.font
-        };
+        let font = &self.font;
         let overflow = text_width(label, font) > rect.right - self.s(30);
         if let Ok(point) = desktop::cursor() {
             self.tooltip.hover(overflow.then(|| label.clone()), point);
         }
     }
     fn escape(&mut self) -> Result<(), String> {
+        self.tooltip.hide();
         self.overlay.hide_tip();
         if !self.preview.reset(&self.cfg)? {
             self.preview.hide();
@@ -1459,181 +1803,9 @@ impl Editor {
         }
         Ok(())
     }
-    fn draw(&mut self, draw: &DRAWITEMSTRUCT) {
-        unsafe {
-            let id = draw.CtlID as i32;
-            let dc = draw.hDC;
-            let mut rect = draw.rcItem;
-            if (TAB_BASE..TAB_BASE + 7).contains(&id) {
-                let selected = id == TAB_BASE + self.tab as i32;
-                SetDCBrushColor(dc, GetSysColor(COLOR_WINDOW));
-                FillRect(dc, &rect, GetStockObject(DC_BRUSH));
-                SetDCBrushColor(
-                    dc,
-                    GetSysColor(if selected {
-                        COLOR_HIGHLIGHT
-                    } else {
-                        COLOR_BTNFACE
-                    }),
-                );
-                let old_brush = SelectObject(dc, GetStockObject(DC_BRUSH));
-                let old_pen = SelectObject(dc, GetStockObject(NULL_PEN));
-                RoundRect(
-                    dc,
-                    rect.left,
-                    rect.top,
-                    rect.right,
-                    rect.bottom,
-                    self.s(12),
-                    self.s(12),
-                );
-                SelectObject(dc, old_brush);
-                SelectObject(dc, old_pen);
-                let old = SelectObject(dc, self.font.0);
-                SetBkMode(dc, TRANSPARENT as i32);
-                SetTextColor(
-                    dc,
-                    GetSysColor(if selected {
-                        COLOR_HIGHLIGHTTEXT
-                    } else {
-                        COLOR_BTNTEXT
-                    }),
-                );
-                let text = wide(self.cfg.tr(
-                    TABS[(id - TAB_BASE) as usize].0,
-                    TABS[(id - TAB_BASE) as usize].1,
-                ));
-                let height = measured(
-                    &String::from_utf16_lossy(&text[..text.len() - 1]),
-                    &self.font,
-                    rect.right - rect.left - self.s(32),
-                );
-                rect.left += self.s(16);
-                rect.right -= self.s(16);
-                rect.top += ((rect.bottom - rect.top - height) / 2).max(0);
-                DrawTextW(
-                    dc,
-                    text.as_ptr(),
-                    (text.len() - 1) as i32,
-                    &mut rect,
-                    DT_LEFT | DT_WORDBREAK | DT_NOPREFIX,
-                );
-                SelectObject(dc, old);
-                if draw.itemState & ODS_FOCUS != 0 {
-                    DrawFocusRect(dc, &draw.rcItem);
-                }
-                return;
-            }
-            if id < BASE {
-                return;
-            }
-            let index = ((id - BASE) / STRIDE) as usize;
-            let Some(row) = self.rows.get(index) else {
-                return;
-            };
-            if matches!(row.field.kind, Kind::Color) {
-                let channels: Vec<_> = (3..=6)
-                    .map(|slot| caption(row.c(slot)).parse::<u32>().unwrap_or(255).min(255))
-                    .collect();
-                let tile = self.s(10).max(1);
-                for y in (rect.top..rect.bottom).step_by(tile as usize) {
-                    for x in (rect.left..rect.right).step_by(tile as usize) {
-                        let base = if (x / tile + y / tile) % 2 == 0 {
-                            crate::colors::CHECKER_LIGHT
-                        } else {
-                            crate::colors::CHECKER_SHADE
-                        };
-                        let foreground = channels[0] | (channels[1] << 8) | (channels[2] << 16);
-                        SetDCBrushColor(
-                            dc,
-                            crate::colors::composite(foreground, base, channels[3] as u8),
-                        );
-                        FillRect(
-                            dc,
-                            &RECT {
-                                left: x,
-                                top: y,
-                                right: (x + tile).min(rect.right),
-                                bottom: (y + tile).min(rect.bottom),
-                            },
-                            GetStockObject(DC_BRUSH),
-                        );
-                    }
-                }
-                let text = wide(format!(
-                    "#{:02X}{:02X}{:02X}   A: {}   {}",
-                    channels[0],
-                    channels[1],
-                    channels[2],
-                    channels[3],
-                    self.cfg.tr("Choose…", "选择…")
-                ));
-                let old = SelectObject(dc, self.font.0);
-                SetBkMode(dc, TRANSPARENT as i32);
-                SetTextColor(
-                    dc,
-                    crate::colors::swatch_text(
-                        channels[0] | (channels[1] << 8) | (channels[2] << 16),
-                        channels[3] as u8,
-                    ),
-                );
-                DrawTextW(
-                    dc,
-                    text.as_ptr(),
-                    (text.len() - 1) as i32,
-                    &mut rect,
-                    DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
-                );
-                SelectObject(dc, old);
-                return;
-            }
-            if !matches!(row.field.kind, Kind::Font | Kind::Fallbacks) || draw.itemID == u32::MAX {
-                return;
-            }
-            let item = draw.itemID as usize;
-            let Some((family, label)) = row.options.get(item) else {
-                return;
-            };
-            if !self.family_fonts.contains_key(&item)
-                && let Ok(font) = Font::new(family, 11, self.dpi, false, false)
-            {
-                self.family_fonts.insert(item, font);
-            }
-            let font = self.family_fonts.get(&item).unwrap_or(&self.font);
-            let selected = draw.itemState & ODS_SELECTED != 0;
-            SetDCBrushColor(
-                dc,
-                GetSysColor(if selected {
-                    COLOR_HIGHLIGHT
-                } else {
-                    COLOR_WINDOW
-                }),
-            );
-            FillRect(dc, &rect, GetStockObject(DC_BRUSH));
-            let old = SelectObject(dc, font.0);
-            SetBkMode(dc, TRANSPARENT as i32);
-            SetTextColor(
-                dc,
-                GetSysColor(if selected {
-                    COLOR_HIGHLIGHTTEXT
-                } else {
-                    COLOR_WINDOWTEXT
-                }),
-            );
-            rect.left += self.s(8);
-            let text = wide(label);
-            DrawTextW(
-                dc,
-                text.as_ptr(),
-                (text.len() - 1) as i32,
-                &mut rect,
-                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
-            );
-            SelectObject(dc, old);
-        }
-    }
 }
 fn populate(hwnd: HWND, options: &[(String, String)], selected: &str, height: i32) {
+    send(hwnd, WM_SETREDRAW, 0, 0);
     for (i, (value, label)) in options.iter().enumerate() {
         send(hwnd, CB_ADDSTRING, 0, wide(label).as_ptr() as isize);
         if value.eq_ignore_ascii_case(selected) {
@@ -1642,6 +1814,27 @@ fn populate(hwnd: HWND, options: &[(String, String)], selected: &str, height: i3
     }
     send(hwnd, CB_SETITEMHEIGHT, usize::MAX, height as isize);
     send(hwnd, CB_SETITEMHEIGHT, 0, height as isize);
+    send(hwnd, WM_SETREDRAW, 1, 0);
+}
+fn rename_entry(table: &mut toml_edit::Table, old: &str, new: &str) {
+    let order: HashMap<_, _> = table
+        .iter()
+        .enumerate()
+        .map(|(index, (key, _))| {
+            (
+                if key == old {
+                    new.to_owned()
+                } else {
+                    key.to_owned()
+                },
+                index,
+            )
+        })
+        .collect();
+    if let Some((_, item)) = table.remove_entry(old) {
+        table.insert(new, item);
+    }
+    table.sort_values_by(|a, _, b, _| order.get(a.get()).cmp(&order.get(b.get())));
 }
 fn sidebar_size(total: i32, dpi: i32, text_width: i32) -> i32 {
     let scale = |value| (value * dpi + 48) / 96;
@@ -1692,7 +1885,9 @@ unsafe extern "system" fn control_proc(
             } else {
                 padding
             };
-            rect.bottom -= padding;
+            // The format box must contain a whole line even when top padding is nonzero.
+            // GDI otherwise resets the edit rectangle to its default top-aligned position.
+            rect.bottom = (rect.top + metrics.tmHeight).max(rect.bottom - padding);
             send(hwnd, EM_SETRECT, 0, (&rect as *const RECT) as isize);
             return result;
         }
@@ -1731,9 +1926,30 @@ unsafe extern "system" fn control_proc(
         if message == WM_MOUSELEAVE {
             PostMessageW(root as HWND, HOVER, 0, 0);
         }
-        if message == WM_MOUSEWHEEL
-            && !(class == "ComboBox" && send(hwnd, CB_GETDROPPEDSTATE, 0, 0) != 0)
-        {
+        if message == WM_MOUSEWHEEL {
+            let owner = GetPropW(hwnd, w!("OwnerCombo"));
+            let combo = if class.eq_ignore_ascii_case("combobox") {
+                hwnd
+            } else {
+                owner
+            };
+            if !combo.is_null() && send(combo, CB_GETDROPPEDSTATE, 0, 0) != 0 {
+                let mut info = COMBOBOXINFO {
+                    cbSize: size_of::<COMBOBOXINFO>() as u32,
+                    ..Default::default()
+                };
+                GetComboBoxInfo(combo, &mut info);
+                let wheel = (wp >> 16) as u16 as i16 as i32;
+                let top = send(info.hwndList, LB_GETTOPINDEX, 0, 0) as i32;
+                let count = send(info.hwndList, LB_GETCOUNT, 0, 0) as i32;
+                send(
+                    info.hwndList,
+                    LB_SETTOPINDEX,
+                    (top - wheel / WHEEL_DELTA as i32 * 3).clamp(0, (count - 1).max(0)) as usize,
+                    0,
+                );
+                return 0;
+            }
             PostMessageW(
                 root as HWND,
                 SCROLL,
@@ -1820,11 +2036,17 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
     match message {
         WM_SIZE => {
             unsafe {
-                PostMessageW(hwnd, RESIZE, 0, 0);
+                if GetPropW(hwnd, w!("ResizeQueued")).is_null() {
+                    SetPropW(hwnd, w!("ResizeQueued"), 1usize as HANDLE);
+                    PostMessageW(hwnd, RESIZE, 0, 0);
+                }
             }
             0
         }
         RESIZE => {
+            unsafe {
+                RemovePropW(hwnd, w!("ResizeQueued"));
+            }
             with_editor(|e| e.layout());
             0
         }
@@ -1845,7 +2067,8 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
                 e.dpi = unsafe { GetDpiForWindow(hwnd) }.max(96) as i32;
                 e.font = Font::new("SystemFont", 0, e.dpi, false, false)?;
                 e.hint_font = Font::new("SystemFont", 9, e.dpi, false, false)?;
-                e.family_fonts.clear();
+                crate::settings_paint::reset_fonts();
+                MEASUREMENTS.with_borrow_mut(HashMap::clear);
                 for handle in e
                     .tabs
                     .iter()
@@ -1912,10 +2135,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
             0
         }
         WM_DRAWITEM => {
-            with_editor(|e| {
-                e.draw(unsafe { &*(lp as *const DRAWITEMSTRUCT) });
-                Ok(())
-            });
+            crate::settings_paint::draw(hwnd, unsafe { &*(lp as *const DRAWITEMSTRUCT) });
             1
         }
         WM_MEASUREITEM => {
@@ -1932,6 +2152,16 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
                     PostQuitMessage(0);
                 }
                 Ok(())
+            });
+            0
+        }
+        WM_ACTIVATE if (wp & 0xffff) as u32 == WA_INACTIVE => {
+            with_editor(|editor| {
+                editor.preview.hide();
+                editor.overlay.hide_tip();
+                editor.overlay.guides(0, &editor.cfg)?;
+                input::track_preview(false)?;
+                input::set_guides(false)
             });
             0
         }
@@ -2041,7 +2271,7 @@ pub fn run(path: &Path) -> Result<(), String> {
             tabs: Vec::new(),
             status: null_mut(),
             status_until: Cell::new(None),
-            axis_controls: [null_mut(); 2],
+            axis_controls: [null_mut(); 3],
             path: path.into(),
             original,
             doc,
@@ -2050,13 +2280,13 @@ pub fn run(path: &Path) -> Result<(), String> {
             tab: 0,
             axis: 0,
             rows: Vec::new(),
+            pages: HashMap::new(),
             scroll: [0; 2],
             extent: [0; 2],
             dpi,
             font: Font::new("SystemFont", 0, dpi, false, false)?,
             hint_font: Font::new("SystemFont", 9, dpi, false, false)?,
             families: fonts::families(),
-            family_fonts: HashMap::new(),
             live: false,
             selected: None,
             pending: None,
@@ -2065,6 +2295,7 @@ pub fn run(path: &Path) -> Result<(), String> {
             overlay: Overlay::new()?,
             preview: Preview::new()?,
             tooltip: HoverTip::new(hwnd)?,
+            active_combo: None,
         };
         for (index, (en, zh)) in TABS.iter().enumerate() {
             editor.tabs.push(editor.create(
@@ -2089,6 +2320,13 @@ pub fn run(path: &Path) -> Result<(), String> {
             "",
             BS_AUTORADIOBUTTON as u32 | BS_MULTILINE as u32 | WS_TABSTOP,
             AXIS_V,
+        )?;
+        editor.axis_controls[2] = editor.create(
+            panes[1],
+            w!("BUTTON"),
+            "",
+            BS_AUTORADIOBUTTON as u32 | BS_MULTILINE as u32 | WS_TABSTOP,
+            AXIS_BOTH,
         )?;
         if !cfg!(test) && !crate::resident::running() {
             crate::launch(editor.cfg.elevate)?;
@@ -2147,6 +2385,22 @@ fn message_loop(hwnd: HWND, timer: HANDLE) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn renamed_mapping_keeps_its_position() {
+        let mut doc = "[keys]\nQ='LeftTop'\nG='Guide'\nH='Help'\n"
+            .parse::<DocumentMut>()
+            .unwrap();
+        rename_entry(doc["keys"].as_table_mut().unwrap(), "G", "F12");
+        assert_eq!(
+            doc["keys"]
+                .as_table()
+                .unwrap()
+                .iter()
+                .map(|(key, _)| key)
+                .collect::<Vec<_>>(),
+            ["Q", "F12", "H"]
+        );
+    }
     #[test]
     fn sidebar_fits_labels_without_consuming_one_third() {
         assert_eq!(sidebar_size(1000, 96, 70), 160);
@@ -2209,11 +2463,22 @@ mod tests {
     #[test]
     #[ignore = "opens a real settings window; run explicitly on an interactive Windows desktop"]
     fn interactive_settings_smoke() {
+        fn wait_tab(hwnd: HWND, tab: usize) -> Result<(), String> {
+            let until = Instant::now() + Duration::from_secs(5);
+            while unsafe { GetPropW(hwnd, w!("ReadyTab")) } as usize != tab + 1 {
+                if Instant::now() > until {
+                    return Err(format!("Tab {tab} did not finish rendering"));
+                }
+                std::thread::sleep(Duration::from_millis(30));
+            }
+            Ok(())
+        }
         let folder = std::env::current_dir().unwrap().join("target/ui-smoke");
         std::fs::create_dir_all(&folder).unwrap();
         let path = folder.join("config.toml");
         let mut doc = config::help().parse::<DocumentMut>().unwrap();
         doc["general"]["language"] = value("zh-CN");
+        doc["presets"]["这是一个超过八个汉字的测试分区名称"] = value("0|0|50sw|50sh");
         std::fs::write(&path, doc.to_string()).unwrap();
         assert!(
             unsafe { FindWindowW(CLASS, null()) }.is_null(),
@@ -2248,10 +2513,13 @@ mod tests {
                     );
                 }
                 for tab in 0..7 {
+                    let start = Instant::now();
                     unsafe {
                         PostMessageW(hwnd, WM_COMMAND, (TAB_BASE + tab) as usize, 0);
                     }
-                    std::thread::sleep(Duration::from_millis(350));
+                    wait_tab(hwnd, tab as usize)?;
+                    println!("tab {tab} first_load_ms={}", start.elapsed().as_millis());
+                    std::thread::sleep(Duration::from_millis(100));
                     let status = caption(unsafe { GetDlgItem(hwnd, 600) });
                     if status.contains("error") || status.contains("错误") {
                         return Err(status);
@@ -2264,6 +2532,17 @@ mod tests {
                         }
                         std::thread::sleep(Duration::from_millis(200));
                         snapshot(hwnd, &output.join("fonts.bmp"));
+                    }
+                }
+                for tab in [0, 1, 2, 3, 4, 5, 6] {
+                    let start = Instant::now();
+                    unsafe {
+                        PostMessageW(hwnd, WM_COMMAND, (TAB_BASE + tab) as usize, 0);
+                    }
+                    wait_tab(hwnd, tab as usize)?;
+                    println!("tab {tab} cached_ms={}", start.elapsed().as_millis());
+                    if start.elapsed() > Duration::from_secs(1) {
+                        return Err(format!("Cached tab {tab} took over one second"));
                     }
                 }
                 // Change FPS through the native edit notification, then confirm persisted clamping.
@@ -2330,6 +2609,199 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(3300));
                 if !caption(unsafe { GetDlgItem(hwnd, 600) }).is_empty() {
                     return Err("Saved status did not expire".into());
+                }
+                if unsafe { IsWindowVisible(GetDlgItem(hwnd, 600)) } != 0 {
+                    return Err("Empty status control is still visible".into());
+                }
+                // Long dropdown entries expose their full label without widening the control.
+                unsafe {
+                    PostMessageW(hwnd, WM_COMMAND, (TAB_BASE + 4) as usize, 0);
+                }
+                wait_tab(hwnd, 4)?;
+                let pane = unsafe { GetDlgItem(hwnd, 2) };
+                let row = schema::fields(4, 0, &Config::parse(&merged).unwrap(), &merged)
+                    .iter()
+                    .position(|field| field.section == "keys" && field.key == "G")
+                    .ok_or("Guide mapping missing")?;
+                let combo = unsafe { GetDlgItem(pane, BASE + row as i32 * STRIDE) };
+                let mut combo_class = [0u16; 64];
+                let class_len = unsafe { GetClassNameW(combo, combo_class.as_mut_ptr(), 64) };
+                if !String::from_utf16_lossy(&combo_class[..class_len as usize])
+                    .eq_ignore_ascii_case("combobox")
+                {
+                    snapshot(hwnd, &output.join("tooltip-failure.bmp"));
+                    return Err(format!(
+                        "Tooltip target is not a combo: row={row}, hwnd={combo:?}, class={}, status={}",
+                        String::from_utf16_lossy(&combo_class[..class_len as usize]),
+                        caption(unsafe { GetDlgItem(hwnd, 600) })
+                    ));
+                }
+                // Scroll to the row before opening its popup.
+                let mut position = RECT::default();
+                unsafe {
+                    GetWindowRect(combo, &mut position);
+                    MapWindowPoints(null_mut(), pane, (&mut position as *mut RECT).cast(), 2);
+                    PostMessageW(hwnd, SCROLL, (position.top - 120) as usize, pane as isize);
+                }
+                std::thread::sleep(Duration::from_millis(150));
+                send(combo, CB_SHOWDROPDOWN, 1, 0);
+                let mut info = COMBOBOXINFO {
+                    cbSize: size_of::<COMBOBOXINFO>() as u32,
+                    ..Default::default()
+                };
+                unsafe {
+                    GetComboBoxInfo(combo, &mut info);
+                }
+                let index = send(
+                    combo,
+                    CB_FINDSTRINGEXACT,
+                    usize::MAX,
+                    wide("这是一个超过八个汉字的测试分区名称").as_ptr() as isize,
+                );
+                if index < 0 {
+                    return Err("Long action label missing".into());
+                }
+                send(info.hwndList, LB_SETTOPINDEX, index as usize, 0);
+                std::thread::sleep(Duration::from_millis(100));
+                let original_cursor = desktop::cursor()?;
+                let mut item_rect = RECT::default();
+                send(
+                    info.hwndList,
+                    LB_GETITEMRECT,
+                    index as usize,
+                    (&mut item_rect as *mut RECT) as isize,
+                );
+                let mut hover_point = POINT {
+                    x: item_rect.left + 10,
+                    y: (item_rect.top + item_rect.bottom) / 2,
+                };
+                unsafe {
+                    ClientToScreen(info.hwndList, &mut hover_point);
+                    SetCursorPos(hover_point.x, hover_point.y);
+                }
+                std::thread::sleep(Duration::from_millis(650));
+                let tooltip = unsafe { GetWindow(hwnd, GW_HWNDFIRST) };
+                let mut current = tooltip;
+                let mut visible = false;
+                while !current.is_null() {
+                    let mut class = [0u16; 64];
+                    let len = unsafe { GetClassNameW(current, class.as_mut_ptr(), 64) };
+                    if String::from_utf16_lossy(&class[..len as usize]) == "tooltips_class32"
+                        && unsafe { GetWindow(current, GW_OWNER) } == hwnd
+                        && unsafe { IsWindowVisible(current) } != 0
+                    {
+                        visible = true;
+                        break;
+                    }
+                    current = unsafe { GetWindow(current, GW_HWNDNEXT) };
+                }
+                send(combo, CB_SHOWDROPDOWN, 0, 0);
+                unsafe {
+                    SetCursorPos(original_cursor.x, original_cursor.y);
+                }
+                if !visible {
+                    snapshot(hwnd, &output.join("tooltip-failure.bmp"));
+                    return Err(format!(
+                        "Overflow tooltip was not displayed (list={:?}, item={index}, rect={},{},{},{}, owner={:?})",
+                        info.hwndList,
+                        item_rect.left,
+                        item_rect.top,
+                        item_rect.right,
+                        item_rect.bottom,
+                        unsafe { GetPropW(info.hwndList, w!("OwnerCombo")) }
+                    ));
+                }
+                unsafe {
+                    PostMessageW(hwnd, WM_COMMAND, (TAB_BASE + 1) as usize, 0);
+                }
+                wait_tab(hwnd, 1)?;
+                let font_row = schema::fields(1, 0, &Config::parse(&merged).unwrap(), &merged)
+                    .iter()
+                    .position(|field| field.key == "font")
+                    .ok_or("Font field missing")?;
+                let font_combo = unsafe { GetDlgItem(pane, BASE + font_row as i32 * STRIDE) };
+                let mut font_pos = RECT::default();
+                unsafe {
+                    GetWindowRect(font_combo, &mut font_pos);
+                    MapWindowPoints(null_mut(), pane, (&mut font_pos as *mut RECT).cast(), 2);
+                    PostMessageW(hwnd, SCROLL, (font_pos.top - 120) as usize, pane as isize);
+                }
+                std::thread::sleep(Duration::from_millis(150));
+                send(font_combo, CB_SHOWDROPDOWN, 1, 0);
+                std::thread::sleep(Duration::from_millis(100));
+                let mut font_info = COMBOBOXINFO {
+                    cbSize: size_of::<COMBOBOXINFO>() as u32,
+                    ..Default::default()
+                };
+                unsafe {
+                    GetComboBoxInfo(font_combo, &mut font_info);
+                }
+                let top = send(font_info.hwndList, LB_GETTOPINDEX, 0, 0);
+                send(
+                    font_combo,
+                    WM_MOUSEWHEEL,
+                    (-120i16 as u16 as usize) << 16,
+                    0,
+                );
+                if send(font_info.hwndList, LB_GETTOPINDEX, 0, 0) <= top {
+                    return Err("Open font combo did not scroll".into());
+                }
+                send(font_combo, CB_SHOWDROPDOWN, 0, 0);
+                unsafe {
+                    PostMessageW(hwnd, WM_COMMAND, (TAB_BASE + 4) as usize, 0);
+                }
+                wait_tab(hwnd, 4)?;
+                // Repeated wheel input at the boundary must not relayout/recreate controls.
+                unsafe {
+                    PostMessageW(hwnd, SCROLL, 100000, pane as isize);
+                }
+                std::thread::sleep(Duration::from_millis(150));
+                let mut before = RECT::default();
+                unsafe {
+                    GetWindowRect(combo, &mut before);
+                }
+                for _ in 0..12 {
+                    unsafe {
+                        PostMessageW(hwnd, SCROLL, 120, pane as isize);
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(150));
+                let mut after = RECT::default();
+                unsafe {
+                    GetWindowRect(combo, &mut after);
+                }
+                if before.left != after.left || before.top != after.top {
+                    return Err("Scrolling beyond the end moved controls".into());
+                }
+                // Rename a mapping without replacing its editor or changing row order.
+                let name = unsafe { GetDlgItem(pane, BASE + row as i32 * STRIDE + 3) };
+                send(name, EM_SETSEL, 0, -1);
+                send(name, EM_REPLACESEL, 1, w!("F12") as isize);
+                std::thread::sleep(Duration::from_millis(800));
+                if unsafe { GetDlgItem(pane, BASE + row as i32 * STRIDE) } != combo {
+                    return Err("Renaming a mapping recreated its control".into());
+                }
+                // Shared style changes affect both axes, while FPS remains one shared field.
+                unsafe {
+                    PostMessageW(hwnd, WM_COMMAND, (TAB_BASE + 5) as usize, 0);
+                }
+                wait_tab(hwnd, 5)?;
+                unsafe {
+                    PostMessageW(hwnd, WM_COMMAND, AXIS_BOTH as usize, 0);
+                }
+                std::thread::sleep(Duration::from_millis(200));
+                let pane = unsafe { GetDlgItem(hwnd, 2) };
+                let width = unsafe { GetDlgItem(pane, BASE + 2 * STRIDE) };
+                send(width, EM_SETSEL, 0, -1);
+                send(width, EM_REPLACESEL, 1, w!("3") as isize);
+                std::thread::sleep(Duration::from_millis(800));
+                let saved = config::read_settings(&output.join("config.toml"))?
+                    .parse::<DocumentMut>()
+                    .map_err(|e| e.to_string())?;
+                if saved["horizontal"]["width"].as_integer() != Some(3)
+                    || saved["vertical"]["width"].as_integer() != Some(3)
+                {
+                    return Err("Unified axis style did not update both lines".into());
                 }
                 Ok(())
             })();

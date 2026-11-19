@@ -14,6 +14,7 @@ mod preview;
 mod resident;
 mod security;
 mod settings;
+mod settings_paint;
 mod settings_schema;
 mod settings_tooltip;
 mod tray;
