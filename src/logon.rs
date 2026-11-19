@@ -92,13 +92,40 @@ pub fn sync_direct(enabled: bool, elevated: bool, owner: &str) -> Result<(), win
 }
 
 pub fn sync(enabled: bool, elevated: bool) -> Result<(), String> {
+    use std::{
+        io::Read,
+        os::windows::{io::AsRawHandle, process::CommandExt},
+        process::{Command, Stdio},
+    };
     let owner = account()?;
-    match sync_direct(enabled, elevated, &owner) {
-        Ok(()) => Ok(()),
-        Err(error)
-            if error.code() == windows::core::HRESULT::from_win32(5)
-                && unsafe { windows_sys::Win32::UI::Shell::IsUserAnAdmin() } == 0 =>
-        {
+    let mut child = Command::new(std::env::current_exe().map_err(|e| e.to_string())?)
+        .args([
+            "--sync-logon-task",
+            if enabled { "1" } else { "0" },
+            if elevated { "1" } else { "0" },
+            &owner,
+        ])
+        .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    if let Err(error) =
+        crate::wait_process(child.as_raw_handle(), std::time::Duration::from_secs(30))
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    let status = child.wait().map_err(|e| e.to_string())?;
+    let mut error = String::new();
+    if let Some(mut stderr) = child.stderr.take() {
+        let _ = stderr.read_to_string(&mut error);
+    }
+    match status.code() {
+        Some(0) => Ok(()),
+        Some(5) if unsafe { windows_sys::Win32::UI::Shell::IsUserAnAdmin() } == 0 => {
             crate::elevated_helper(&format!(
                 "--sync-logon-task {} {} {}",
                 u8::from(enabled),
@@ -106,7 +133,7 @@ pub fn sync(enabled: bool, elevated: bool) -> Result<(), String> {
                 crate::quote_argument(&owner)
             ))
         }
-        Err(error) => Err(format!("Autostart / 自动启动: {error}")),
+        _ => Err(format!("Autostart / 自动启动: {} ({status})", error.trim())),
     }
 }
 

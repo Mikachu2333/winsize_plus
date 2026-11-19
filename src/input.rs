@@ -3,12 +3,15 @@ use crate::{
     desktop::{self, err},
 };
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     ptr::{null, null_mut},
+    sync::mpsc,
+    thread::JoinHandle,
+    time::Duration,
 };
 use windows_sys::Win32::{
     Foundation::*,
-    System::{LibraryLoader::GetModuleHandleW, Threading::GetCurrentThreadId},
+    System::{LibraryLoader::GetModuleHandleW, Threading::*},
     UI::{Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
 };
 
@@ -70,6 +73,70 @@ struct PointerAction {
     canceled: bool,
 }
 thread_local! {static INPUT:RefCell<Input>=RefCell::new(Input::default());}
+thread_local! {
+    static EVENTS: RefCell<Option<(mpsc::Sender<QueuedEvent>, usize)>> = const { RefCell::new(None) };
+    static INBOX: RefCell<Option<mpsc::Receiver<QueuedEvent>>> = const { RefCell::new(None) };
+    static CURRENT: Cell<Option<(u32, POINT)>> = const { Cell::new(None) };
+    static DRIVER: RefCell<Option<Driver>> = const { RefCell::new(None) };
+}
+const WAKE: u32 = WM_APP + 90;
+struct QueuedEvent {
+    message: u32,
+    wp: usize,
+    lp: isize,
+    point: Option<POINT>,
+}
+/// Consume owned event data only in the outer application loop. A native modal
+/// loop may dispatch the HWND wakeup, but cannot discard the channel's contents.
+pub fn next_event() -> Option<MSG> {
+    let event = INBOX.with_borrow(|inbox| inbox.as_ref()?.try_recv().ok())?;
+    // Leave a wakeup for any backlog after an outer loop's bounded drain, even
+    // when a modal loop already consumed all original wakeup messages.
+    DRIVER.with_borrow(|driver| {
+        if let Some(driver) = driver {
+            unsafe {
+                PostMessageW(driver.window, WAKE, 0, 0);
+            }
+        }
+    });
+    CURRENT.with(|current| current.set(event.point.map(|point| (event.message, point))));
+    Some(MSG {
+        message: event.message,
+        wParam: event.wp,
+        lParam: event.lp,
+        ..Default::default()
+    })
+}
+type Job = Box<dyn FnOnce() + Send>;
+enum Control {
+    Run(Job),
+    Stop,
+}
+struct Driver {
+    commands: mpsc::Sender<Control>,
+    wake: HANDLE,
+    window: HWND,
+}
+fn on_hook<R: Send + 'static>(action: impl FnOnce() -> R + Send + 'static) -> Result<R, String> {
+    DRIVER.with_borrow(|driver| {
+        let Some(driver) = driver else {
+            return Ok(action());
+        };
+        let (send, receive) = mpsc::sync_channel(1);
+        driver
+            .commands
+            .send(Control::Run(Box::new(move || {
+                let _ = send.send(action());
+            })))
+            .map_err(|_| "Input thread stopped".to_owned())?;
+        // SAFETY: Hooks owns the event until the worker has joined; no window messages
+        // or UI-owned references cross this channel.
+        desktop::check(unsafe { SetEvent(driver.wake) })?;
+        receive
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|_| "Input thread did not respond".into())
+    })
+}
 fn mask(text: &str) -> u8 {
     match text {
         "left" => 1,
@@ -82,9 +149,28 @@ fn bit(key: u32) -> (usize, u64) {
     ((key / 64) as usize, 1u64 << (key % 64))
 }
 fn post(message: u32, wp: usize, lp: isize) {
-    unsafe {
-        PostThreadMessageW(GetCurrentThreadId(), message, wp, lp);
-    }
+    post_event(message, wp, lp, None);
+}
+fn post_event(message: u32, wp: usize, lp: isize, point: Option<POINT>) -> bool {
+    EVENTS.with_borrow(|events| {
+        let Some((send, hwnd)) = events else {
+            return false;
+        };
+        if send
+            .send(QueuedEvent {
+                message,
+                wp,
+                lp,
+                point,
+            })
+            .is_err()
+        {
+            return false;
+        }
+        // Only integers cross the window-message boundary. On queue saturation the
+        // next outer-loop drain still reads the owned event; MOVE can retry waking.
+        unsafe { PostMessageW(*hwnd as HWND, WAKE, 0, 0) != 0 }
+    })
 }
 impl Input {
     fn update_mouse(&mut self) -> Result<(), String> {
@@ -319,13 +405,11 @@ unsafe extern "system" fn mouse(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
                             if let Some(mut drag) = input.drag
                                 && drag.draggable && !drag.canceled && !drag.active && ((data.pt.x as i64 - drag.start.x as i64).abs() >= GetSystemMetrics(SM_CXDRAG) as i64 || (data.pt.y as i64 - drag.start.y as i64).abs() >= GetSystemMetrics(SM_CYDRAG) as i64) {
                                     drag.active = true;
-                                    DRAG_ORIGIN.with(|origin| origin.set(drag.start));
-                                    post(DRAG_START, input.gesture_target as usize, isize::from(drag.resize));
+                                    post_event(DRAG_START, input.gesture_target as usize, isize::from(drag.resize), Some(drag.start));
                                     input.drag = Some(drag);
                                 }
                             if !input.queued {
-                                input.queued = true;
-                                post(MOVE, 0, 0)
+                                input.queued = post_event(MOVE, 0, 0, None);
                             }
                             false
                         }
@@ -335,10 +419,9 @@ unsafe extern "system" fn mouse(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
                                 let drag = input.drag.take().unwrap();
                                 input.point = data.pt;
                                 if drag.canceled { /* Consume the matching release without a click. */ }
-                                else if drag.active { post(DRAG_END, 0, 0); }
+                                else if drag.active { post_event(DRAG_END, 0, 0, Some(data.pt)); }
                                 else if button == 2 {
-                                    CLICK_POS.with(|point| point.set((data.pt, input.gesture_target)));
-                                    post(CLICK, input.gesture_target as usize, pack(data.pt));
+                                    post_event(CLICK, input.gesture_target as usize, 0, Some(data.pt));
                                 }
                                 let _ = input.update_mouse();
                                 return true;
@@ -368,13 +451,12 @@ unsafe extern "system" fn mouse(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
         CallNextHookEx(null_mut(), code, wp, lp)
     }
 }
-thread_local! {static CLICK_POS:std::cell::Cell<(POINT,HWND)>=Default::default();}
-thread_local! {static DRAG_ORIGIN:std::cell::Cell<POINT>=Default::default();}
 pub fn drag_origin() -> POINT {
-    DRAG_ORIGIN.with(|origin| origin.get())
-}
-fn pack(point: POINT) -> isize {
-    ((point.x as u32 as u64) | ((point.y as u32 as u64) << 32)) as isize
+    CURRENT
+        .with(Cell::get)
+        .filter(|(kind, _)| *kind == DRAG_START)
+        .map(|(_, point)| point)
+        .unwrap_or_default()
 }
 fn mouse_button(message: u32, data: u32) -> Option<(u32, bool)> {
     Some(match message {
@@ -392,108 +474,307 @@ fn mouse_button(message: u32, data: u32) -> Option<(u32, bool)> {
     })
 }
 pub fn tip_visible(visible: bool) {
-    INPUT.with_borrow_mut(|input| input.tip_visible = visible);
+    let _ = on_hook(move || INPUT.with_borrow_mut(|input| input.tip_visible = visible));
 }
-pub fn click_point(packed: isize) -> POINT {
-    if usize::BITS >= 64 {
-        POINT {
-            x: packed as i32,
-            y: ((packed as u64) >> 32) as i32,
-        }
-    } else {
-        CLICK_POS.with(|point| point.get().0)
-    }
+pub fn click_point() -> POINT {
+    CURRENT
+        .with(Cell::get)
+        .filter(|(kind, _)| *kind == CLICK)
+        .map(|(_, point)| point)
+        .unwrap_or_default()
 }
 pub fn moved() -> POINT {
-    INPUT.with_borrow_mut(|input| {
-        input.queued = false;
-        input.point
+    if let Some((DRAG_END, point)) = CURRENT.with(Cell::get) {
+        return point;
+    }
+    on_hook(|| {
+        INPUT.with_borrow_mut(|input| {
+            input.queued = false;
+            input.point
+        })
     })
+    .unwrap_or_else(|_| desktop::cursor().unwrap_or_default())
 }
 pub fn cancel() {
-    INPUT.with_borrow_mut(|input| {
-        input.mode = Mode::Idle;
-        if let Some(drag) = &mut input.drag {
-            drag.canceled = true;
-        }
-    })
+    let _ = on_hook(|| {
+        INPUT.with_borrow_mut(|input| {
+            input.mode = Mode::Idle;
+            if let Some(drag) = &mut input.drag {
+                drag.canceled = true;
+            }
+        })
+    });
 }
 pub fn alt_held() -> bool {
-    INPUT.with_borrow(|input| input.pressed & (input.alt_mask | input.gesture_mask) != 0)
+    on_hook(|| {
+        INPUT.with_borrow(|input| input.pressed & (input.alt_mask | input.gesture_mask) != 0)
+    })
+    .unwrap_or(false)
 }
 pub fn command_mode() {
-    INPUT.with_borrow_mut(|input| input.mode = Mode::Command);
+    let _ = on_hook(|| INPUT.with_borrow_mut(|input| input.mode = Mode::Command));
 }
 pub fn set_guides(on: bool) -> Result<(), String> {
-    INPUT.with_borrow_mut(|input| {
-        input.guides = on;
-        input.update_mouse()
-    })
+    on_hook(move || {
+        INPUT.with_borrow_mut(|input| {
+            input.guides = on;
+            input.update_mouse()
+        })
+    })?
 }
 pub fn track_preview(on: bool) -> Result<(), String> {
-    INPUT.with_borrow_mut(|input| {
-        input.preview_tracking = on;
-        input.update_mouse()
-    })
+    on_hook(move || {
+        INPUT.with_borrow_mut(|input| {
+            input.preview_tracking = on;
+            input.update_mouse()
+        })
+    })?
 }
 pub fn configure(cfg: &Config) -> Result<(), String> {
-    INPUT.with_borrow_mut(|input| {
-        input.mode = Mode::Idle;
-        input.tap = None;
-        input.last_tap = None;
-        input.alt_mask = mask(&cfg.alt);
-        input.gesture_mask = mask(&cfg.gesture);
-        input.preview_enabled = cfg.preview;
-        input.exclusions = cfg.exclusions.clone();
-        input.move_button = cfg.move_button;
-        input.resize_button = cfg.resize_button;
-        input.double_ms = cfg.double_ms;
-        input.command = [0; 4];
-        input.bound = [0; 4];
-        for (key, action) in &cfg.keys {
-            let (index, flag) = bit(*key);
-            input.bound[index] |= flag;
-            if action == "command" {
-                input.command[index] |= flag;
+    let (alt, gesture, preview, exclusions, move_button, resize_button, double_ms) = (
+        mask(&cfg.alt),
+        mask(&cfg.gesture),
+        cfg.preview,
+        cfg.exclusions.clone(),
+        cfg.move_button,
+        cfg.resize_button,
+        cfg.double_ms,
+    );
+    let keys = cfg.keys.clone();
+    on_hook(move || {
+        INPUT.with_borrow_mut(|input| {
+            input.mode = Mode::Idle;
+            input.tap = None;
+            input.last_tap = None;
+            input.alt_mask = alt;
+            input.gesture_mask = gesture;
+            input.preview_enabled = preview;
+            input.exclusions = exclusions;
+            input.move_button = move_button;
+            input.resize_button = resize_button;
+            input.double_ms = double_ms;
+            input.command = [0; 4];
+            input.bound = [0; 4];
+            for (key, action) in &keys {
+                let (index, flag) = bit(*key);
+                input.bound[index] |= flag;
+                if action == "command" {
+                    input.command[index] |= flag;
+                }
             }
-        }
-        input.update_mouse()
-    })
+            input.update_mouse()
+        })
+    })?
 }
-pub struct Hooks(HHOOK);
+pub struct Hooks {
+    worker: Option<JoinHandle<()>>,
+    // Raw handles also prevent moving this UI-thread guard to another thread.
+    wake: HANDLE,
+    window: HWND,
+}
 impl Hooks {
     pub fn escape_only() -> Result<Self, String> {
-        let hook = unsafe {
-            SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard), GetModuleHandleW(null()), 0)
-        };
-        if hook.is_null() {
-            Err(err())
-        } else {
-            Ok(Self(hook))
+        if DRIVER.with_borrow(Option::is_some) {
+            return Err("Input hooks already running on this UI thread".into());
         }
+        // A message-only window gives notifications a destination native modal
+        // loops can dispatch, without executing application code reentrantly.
+        let window = unsafe {
+            CreateWindowExW(
+                0,
+                windows_sys::core::w!("STATIC"),
+                null(),
+                0,
+                0,
+                0,
+                0,
+                0,
+                HWND_MESSAGE,
+                null_mut(),
+                GetModuleHandleW(null()),
+                null(),
+            )
+        };
+        if window.is_null() {
+            return Err(err());
+        }
+        let wake = unsafe { CreateEventW(null(), 0, 0, null()) };
+        if wake.is_null() {
+            unsafe {
+                DestroyWindow(window);
+            }
+            return Err(err());
+        }
+        let (send_events, receive_events) = mpsc::channel();
+        let destination = window as usize;
+        let event = wake as usize;
+        let (commands, receive) = mpsc::channel();
+        let (ready, started) = mpsc::sync_channel(1);
+        let worker = std::thread::Builder::new()
+            .name("winsizep-input".into())
+            .spawn(move || {
+                EVENTS.with_borrow_mut(|events| *events = Some((send_events, destination)));
+                // SAFETY: both hooks are installed, pumped and removed on this worker.
+                unsafe {
+                    let hook = SetWindowsHookExW(
+                        WH_KEYBOARD_LL,
+                        Some(keyboard),
+                        GetModuleHandleW(null()),
+                        0,
+                    );
+                    if hook.is_null() {
+                        let _ = ready.send(Err(err()));
+                        return;
+                    }
+                    let _ = ready.send(Ok(()));
+                    'pump: loop {
+                        match MsgWaitForMultipleObjectsEx(
+                            1,
+                            &(event as HANDLE),
+                            INFINITE,
+                            QS_ALLINPUT,
+                            MWMO_INPUTAVAILABLE,
+                        ) {
+                            WAIT_OBJECT_0 => {
+                                while let Ok(command) = receive.try_recv() {
+                                    match command {
+                                        Control::Run(action) => action(),
+                                        Control::Stop => break 'pump,
+                                    }
+                                }
+                            }
+                            value if value == WAIT_OBJECT_0 + 1 => {
+                                let mut msg = MSG::default();
+                                for _ in 0..64 {
+                                    if PeekMessageW(&mut msg, null_mut(), 0, 0, PM_REMOVE) == 0 {
+                                        break;
+                                    }
+                                    if msg.message == WM_QUIT {
+                                        break 'pump;
+                                    }
+                                    DispatchMessageW(&msg);
+                                }
+                            }
+                            _ => break,
+                        }
+                    }
+                    UnhookWindowsHookEx(hook);
+                    INPUT.with_borrow_mut(|input| {
+                        if !input.mouse.is_null() {
+                            UnhookWindowsHookEx(input.mouse);
+                        }
+                        *input = Input::default();
+                    });
+                }
+            });
+        let worker = match worker {
+            Ok(worker) => worker,
+            Err(error) => {
+                unsafe {
+                    CloseHandle(wake);
+                    DestroyWindow(window);
+                }
+                return Err(error.to_string());
+            }
+        };
+        DRIVER.with_borrow_mut(|driver| {
+            *driver = Some(Driver {
+                commands,
+                wake,
+                window,
+            })
+        });
+        INBOX.with_borrow_mut(|inbox| *inbox = Some(receive_events));
+        let hooks = Self {
+            worker: Some(worker),
+            wake,
+            window,
+        };
+        started
+            .recv()
+            .map_err(|_| "Input thread failed to start".to_owned())??;
+        Ok(hooks)
     }
     pub fn start(cfg: &Config) -> Result<Self, String> {
+        let hooks = Self::escape_only()?;
         configure(cfg)?;
-        let hook = unsafe {
-            SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard), GetModuleHandleW(null()), 0)
-        };
-        if hook.is_null() {
-            Err(err())
-        } else {
-            Ok(Self(hook))
-        }
+        Ok(hooks)
     }
 }
 impl Drop for Hooks {
     fn drop(&mut self) {
-        unsafe {
-            UnhookWindowsHookEx(self.0);
-            INPUT.with_borrow_mut(|input| {
-                if !input.mouse.is_null() {
-                    UnhookWindowsHookEx(input.mouse);
+        DRIVER.with_borrow_mut(|driver| {
+            if let Some(driver) = driver.take() {
+                let _ = driver.commands.send(Control::Stop);
+                unsafe {
+                    SetEvent(driver.wake);
                 }
-                *input = Input::default();
-            });
+            }
+        });
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
         }
+        unsafe {
+            CloseHandle(self.wake);
+            DestroyWindow(self.window);
+        }
+        INBOX.with_borrow_mut(|inbox| {
+            inbox.take();
+        });
+        CURRENT.with(|current| current.set(None));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn modal_dispatch_preserves_input_events_and_their_coordinates() {
+        let hooks = super::Hooks::escape_only().unwrap();
+        super::on_hook(|| {
+            assert!(super::post_event(
+                super::CLICK,
+                17,
+                0,
+                Some(super::POINT {
+                    x: -80000,
+                    y: 90000
+                })
+            ));
+            assert!(super::post_event(
+                super::CLICK,
+                18,
+                0,
+                Some(super::POINT { x: 3, y: 4 })
+            ));
+        })
+        .unwrap();
+        // Simulate a native loop: it dispatches only HWND messages and knows
+        // nothing about the application's input protocol.
+        unsafe {
+            let mut msg = super::MSG::default();
+            while super::PeekMessageW(&mut msg, hooks.window, 0, 0, super::PM_REMOVE) != 0 {
+                super::DispatchMessageW(&msg);
+            }
+        }
+        assert_eq!(super::next_event().unwrap().wParam, 17);
+        let first = super::click_point();
+        assert_eq!((first.x, first.y), (-80000, 90000));
+        assert_eq!(super::next_event().unwrap().wParam, 18);
+        let second = super::click_point();
+        assert_eq!((second.x, second.y), (3, 4));
+        assert!(super::next_event().is_none());
+    }
+    #[test]
+    fn hook_worker_keeps_pumping_while_the_ui_is_busy() {
+        let _hooks = super::Hooks::escape_only().unwrap();
+        let worker_id = super::on_hook(|| unsafe {
+            windows_sys::Win32::System::Threading::GetCurrentThreadId()
+        })
+        .unwrap();
+        assert_ne!(worker_id, unsafe {
+            windows_sys::Win32::System::Threading::GetCurrentThreadId()
+        });
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        assert_eq!(super::on_hook(|| 42).unwrap(), 42);
     }
 }

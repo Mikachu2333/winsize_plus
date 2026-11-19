@@ -123,7 +123,8 @@ impl App {
         self.snapshot = Some(loaded.bytes);
         let sync_task =
             !automatic || (cfg.autostart, cfg.elevate) != (self.cfg.autostart, self.cfg.elevate);
-        let mut restart = automatic && cfg.elevate != self.cfg.elevate;
+        let mut restart =
+            cfg.elevate != (unsafe { windows_sys::Win32::UI::Shell::IsUserAnAdmin() } != 0);
         let mut startup_error = None;
         if sync_task && let Err(error) = crate::logon::sync(cfg.autostart, cfg.elevate) {
             // Keep independent settings working when consent is canceled; retry startup on
@@ -297,6 +298,16 @@ impl App {
         self.overlay.tip(&format!(": {}▏", self.command), &self.cfg)
     }
     fn event(&mut self, msg: MSG) -> Result<(), String> {
+        self.handle_event(msg)?;
+        for _ in 0..64 {
+            let Some(event) = input::next_event() else {
+                break;
+            };
+            self.handle_event(event)?;
+        }
+        Ok(())
+    }
+    fn handle_event(&mut self, msg: MSG) -> Result<(), String> {
         match msg.message {
             crate::tray::MENU => {
                 if let Some(action) = self.tray.menu(&self.cfg, msg.lParam)? {
@@ -339,7 +350,7 @@ impl App {
             input::CLICK => {
                 self.close_preview()?;
                 self.clear();
-                let point = input::click_point(msg.lParam);
+                let point = input::click_point();
                 let screen = desktop::screen(point, 0)?;
                 let cell = screen.full.grid(point.x, point.y) as u32 + 1;
                 if let Some(preset) = self.cfg.cell(screen.number, cell) {
@@ -377,10 +388,14 @@ impl App {
                 self.follow_frame(desktop::cursor()?)
             }
             input::DRAG_END => {
-                self.follow_frame(input::moved())?;
-                self.drag = None;
+                let drag = self.drag.take();
                 self.frames.reset(self.cfg.fps);
-                Ok(())
+                let point = input::moved();
+                // End the gesture even if its final move fails (closed target,
+                // denied operation or drawing error). A failure must not re-arm it.
+                let moved = drag.as_ref().map_or(Ok(()), |drag| drag.follow(point));
+                let drawn = self.overlay.follow(point, &self.cfg);
+                moved.and(drawn)
             }
             input::CANCEL => {
                 input::cancel();
@@ -475,7 +490,7 @@ pub fn running() -> bool {
         true
     }
 }
-pub fn run(path: &Path) -> Result<crate::ResidentExit, String> {
+pub fn run(path: &Path, recovery: Option<&str>) -> Result<crate::ResidentExit, String> {
     unsafe {
         let handle = CreateMutexW(null(), 0, w!("Local\\D5C9A59069D907909B153C76CEBDC023"));
         if handle.is_null() {
@@ -499,7 +514,12 @@ pub fn run(path: &Path) -> Result<crate::ResidentExit, String> {
         }
         let watch = Watch(watch);
         let loaded = config::load_snapshot(path, None)?;
-        let cfg = loaded.config;
+        let mut cfg = loaded.config;
+        if recovery.is_some() {
+            // A failed handoff resumes this process at its original integrity level.
+            // Keep the requested file untouched so an explicit reload can retry.
+            cfg.elevate = windows_sys::Win32::UI::Shell::IsUserAnAdmin() != 0;
+        }
         let snapshot = Some(loaded.bytes);
         let overlay = Overlay::new()?;
         let _hooks = input::Hooks::start(&cfg)?;
@@ -523,12 +543,22 @@ pub fn run(path: &Path) -> Result<crate::ResidentExit, String> {
             exit: None,
         };
         let mut msg = MSG::default();
-        if let Err(problem) = crate::logon::sync(app.cfg.autostart, app.cfg.elevate) {
+        if let Some(problem) = recovery {
+            app.notice(problem)?;
+        } else if let Err(problem) = crate::logon::sync(app.cfg.autostart, app.cfg.elevate) {
             app.notice(&problem)?;
         } else if !app.cfg.warnings.is_empty() {
             app.config_notice()?;
         }
         loop {
+            for _ in 0..64 {
+                let Some(event) = input::next_event() else {
+                    break;
+                };
+                if let Err(problem) = app.handle_event(event) {
+                    let _ = app.notice(&problem);
+                }
+            }
             if let Err(problem) = app.deadlines() {
                 let _ = app.notice(&problem);
             }

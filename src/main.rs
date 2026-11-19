@@ -31,11 +31,7 @@ use windows_sys::{
         Foundation::*,
         Security::*,
         System::{Recovery::RegisterApplicationRestart, Threading::*},
-        UI::{
-            HiDpi::*,
-            Shell::*,
-            WindowsAndMessaging::{GetShellWindow, GetWindowThreadProcessId, SW_HIDE},
-        },
+        UI::{HiDpi::*, Shell::*, WindowsAndMessaging::*},
     },
     core::w,
 };
@@ -43,6 +39,28 @@ use windows_sys::{
 pub enum ResidentExit {
     Quit,
     Restart(Option<bool>),
+}
+
+/// Keep this process available until a restart has been accepted. In particular,
+/// denied UAC must return to a functioning resident instead of terminating it.
+fn supervise_resident(
+    mut run: impl FnMut(Option<&str>) -> Result<ResidentExit, String>,
+    mut restart: impl FnMut(Option<bool>) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut recovery = None;
+    loop {
+        match run(recovery.as_deref())? {
+            ResidentExit::Quit => return Ok(()),
+            ResidentExit::Restart(elevation) => match restart(elevation) {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    recovery = Some(format!(
+                        "Restart failed; previous permissions restored / 重启失败，已恢复原权限运行: {error}"
+                    ))
+                }
+            },
+        }
+    }
 }
 
 pub fn quote_argument(text: &str) -> String {
@@ -85,7 +103,14 @@ pub fn elevated_helper(parameters: &str) -> Result<(), String> {
         if info.hProcess.is_null() {
             return Err("UAC: no helper process / 未启动权限助手".into());
         }
-        WaitForSingleObject(info.hProcess, INFINITE);
+        let waited = wait_process(info.hProcess, std::time::Duration::from_secs(30));
+        if let Err(error) = waited {
+            // Only terminate the helper we just created; prevent a timed-out task
+            // update from committing after a later user edit.
+            TerminateProcess(info.hProcess, 1);
+            CloseHandle(info.hProcess);
+            return Err(error);
+        }
         let mut code = 1;
         let ok = GetExitCodeProcess(info.hProcess, &mut code);
         CloseHandle(info.hProcess);
@@ -96,6 +121,54 @@ pub fn elevated_helper(parameters: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Wait for our child without starving owned windows or waiting indefinitely.
+pub fn wait_process(process: HANDLE, timeout: std::time::Duration) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut deferred = Vec::new();
+    let result = loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break Err("Helper timed out / 助手进程超时".into());
+        }
+        // SAFETY: the process handle is owned by the caller until this returns.
+        unsafe {
+            match MsgWaitForMultipleObjectsEx(
+                1,
+                &process,
+                remaining.as_millis().min(100) as u32,
+                QS_ALLINPUT,
+                MWMO_INPUTAVAILABLE,
+            ) {
+                WAIT_OBJECT_0 => break Ok(()),
+                n if n == WAIT_OBJECT_0 + 1 => {
+                    let mut msg = MSG::default();
+                    for _ in 0..64 {
+                        if PeekMessageW(&mut msg, null_mut(), 0, 0, PM_REMOVE) == 0 {
+                            break;
+                        }
+                        if msg.hwnd.is_null() {
+                            deferred.push(msg);
+                        } else {
+                            TranslateMessage(&msg);
+                            DispatchMessageW(&msg);
+                        }
+                    }
+                }
+                WAIT_TIMEOUT => {}
+                _ => break Err(desktop::err()),
+            }
+        }
+    };
+    // The outer loop owns application thread messages. Preserve them while a
+    // synchronous helper is pending instead of discarding them in DispatchMessage.
+    for msg in deferred {
+        unsafe {
+            PostThreadMessageW(GetCurrentThreadId(), msg.message, msg.wParam, msg.lParam);
+        }
+    }
+    result
 }
 
 fn launch_unelevated() -> Result<(), String> {
@@ -291,8 +364,17 @@ fn execute(args: &[String]) -> Result<(), String> {
         ["--sync-logon-task", enabled, elevated, owner]
             if matches!(*enabled, "0" | "1") && matches!(*elevated, "0" | "1") =>
         {
-            return logon::sync_direct(*enabled == "1", *elevated == "1", owner)
-                .map_err(|error| error.to_string());
+            if let Err(error) = logon::sync_direct(*enabled == "1", *elevated == "1", owner) {
+                eprintln!("{error}");
+                // Private helper protocol: the parent may request consent only for
+                // access denial, not for malformed XML or an unavailable service.
+                std::process::exit(if error.code() == windows::core::HRESULT::from_win32(5) {
+                    5
+                } else {
+                    1
+                });
+            }
+            return Ok(());
         }
         ["--check"] => {
             let cfg = config::load(&path, None)?;
@@ -317,13 +399,16 @@ fn execute(args: &[String]) -> Result<(), String> {
             unsafe {
                 RegisterApplicationRestart(w!("--resident"), 0);
             }
-            match resident::run(&path)? {
-                ResidentExit::Quit => {}
-                ResidentExit::Restart(Some(false)) if unsafe { IsUserAnAdmin() } != 0 => {
-                    return launch_unelevated();
-                }
-                ResidentExit::Restart(elevation) => return launch(elevation.unwrap_or(false)),
-            }
+            return supervise_resident(
+                |recovery| resident::run(&path, recovery),
+                |elevation| {
+                    if elevation == Some(false) && unsafe { IsUserAnAdmin() } != 0 {
+                        launch_unelevated()
+                    } else {
+                        launch(elevation.unwrap_or(false))
+                    }
+                },
+            );
         }
         _ => {
             let req = cli::parse(&args)?;
@@ -340,6 +425,21 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("WinSizeP: {err}");
+            if std::env::args()
+                .nth(1)
+                .is_none_or(|arg| matches!(arg.as_str(), "--resident" | "--settings"))
+            {
+                // Background launches intentionally have no stderr. Show failures
+                // where the user can see them rather than silently losing the tray.
+                unsafe {
+                    MessageBoxW(
+                        null_mut(),
+                        desktop::wide(&err).as_ptr(),
+                        w!("WinSizeP"),
+                        MB_OK | MB_ICONERROR,
+                    );
+                }
+            }
             ExitCode::FAILURE
         }
     }
@@ -347,6 +447,30 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn denied_elevation_resumes_the_resident_with_a_visible_error() {
+        let mut runs = 0;
+        let mut requests = 0;
+        super::supervise_resident(
+            |recovery| {
+                runs += 1;
+                if runs == 1 {
+                    assert!(recovery.is_none());
+                    Ok(super::ResidentExit::Restart(Some(true)))
+                } else {
+                    assert!(recovery.unwrap().contains("UAC canceled"));
+                    Ok(super::ResidentExit::Quit)
+                }
+            },
+            |elevation| {
+                requests += 1;
+                assert_eq!(elevation, Some(true));
+                Err("UAC canceled".into())
+            },
+        )
+        .unwrap();
+        assert_eq!((runs, requests), (2, 1));
+    }
     #[test]
     fn quotes_windows_paths_without_losing_backslashes_or_quotes() {
         assert_eq!(

@@ -58,7 +58,7 @@ pub fn open() -> Result<(), String> {
     unsafe {
         let existing = FindWindowW(CLASS, null());
         if !existing.is_null() {
-            ShowWindow(existing, SW_RESTORE);
+            ShowWindowAsync(existing, SW_RESTORE);
             SetForegroundWindow(existing);
             return Ok(());
         }
@@ -2537,6 +2537,16 @@ pub fn run(path: &Path) -> Result<(), String> {
 fn message_loop(hwnd: HWND, timer: HANDLE) -> Result<(), String> {
     unsafe {
         loop {
+            for _ in 0..64 {
+                let Some(msg) = input::next_event() else {
+                    break;
+                };
+                match msg.message {
+                    input::MOVE => with_editor(|e| e.moved(input::moved())),
+                    input::CANCEL => with_editor(|e| e.escape()),
+                    _ => {}
+                }
+            }
             match MsgWaitForMultipleObjectsEx(1, &timer, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE)
             {
                 WAIT_OBJECT_0 => with_editor(|e| {
