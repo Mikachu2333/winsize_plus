@@ -448,6 +448,16 @@ pub fn configure(cfg: &Config) -> Result<(), String> {
 }
 pub struct Hooks(HHOOK);
 impl Hooks {
+    pub fn escape_only() -> Result<Self, String> {
+        let hook = unsafe {
+            SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard), GetModuleHandleW(null()), 0)
+        };
+        if hook.is_null() {
+            Err(err())
+        } else {
+            Ok(Self(hook))
+        }
+    }
     pub fn start(cfg: &Config) -> Result<Self, String> {
         configure(cfg)?;
         let hook = unsafe {

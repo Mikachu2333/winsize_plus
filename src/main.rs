@@ -12,6 +12,8 @@ mod overlay;
 mod preview;
 mod resident;
 mod settings;
+mod settings_schema;
+mod settings_tooltip;
 mod tray;
 
 use std::{

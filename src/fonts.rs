@@ -46,6 +46,16 @@ impl Font {
         bold: bool,
         italic: bool,
     ) -> Result<Self, String> {
+        Self::with_quality(family, points, dpi, bold, italic, CLEARTYPE_QUALITY)
+    }
+    fn with_quality(
+        family: &str,
+        points: i32,
+        dpi: i32,
+        bold: bool,
+        italic: bool,
+        quality: u8,
+    ) -> Result<Self, String> {
         let mut face = system_face(dpi);
         if !family.eq_ignore_ascii_case("SystemFont") {
             face.lfFaceName = [0; 32];
@@ -62,7 +72,7 @@ impl Font {
             FW_NORMAL as i32
         };
         face.lfItalic = u8::from(italic);
-        face.lfQuality = ANTIALIASED_QUALITY;
+        face.lfQuality = quality;
         let handle = unsafe { CreateFontIndirectW(&face) };
         if handle.is_null() {
             Err(err())
@@ -133,7 +143,15 @@ impl Fonts {
             .chain(fallbacks.iter().take(3).map(String::as_str))
             .chain(std::iter::once("SystemFont"))
         {
-            fonts.push(Font::new(name, size, dpi, bold, italic)?);
+            // Transparent overlay text needs grayscale edges; opaque settings use ClearType.
+            fonts.push(Font::with_quality(
+                name,
+                size,
+                dpi,
+                bold,
+                italic,
+                ANTIALIASED_QUALITY,
+            )?);
         }
         Ok(Self(fonts))
     }
