@@ -87,13 +87,18 @@ impl App {
         self.refresh_preview()?;
         self.status(&self.cfg.show.clone())?;
         // The default tip and outlines share one deadline, including a hidden default tip.
-        self.preview_until = Some(self.hide.unwrap_or_else(|| later(self.cfg.duration)));
+        self.preview_until = (!self.overlay.tip_scrollable())
+            .then(|| self.hide.unwrap_or_else(|| later(self.cfg.duration)));
         self.preview_check = Some(later(100));
         Ok(())
     }
     fn notice(&mut self, text: &str) -> Result<(), String> {
         self.hide = Some(later(self.cfg.duration));
-        self.overlay.tip(text, &self.cfg)
+        self.overlay.tip(text, &self.cfg)?;
+        if self.overlay.tip_scrollable() {
+            self.hide = None;
+        }
+        Ok(())
     }
     fn status(&mut self, kind: &str) -> Result<(), String> {
         match kind {
@@ -309,6 +314,12 @@ impl App {
     }
     fn handle_event(&mut self, msg: MSG) -> Result<(), String> {
         match msg.message {
+            input::TIP_SCROLL => {
+                self.overlay.scroll_tip(msg.wParam as i32);
+                self.hide = None;
+                self.preview_until = None;
+                Ok(())
+            }
             input::DISPLAY_CHANGED => {
                 self.overlay.follow(desktop::cursor()?, &self.cfg)?;
                 self.preview.tick(&self.cfg)

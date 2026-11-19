@@ -2563,6 +2563,10 @@ fn message_loop(hwnd: HWND, timer: HANDLE) -> Result<(), String> {
                     break;
                 };
                 match msg.message {
+                    input::TIP_SCROLL => with_editor(|e| {
+                        e.overlay.scroll_tip(msg.wParam as i32);
+                        Ok(())
+                    }),
                     input::DISPLAY_CHANGED => with_editor(|e| e.render()),
                     input::MOVE => with_editor(|e| e.moved(input::moved())),
                     input::CANCEL => with_editor(|e| e.escape()),

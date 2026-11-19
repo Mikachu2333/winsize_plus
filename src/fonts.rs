@@ -187,6 +187,11 @@ struct Run {
     text: Vec<u16>,
     width: i32,
 }
+impl Run {
+    fn is_tab(&self) -> bool {
+        self.text == [b'\t' as u16]
+    }
+}
 struct Line {
     runs: Vec<Run>,
     width: i32,
@@ -221,11 +226,19 @@ impl TextLayout {
         };
         let mut previous = null_mut();
         let mut descent = 0;
+        let text = text.replace('\r', "");
+        let tabbed_lines: Vec<_> = text.split('\n').map(|line| line.contains('\t')).collect();
+        let mut line_number = 0;
+        let mut gap = 1;
+        // SAFETY: the owned fonts and UTF-16 buffers remain alive during synchronous GDI calls.
         unsafe {
             for (index, font) in layout.fonts.0.iter().enumerate() {
                 let old = SelectObject(dc, font.0);
                 if index == 0 {
                     previous = old;
+                    let mut size = SIZE::default();
+                    GetTextExtentPoint32W(dc, [32u16, 32].as_ptr(), 2, &mut size);
+                    gap = size.cx.max(1);
                 }
                 let mut metrics = TEXTMETRICW::default();
                 GetTextMetricsW(dc, &mut metrics);
@@ -237,13 +250,22 @@ impl TextLayout {
                 descent = descent.max(metrics.tmDescent + metrics.tmExternalLeading);
             }
             layout.line_height = layout.line_height.max(layout.baseline + descent);
-            for ch in text.replace('\r', "").chars() {
+            for ch in text.chars() {
                 if ch == '\n' {
                     layout.lines.push(line);
                     line = Line {
                         runs: Vec::new(),
                         width: 0,
                     };
+                    line_number += 1;
+                    continue;
+                }
+                if ch == '\t' {
+                    line.runs.push(Run {
+                        font: 0,
+                        text: vec![9],
+                        width: 0,
+                    });
                     continue;
                 }
                 let mut units = [0u16; 2];
@@ -268,14 +290,21 @@ impl TextLayout {
                 SelectObject(dc, layout.fonts.0[selected].0);
                 let mut size = SIZE::default();
                 GetTextExtentPoint32W(dc, units.as_ptr(), units.len() as i32, &mut size);
-                if line.width > 0 && line.width + size.cx > max_width.max(1) {
+                if !tabbed_lines[line_number]
+                    && line.width > 0
+                    && line.width + size.cx > max_width.max(1)
+                {
                     layout.lines.push(line);
                     line = Line {
                         runs: Vec::new(),
                         width: 0,
                     };
                 }
-                if let Some(run) = line.runs.last_mut().filter(|run| run.font == selected) {
+                if let Some(run) = line
+                    .runs
+                    .last_mut()
+                    .filter(|run| run.font == selected && !run.is_tab())
+                {
                     run.text.extend_from_slice(units);
                     run.width += size.cx;
                 } else {
@@ -294,10 +323,16 @@ impl TextLayout {
         // Measure complete runs using the same shaping/kerning as TextOutW.
         unsafe {
             let dc = GetDC(null_mut());
+            if dc.is_null() {
+                return Err(err());
+            }
             let old = SelectObject(dc, layout.fonts.0[0].0);
             for line in &mut layout.lines {
                 line.width = 0;
                 for run in &mut line.runs {
+                    if run.is_tab() {
+                        continue;
+                    }
                     SelectObject(dc, layout.fonts.0[run.font].0);
                     let mut size = SIZE::default();
                     GetTextExtentPoint32W(dc, run.text.as_ptr(), run.text.len() as i32, &mut size);
@@ -305,6 +340,100 @@ impl TextLayout {
                     line.width += size.cx;
                 }
             }
+            // Each consecutive group of tabbed lines is a table. Measure columns independently,
+            // so short key names never inherit the wider spacing needed by region names.
+            let mut start = 0;
+            while start < layout.lines.len() {
+                if !layout.lines[start].runs.iter().any(Run::is_tab) {
+                    start += 1;
+                    continue;
+                }
+                let end = start
+                    + layout.lines[start..]
+                        .iter()
+                        .take_while(|line| line.runs.iter().any(Run::is_tab))
+                        .count();
+                let mut widths = Vec::<i32>::new();
+                for line in &layout.lines[start..end] {
+                    let (mut column, mut width) = (0, 0);
+                    for run in &line.runs {
+                        if run.is_tab() {
+                            if column == widths.len() {
+                                widths.push(0);
+                            }
+                            widths[column] = widths[column].max(width);
+                            column += 1;
+                            width = 0;
+                        } else {
+                            width += run.width;
+                        }
+                    }
+                    if column == widths.len() {
+                        widths.push(width);
+                    } else {
+                        widths[column] = widths[column].max(width);
+                    }
+                }
+                for line in &mut layout.lines[start..end] {
+                    let (mut column, mut width) = (0, 0);
+                    for run in &mut line.runs {
+                        if run.is_tab() {
+                            run.width = widths[column] - width + gap;
+                            column += 1;
+                            width = 0;
+                        } else {
+                            width += run.width;
+                        }
+                    }
+                    line.width = line.runs.iter().map(|run| run.width).sum();
+                }
+                start = end;
+            }
+            // Very wide tables must remain readable on small screens: wrap their text and
+            // reduce tab padding on overflow, instead of clipping the region names.
+            let max_width = max_width.max(1);
+            let mut wrapped = Vec::new();
+            for line in std::mem::take(&mut layout.lines) {
+                if line.width <= max_width || !line.runs.iter().any(Run::is_tab) {
+                    wrapped.push(line);
+                    continue;
+                }
+                let mut current = Line {
+                    runs: Vec::new(),
+                    width: 0,
+                };
+                for run in line.runs {
+                    if run.is_tab() {
+                        if current.width > 0 && current.width + gap <= max_width {
+                            current.runs.push(Run { width: gap, ..run });
+                            current.width += gap;
+                        }
+                        continue;
+                    }
+                    SelectObject(dc, layout.fonts.0[run.font].0);
+                    for ch in String::from_utf16_lossy(&run.text).chars() {
+                        let mut units = [0; 2];
+                        let units = ch.encode_utf16(&mut units);
+                        let mut size = SIZE::default();
+                        GetTextExtentPoint32W(dc, units.as_ptr(), units.len() as i32, &mut size);
+                        if current.width > 0 && current.width + size.cx > max_width {
+                            wrapped.push(current);
+                            current = Line {
+                                runs: Vec::new(),
+                                width: 0,
+                            };
+                        }
+                        current.runs.push(Run {
+                            font: run.font,
+                            text: units.to_vec(),
+                            width: size.cx,
+                        });
+                        current.width += size.cx;
+                    }
+                }
+                wrapped.push(current);
+            }
+            layout.lines = wrapped;
             SelectObject(dc, old);
             ReleaseDC(null_mut(), dc);
         }
@@ -319,17 +448,28 @@ impl TextLayout {
         Ok(layout)
     }
     pub fn draw(&self, dc: HDC, x: i32, y: i32, color: u32, centered: bool) {
+        // SAFETY: the caller supplies a live DC; all selected fonts remain owned by the layout.
         unsafe {
+            let mut clip = RECT::default();
+            if matches!(GetClipBox(dc, &mut clip), 0 | 1) {
+                return;
+            }
+            let visible = self.visible_lines(y, clip.top, clip.bottom);
             let old = SelectObject(dc, self.fonts.0[0].0);
             let old_color = SetTextColor(dc, color);
             let old_mode = SetBkMode(dc, TRANSPARENT as i32);
-            for (index, line) in self.lines.iter().enumerate() {
+            for index in visible {
+                let line = &self.lines[index];
                 let mut left = x + if centered {
                     (self.width - line.width) / 2
                 } else {
                     0
                 };
                 for run in &line.runs {
+                    if run.is_tab() {
+                        left += run.width;
+                        continue;
+                    }
                     SelectObject(dc, self.fonts.0[run.font].0);
                     TextOutW(
                         dc,
@@ -346,5 +486,114 @@ impl TextLayout {
             SetBkMode(dc, old_mode);
             SelectObject(dc, old);
         }
+    }
+    fn visible_lines(&self, y: i32, top: i32, bottom: i32) -> std::ops::Range<usize> {
+        // Include one adjacent line for glyph overhang, but never visit the full document.
+        let start = (i64::from(top) - i64::from(y))
+            .div_euclid(i64::from(self.line_height))
+            .saturating_sub(1)
+            .max(0) as usize;
+        let end = (i64::from(bottom) - i64::from(y))
+            .div_euclid(i64::from(self.line_height))
+            .saturating_add(2)
+            .max(0) as usize;
+        start.min(self.lines.len())..end.max(start).min(self.lines.len())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn layout(text: &str, width: i32, dpi: i32) -> TextLayout {
+        TextLayout::new(
+            text,
+            Fonts::opaque("SystemFont", &[], 12, dpi, false, false).unwrap(),
+            width,
+        )
+        .unwrap()
+    }
+
+    fn stops(line: &Line) -> Vec<i32> {
+        let mut x = 0;
+        line.runs
+            .iter()
+            .filter_map(|run| {
+                x += run.width;
+                run.is_tab().then_some(x)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tab_columns_align_using_actual_font_widths_and_reset_between_tables() {
+        for dpi in [96, 144, 192] {
+            let table = layout(
+                "F12\t\t中文长区域名\tRight\nQ\t->\tLeft\tR\n\nI\tX",
+                4000,
+                dpi,
+            );
+            assert_eq!(stops(&table.lines[0]), stops(&table.lines[1]));
+            let columns = stops(&table.lines[0]);
+            assert!(columns[2] - columns[1] > columns[0]);
+            assert!(stops(&table.lines[3])[0] < columns[0]);
+            let longer = layout(
+                "F12\t\tEvenLongerRegionName\tRight\nQ\t->\tLeft\tR",
+                4000,
+                dpi,
+            );
+            assert_eq!(&stops(&longer.lines[0])[..2], &columns[..2]);
+            assert!(stops(&longer.lines[0])[2] > columns[2]);
+        }
+    }
+
+    #[test]
+    fn shorter_rows_still_contribute_their_last_cell_to_column_widths() {
+        let table = layout("Q\tLongRegionName\nF12\tX\tY", 4000, 96);
+        let first_stops = stops(&table.lines[0]);
+        let second_stops = stops(&table.lines[1]);
+        assert_eq!(first_stops[0], second_stops[0]);
+        assert!(second_stops[1] > table.lines[0].width);
+    }
+
+    #[test]
+    fn narrow_tables_wrap_without_losing_text() {
+        let text = "Q\tW\t->\t这是很长的区域名称\tRightBottom";
+        let table = layout(text, 80, 96);
+        assert!(table.lines.len() > 1);
+        assert!(table.width <= 80);
+        let displayed: Vec<u16> = table
+            .lines
+            .iter()
+            .flat_map(|line| &line.runs)
+            .filter(|run| !run.is_tab())
+            .flat_map(|run| run.text.iter().copied())
+            .collect();
+        assert_eq!(String::from_utf16_lossy(&displayed), text.replace('\t', ""));
+    }
+    #[test]
+    fn scrolling_draws_only_the_viewport_and_adjacent_glyph_overhang() {
+        let text = layout(&"line\n".repeat(4500), 300, 96);
+        let line_height = text.line_height;
+        for scroll in [
+            0,
+            line_height - 1,
+            line_height * 2000 + 3,
+            text.height - 300,
+        ] {
+            let range = text.visible_lines(-scroll, 0, 300);
+            assert!(range.len() <= (300 / line_height + 4) as usize);
+            for line in 0..text.lines.len() {
+                let y = line as i32 * line_height - scroll;
+                if y < 300 && y + line_height > 0 {
+                    assert!(
+                        range.contains(&line),
+                        "missing visible line {line} at scroll {scroll}"
+                    );
+                }
+            }
+        }
+        assert!(text.visible_lines(text.height, 0, 300).is_empty());
+        assert!(text.visible_lines(-text.height - 300, 0, 300).is_empty());
     }
 }

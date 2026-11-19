@@ -27,6 +27,7 @@ pub const DRAG_START: u32 = WM_APP + 9;
 pub const DRAG_END: u32 = WM_APP + 10;
 pub const GRID_SHOW: u32 = WM_APP + 11;
 pub const DISPLAY_CHANGED: u32 = WM_APP + 12;
+pub const TIP_SCROLL: u32 = WM_APP + 13;
 pub fn display_changed() {
     desktop::invalidate_displays();
     post(DISPLAY_CHANGED, 0, 0);
@@ -62,6 +63,8 @@ struct Input {
     point: POINT,
     queued: bool,
     tip_visible: bool,
+    tip_scrollable: bool,
+    tip_window: usize,
     target_allowed: bool,
     exclusions: Vec<Identity>,
     move_button: Option<u32>,
@@ -183,6 +186,7 @@ impl Input {
             let needed = self.guides
                 || self.preview_tracking
                 || self.drag.is_some()
+                || (self.tip_scrollable && self.tip_window != 0)
                 || (self.target_allowed && self.pressed & self.gesture_mask != 0);
             if needed && self.mouse.is_null() {
                 self.mouse =
@@ -207,6 +211,19 @@ impl Input {
             if !down {
                 self.eaten[index] &= !flag;
             }
+            return true;
+        }
+        if down && self.tip_scrollable && matches!(key, 0x21..=0x24 | 0x26 | 0x28) {
+            let delta = match key {
+                0x21 => -400,
+                0x22 => 400,
+                0x23 => i32::MAX,
+                0x24 => i32::MIN,
+                0x26 => -40,
+                _ => 40,
+            };
+            post(TIP_SCROLL, delta as usize, 0);
+            self.eaten[index] |= flag;
             return true;
         }
         if down
@@ -402,6 +419,31 @@ unsafe extern "system" fn mouse(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
         if code == HC_ACTION as i32 {
             let data = &*(lp as *const MSLLHOOKSTRUCT);
+            // Clicking the tip's scrollbar must not dismiss an Alt preview or begin a drag.
+            let tip_window = INPUT.with_borrow(|input| {
+                if input.tip_scrollable
+                    && input.drag.is_none()
+                    && input.tip_window != 0
+                    && WindowFromPoint(data.pt) as usize == input.tip_window
+                {
+                    input.tip_window
+                } else {
+                    0
+                }
+            });
+            if tip_window != 0 {
+                if wp as u32 == WM_MOUSEWHEEL
+                    && PostMessageW(
+                        tip_window as HWND,
+                        WM_MOUSEWHEEL,
+                        data.mouseData as usize,
+                        0,
+                    ) != 0
+                {
+                    return 1;
+                }
+                return CallNextHookEx(null_mut(), code, wp, lp);
+            }
             let eaten = INPUT.with(|cell| {
                 cell.try_borrow_mut()
                     .is_ok_and(|mut input| match wp as u32 {
@@ -479,7 +521,25 @@ fn mouse_button(message: u32, data: u32) -> Option<(u32, bool)> {
     })
 }
 pub fn tip_visible(visible: bool) {
-    let _ = on_hook(move || INPUT.with_borrow_mut(|input| input.tip_visible = visible));
+    let _ = on_hook(move || {
+        INPUT.with_borrow_mut(|input| {
+            input.tip_visible = visible;
+            if !visible {
+                input.tip_scrollable = false;
+                input.tip_window = 0;
+            }
+            let _ = input.update_mouse();
+        })
+    });
+}
+pub fn tip_scrollable(scrollable: bool, window: usize) {
+    let _ = on_hook(move || {
+        INPUT.with_borrow_mut(|input| {
+            input.tip_scrollable = scrollable;
+            input.tip_window = window;
+            let _ = input.update_mouse();
+        })
+    });
 }
 pub fn click_point() -> POINT {
     CURRENT
@@ -736,6 +796,25 @@ impl Drop for Hooks {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scrolling_keys_are_consumed_only_for_an_overflowing_tip() {
+        let _hooks = super::Hooks::escape_only().unwrap();
+        super::tip_scrollable(true, 0);
+        let eaten =
+            super::on_hook(|| super::INPUT.with_borrow_mut(|input| input.keyboard(0x22, true, 1)))
+                .unwrap();
+        assert!(eaten);
+        let event = super::next_event().unwrap();
+        assert_eq!((event.message, event.wParam), (super::TIP_SCROLL, 400));
+        super::tip_visible(false);
+        super::on_hook(|| {
+            super::INPUT.with_borrow_mut(|input| {
+                assert!(input.keyboard(0x22, false, 2));
+                assert!(!input.keyboard(0x22, true, 3));
+            })
+        })
+        .unwrap();
+    }
     #[test]
     fn modal_dispatch_preserves_input_events_and_their_coordinates() {
         let hooks = super::Hooks::escape_only().unwrap();

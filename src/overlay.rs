@@ -1,7 +1,7 @@
 use crate::{
     config::Config,
     desktop::{self, Display, check, err},
-    fonts::{Fonts, TextLayout},
+    fonts::{Font, Fonts, TextLayout},
     layout::Rect,
     tray::APP_ICON,
 };
@@ -14,12 +14,119 @@ use windows_sys::{
         Foundation::*,
         Graphics::Gdi::*,
         System::{LibraryLoader::GetModuleHandleW, Registry::*},
-        UI::WindowsAndMessaging::*,
+        UI::{
+            Controls::{SetScrollInfo, ShowScrollBar},
+            WindowsAndMessaging::*,
+        },
     },
     core::w,
 };
 
 const CLASS: *const u16 = w!("WinSizeP.Overlay");
+
+/// A viewport-sized bitmap reused throughout scrolling, never as tall as the full text.
+struct PaintBuffer {
+    dc: HDC,
+    bitmap: HBITMAP,
+    previous: HGDIOBJ,
+}
+impl PaintBuffer {
+    fn new(hwnd: HWND, width: i32, height: i32) -> Result<Self, String> {
+        // SAFETY: the window is live; the screen DC is released and bitmap selection is restored
+        // on every path. Only this UI thread owns and paints into the memory DC.
+        unsafe {
+            let screen = GetDC(hwnd);
+            if screen.is_null() {
+                return Err(err());
+            }
+            let dc = CreateCompatibleDC(screen);
+            let bitmap = CreateCompatibleBitmap(screen, width.max(1), height.max(1));
+            ReleaseDC(hwnd, screen);
+            if dc.is_null() || bitmap.is_null() {
+                let error = err();
+                if !dc.is_null() {
+                    DeleteDC(dc);
+                }
+                if !bitmap.is_null() {
+                    DeleteObject(bitmap);
+                }
+                return Err(error);
+            }
+            let previous = SelectObject(dc, bitmap);
+            if previous.is_null() || previous as isize == -1 {
+                let error = err();
+                DeleteDC(dc);
+                DeleteObject(bitmap);
+                return Err(error);
+            }
+            Ok(Self {
+                dc,
+                bitmap,
+                previous,
+            })
+        }
+    }
+}
+impl Drop for PaintBuffer {
+    fn drop(&mut self) {
+        // SAFETY: restore the original selection before destroying the owned bitmap and DC.
+        unsafe {
+            SelectObject(self.dc, self.previous);
+            DeleteObject(self.bitmap);
+            DeleteDC(self.dc);
+        }
+    }
+}
+
+struct TipContent {
+    layout: TextLayout,
+    buffer: PaintBuffer,
+    scroll_font: Option<Font>,
+}
+
+fn paint_tip_outline(hwnd: HWND, dc: HDC) {
+    // SAFETY: the borderless popup's client and window origins coincide. The full window
+    // rectangle includes the native scrollbar; each caller clips to its own paint surface.
+    unsafe {
+        let mut window = RECT::default();
+        GetWindowRect(hwnd, &mut window);
+        let border = GetPropW(hwnd, w!("BorderWidth")) as usize as i32;
+        let diameter = GetPropW(hwnd, w!("CornerDiameter")) as usize as i32;
+        let outline = CreateRoundRectRgn(
+            0,
+            0,
+            window.right - window.left,
+            window.bottom - window.top,
+            diameter,
+            diameter,
+        );
+        if !outline.is_null() {
+            SetDCBrushColor(dc, GetPropW(hwnd, w!("BorderColor")) as usize as u32);
+            FrameRgn(dc, outline, GetStockObject(DC_BRUSH), border, border);
+            DeleteObject(outline);
+        }
+    }
+}
+
+fn paint_tip_scrollbar_outline(hwnd: HWND) {
+    // SAFETY: this is a live overlay; the common window DC is released after clipping out
+    // the client area. Native scrollbar state is untouched.
+    unsafe {
+        if GetPropW(hwnd, w!("TipContent")).is_null() || GetPropW(hwnd, w!("ScrollLimit")).is_null()
+        {
+            return;
+        }
+        let dc = GetWindowDC(hwnd);
+        if !dc.is_null() {
+            let mut client = RECT::default();
+            GetClientRect(hwnd, &mut client);
+            ExcludeClipRect(dc, 0, 0, client.right, client.bottom);
+            paint_tip_outline(hwnd, dc);
+            ReleaseDC(hwnd, dc);
+        }
+    }
+}
+
 unsafe extern "system" fn paint(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
         match msg {
@@ -27,17 +134,65 @@ unsafe extern "system" fn paint(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
                 crate::input::display_changed();
                 DefWindowProcW(hwnd, msg, wp, lp)
             }
-            WM_NCHITTEST => HTTRANSPARENT as isize,
+            WM_NCHITTEST if GetPropW(hwnd, w!("ScrollLimit")).is_null() => HTTRANSPARENT as isize,
+            WM_MOUSEACTIVATE => MA_NOACTIVATE as isize,
+            WM_VSCROLL => {
+                let mut info = SCROLLINFO {
+                    cbSize: size_of::<SCROLLINFO>() as u32,
+                    fMask: SIF_ALL,
+                    ..Default::default()
+                };
+                if GetScrollInfo(hwnd, SB_VERT, &mut info) != 0 {
+                    let position = match (wp & 0xffff) as i32 {
+                        SB_LINEUP => info.nPos.saturating_sub(40),
+                        SB_LINEDOWN => info.nPos.saturating_add(40),
+                        SB_PAGEUP => info.nPos.saturating_sub(info.nPage as i32),
+                        SB_PAGEDOWN => info.nPos.saturating_add(info.nPage as i32),
+                        SB_TOP => 0,
+                        SB_BOTTOM => i32::MAX,
+                        SB_THUMBPOSITION | SB_THUMBTRACK => info.nTrackPos,
+                        _ => info.nPos,
+                    };
+                    set_tip_offset(hwnd, position);
+                }
+                0
+            }
+            WM_MOUSEWHEEL => {
+                let current = GetPropW(hwnd, w!("TextOffset")) as usize as i32;
+                let delta = (wp >> 16) as i16 as i32;
+                set_tip_offset(hwnd, current.saturating_sub(delta));
+                0
+            }
             WM_ERASEBKGND => 1,
+            WM_NCPAINT | WM_NCMOUSEMOVE | WM_NCMOUSELEAVE | WM_NCLBUTTONDOWN | WM_NCLBUTTONUP => {
+                let result = DefWindowProcW(hwnd, msg, wp, lp);
+                paint_tip_scrollbar_outline(hwnd);
+                result
+            }
             WM_PAINT => {
                 let mut paint = PAINTSTRUCT::default();
-                let dc = BeginPaint(hwnd, &mut paint);
+                let target = BeginPaint(hwnd, &mut paint);
                 if !GetPropW(hwnd, w!("PixelAlpha")).is_null() {
                     EndPaint(hwnd, &paint);
                     return 0;
                 }
                 let mut area = RECT::default();
                 GetClientRect(hwnd, &mut area);
+                // SAFETY: Overlay owns the boxed content and removes the property before dropping
+                // it. Painting and replacement both run on the window's UI thread.
+                let content = (GetPropW(hwnd, w!("TipContent")) as *const TipContent).as_ref();
+                let dc = content.map_or(target, |content| content.buffer.dc);
+                let buffer_state = content.map(|_| {
+                    let state = SaveDC(dc);
+                    IntersectClipRect(
+                        dc,
+                        paint.rcPaint.left,
+                        paint.rcPaint.top,
+                        paint.rcPaint.right,
+                        paint.rcPaint.bottom,
+                    );
+                    state
+                });
                 SetDCBrushColor(dc, GetWindowLongPtrW(hwnd, GWLP_USERDATA) as u32);
                 FillRect(dc, &area, GetStockObject(DC_BRUSH));
                 let axis = GetPropW(hwnd, w!("Axis")) as usize;
@@ -60,22 +215,52 @@ unsafe extern "system" fn paint(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
                     SetDCBrushColor(dc, GetPropW(hwnd, w!("ColorKey")) as usize as u32);
                     FillRect(dc, &gap, GetStockObject(DC_BRUSH));
                 }
-                let layout = GetPropW(hwnd, w!("TextLayout")) as *const TextLayout;
-                if !layout.is_null() {
-                    // SAFETY: the owning overlay removes this property before dropping the boxed layout.
-                    let layout = &*layout;
+                if let Some(content) = content {
                     let border = GetPropW(hwnd, w!("BorderWidth")) as usize as i32;
-                    let radius = GetPropW(hwnd, w!("CornerDiameter")) as usize as i32;
-                    let outline = CreateRoundRectRgn(0, 0, area.right, area.bottom, radius, radius);
-                    if !outline.is_null() {
-                        SetDCBrushColor(dc, GetPropW(hwnd, w!("BorderColor")) as usize as u32);
-                        FrameRgn(dc, outline, GetStockObject(DC_BRUSH), border, border);
-                        DeleteObject(outline);
-                    }
+                    paint_tip_outline(hwnd, dc);
                     let left = GetPropW(hwnd, w!("PaddingX")) as usize as i32;
                     let top = GetPropW(hwnd, w!("PaddingTop")) as usize as i32;
                     let color = GetPropW(hwnd, w!("TextColor")) as usize as u32;
-                    layout.draw(dc, left, top, color, false);
+                    let saved = SaveDC(dc);
+                    let bottom = GetPropW(hwnd, w!("PaddingBottom")) as usize as i32;
+                    IntersectClipRect(dc, left, top, area.right - left, area.bottom - bottom);
+                    let offset = GetPropW(hwnd, w!("TextOffset")) as usize as i32;
+                    content.layout.draw(dc, left, top - offset, color, false);
+                    RestoreDC(dc, saved);
+                    if let Some(font) = &content.scroll_font {
+                        let old = SelectObject(dc, font.0);
+                        let mut footer = RECT {
+                            left,
+                            top: area.bottom - bottom,
+                            right: area.right - left,
+                            bottom: area.bottom - border,
+                        };
+                        SetBkMode(dc, TRANSPARENT as i32);
+                        SetTextColor(dc, color);
+                        DrawTextW(
+                            dc,
+                            w!("PgUp/PgDn  ↑↓  Home/End  ·  Esc"),
+                            -1,
+                            &mut footer,
+                            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
+                        );
+                        SelectObject(dc, old);
+                    }
+                }
+                if let Some(state) = buffer_state {
+                    RestoreDC(dc, state);
+                    let rect = paint.rcPaint;
+                    BitBlt(
+                        target,
+                        rect.left,
+                        rect.top,
+                        rect.right - rect.left,
+                        rect.bottom - rect.top,
+                        dc,
+                        rect.left,
+                        rect.top,
+                        SRCCOPY,
+                    );
                 }
                 EndPaint(hwnd, &paint);
                 0
@@ -201,7 +386,8 @@ impl Drop for Panel {
 pub struct Overlay {
     tip: Panel,
     shadow: Panel,
-    text: Option<Box<TextLayout>>,
+    content: Option<Box<TipContent>>,
+    scroll_limit: i32,
     segments: Vec<Panel>,
     mode: u8,
     last_monitor: HMONITOR,
@@ -245,7 +431,8 @@ impl Overlay {
             Ok(Self {
                 shadow: Panel::new()?,
                 tip,
-                text: None,
+                content: None,
+                scroll_limit: 0,
                 segments: Vec::new(),
                 mode: 0,
                 last_monitor: null_mut(),
@@ -269,39 +456,79 @@ impl Overlay {
         let border = scale(1, dpi).max(1);
         let horizontal = scale(10, dpi) + border;
         let top = scale(4, dpi) + border;
-        let bottom = scale(6, dpi) + border;
+        let mut bottom = scale(6, dpi) + border;
         let radius = scale(12, dpi);
-        let fonts = Fonts::opaque(
-            &cfg.font,
-            &cfg.font_fallbacks,
-            cfg.font_size,
-            dpi,
-            cfg.font_bold,
-            cfg.font_italic,
-        )?;
-        let text = Box::new(TextLayout::new(
-            text,
-            fonts,
-            (screen.work.width - 2 * horizontal).max(1),
-        )?);
-        let width = (text.width + 2 * horizontal).min(screen.work.width);
-        let height = (text.height + top + bottom).min(screen.work.height);
+        let make_layout = |width| {
+            let fonts = Fonts::opaque(
+                &cfg.font,
+                &cfg.font_fallbacks,
+                cfg.font_size,
+                dpi,
+                cfg.font_bold,
+                cfg.font_italic,
+            )?;
+            TextLayout::new(text, fonts, width)
+        };
+        let max_height = tip_height_limit(screen.work.height);
+        let available_width = (screen.work.width - 2 * horizontal).max(1);
+        let mut text = make_layout(available_width)?;
+        let scrollable = text.height + top + bottom > max_height;
+        let scrollbar = if scrollable {
+            // SAFETY: querying a metric does not retain pointers or resources.
+            unsafe {
+                windows_sys::Win32::UI::HiDpi::GetSystemMetricsForDpi(SM_CXVSCROLL, dpi as u32)
+            }
+            .max(1)
+        } else {
+            0
+        };
+        if scrollable && text.width + scrollbar > available_width {
+            text = make_layout((available_width - scrollbar).max(1))?;
+        }
+        let width = (text.width + 2 * horizontal + scrollbar).min(screen.work.width);
+        let height = (text.height + top + bottom).min(max_height);
+        let scroll_font = if scrollable {
+            let font = Font::new("SystemFont", 0, dpi, false, false)?;
+            bottom += font.height() + scale(6, dpi);
+            Some(font)
+        } else {
+            None
+        };
+        self.scroll_limit = (text.height - (height - top - bottom).max(1)).max(0);
         let index = if cfg.theme == "dark" || (cfg.theme == "system" && dark()) {
             2
         } else {
             0
         };
+        let content = Box::new(TipContent {
+            layout: text,
+            buffer: PaintBuffer::new(self.tip.0, width, height)?,
+            scroll_font,
+        });
         unsafe {
+            let style = GetWindowLongW(self.tip.0, GWL_EXSTYLE) as u32;
+            SetWindowLongW(
+                self.tip.0,
+                GWL_EXSTYLE,
+                if scrollable {
+                    style & !WS_EX_TRANSPARENT
+                } else {
+                    style | WS_EX_TRANSPARENT
+                } as i32,
+            );
             check(SetPropW(
                 self.tip.0,
-                w!("TextLayout"),
-                (&*text as *const TextLayout) as HANDLE,
+                w!("TipContent"),
+                (&*content as *const TipContent) as HANDLE,
             ))?;
             for (property, value) in [
                 (w!("PaddingX"), horizontal as usize),
                 (w!("PaddingTop"), top as usize),
+                (w!("PaddingBottom"), bottom as usize),
                 (w!("BorderWidth"), border as usize),
                 (w!("CornerDiameter"), radius as usize),
+                (w!("TextOffset"), 0),
+                (w!("ScrollLimit"), self.scroll_limit as usize),
                 (
                     w!("BorderColor"),
                     crate::colors::tip_border(cfg.colors[index]) as usize,
@@ -314,8 +541,17 @@ impl Overlay {
                 w!("TextColor"),
                 cfg.colors[index + 1] as usize as HANDLE,
             );
+            let info = SCROLLINFO {
+                cbSize: size_of::<SCROLLINFO>() as u32,
+                fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
+                nMax: content.layout.height.saturating_sub(1),
+                nPage: (height - top - bottom).max(1) as u32,
+                ..Default::default()
+            };
+            SetScrollInfo(self.tip.0, SB_VERT, &info, 1);
+            ShowScrollBar(self.tip.0, SB_VERT, i32::from(scrollable));
         }
-        self.text = Some(text);
+        self.content = Some(content);
         self.tip.style(cfg.colors[index], 255);
         let rect = Rect {
             x: screen.work.x + (screen.work.width - width) / 2,
@@ -338,8 +574,35 @@ impl Overlay {
             ..rect
         });
         self.tip.show(rect);
+        // A new buffer has no preserved pixels when Windows resizes an existing popup.
+        // Invalidate after resizing so even newly exposed or retained edges are rendered.
+        unsafe {
+            InvalidateRect(self.tip.0, null(), 0);
+        }
         crate::input::tip_visible(true);
+        crate::input::tip_scrollable(self.scroll_limit > 0, self.tip.0 as usize);
         Ok(())
+    }
+    pub fn scroll_tip(&mut self, delta: i32) {
+        // SAFETY: the panel owns a live window; mouse and keyboard scrolling share its offset.
+        unsafe {
+            let current = GetPropW(self.tip.0, w!("TextOffset")) as usize as i32;
+            let delta = if matches!(delta, -400 | 400) {
+                let mut info = SCROLLINFO {
+                    cbSize: size_of::<SCROLLINFO>() as u32,
+                    fMask: SIF_PAGE,
+                    ..Default::default()
+                };
+                GetScrollInfo(self.tip.0, SB_VERT, &mut info);
+                delta.signum() * (info.nPage as i32).max(1)
+            } else {
+                delta
+            };
+            set_tip_offset(self.tip.0, scroll_offset(current, delta, self.scroll_limit));
+        }
+    }
+    pub fn tip_scrollable(&self) -> bool {
+        self.tip.1.get().is_some() && self.scroll_limit > 0
     }
     pub fn mode(&self) -> u8 {
         self.mode
@@ -436,10 +699,47 @@ impl Overlay {
         Ok(())
     }
 }
+fn scroll_offset(current: i32, delta: i32, limit: i32) -> i32 {
+    current.saturating_add(delta).clamp(0, limit)
+}
+fn tip_height_limit(work_height: i32) -> i32 {
+    (work_height / 3).max(1)
+}
+fn set_tip_offset(hwnd: HWND, position: i32) {
+    // SAFETY: callers pass a live overlay window, and all state is stored on its UI thread.
+    unsafe {
+        let limit = GetPropW(hwnd, w!("ScrollLimit")) as usize as i32;
+        let position = position.clamp(0, limit);
+        if position == GetPropW(hwnd, w!("TextOffset")) as usize as i32 {
+            return;
+        }
+        SetPropW(hwnd, w!("TextOffset"), position as usize as HANDLE);
+        let info = SCROLLINFO {
+            cbSize: size_of::<SCROLLINFO>() as u32,
+            fMask: SIF_POS,
+            nPos: position,
+            ..Default::default()
+        };
+        SetScrollInfo(hwnd, SB_VERT, &info, 1);
+        // SetScrollInfo can paint the native bar directly without sending WM_NCPAINT.
+        paint_tip_scrollbar_outline(hwnd);
+        let mut content = RECT::default();
+        GetClientRect(hwnd, &mut content);
+        let horizontal = GetPropW(hwnd, w!("PaddingX")) as usize as i32;
+        content.left += horizontal;
+        content.right -= horizontal;
+        content.top += GetPropW(hwnd, w!("PaddingTop")) as usize as i32;
+        content.bottom -= GetPropW(hwnd, w!("PaddingBottom")) as usize as i32;
+        InvalidateRect(hwnd, &content, 0);
+    }
+}
 impl Drop for Overlay {
     fn drop(&mut self) {
+        if self.tip.1.get().is_some() {
+            crate::input::tip_visible(false);
+        }
         unsafe {
-            RemovePropW(self.tip.0, w!("TextLayout"));
+            RemovePropW(self.tip.0, w!("TipContent"));
         }
     }
 }
@@ -509,6 +809,239 @@ impl Label {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "opens a temporary tip and measures synchronous scrolling paints"]
+    fn tip_scrolling_paint_diagnostics() {
+        let cfg = Config::parse(&crate::config::help().parse().unwrap()).unwrap();
+        let mut overlay = Overlay::new().unwrap();
+        for (name, text) in [
+            ("help", cfg.help_text()),
+            ("4500 lines", "Long tip to scroll\n".repeat(4500)),
+        ] {
+            overlay.tip(&text, &cfg).unwrap();
+            // SAFETY: all handles are owned by the test and used on their creating UI thread.
+            unsafe {
+                UpdateWindow(overlay.tip.0);
+                let start = Instant::now();
+                for frame in 0..120 {
+                    set_tip_offset(
+                        overlay.tip.0,
+                        (i64::from(overlay.scroll_limit) * (frame % 60) / 59) as i32,
+                    );
+                    UpdateWindow(overlay.tip.0);
+                }
+                GdiFlush();
+                println!("{name}: 120 scrolling paints in {:?}", start.elapsed());
+                overlay.hide_tip();
+            }
+        }
+    }
+    #[test]
+    #[ignore = "opens temporary tips and compares buffered repaint pixels and GDI resource lifetime"]
+    fn buffered_tip_partial_paints_match_full_paints_without_leaking_gdi_objects() {
+        let cfg = Config::parse(&crate::config::help().parse().unwrap()).unwrap();
+        // SAFETY: test windows, DCs, and their content are owned and used on this UI thread.
+        unsafe {
+            // Warm up the GDI font cache before counting resources owned by the overlay.
+            let mut warmup = Overlay::new().unwrap();
+            warmup.tip(&cfg.help_text(), &cfg).unwrap();
+            UpdateWindow(warmup.tip.0);
+            warmup.hide_tip();
+            drop(warmup);
+            let before = GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS);
+            let mut overlay = Overlay::new().unwrap();
+            for theme in ["light", "dark"] {
+                let mut themed = Config::parse(&crate::config::help().parse().unwrap()).unwrap();
+                themed.theme = theme.into();
+                overlay.tip(&themed.help_text(), &themed).unwrap();
+                UpdateWindow(overlay.tip.0);
+                let dc = overlay.content.as_ref().unwrap().buffer.dc;
+                let mut client = RECT::default();
+                GetClientRect(overlay.tip.0, &mut client);
+                let snapshot = || {
+                    (0..client.bottom)
+                        .flat_map(|y| (0..client.right).map(move |x| GetPixel(dc, x, y)))
+                        .collect::<Vec<_>>()
+                };
+                for position in [17, overlay.scroll_limit / 2, overlay.scroll_limit, 0] {
+                    set_tip_offset(overlay.tip.0, position);
+                    UpdateWindow(overlay.tip.0);
+                    let partial = snapshot();
+                    InvalidateRect(overlay.tip.0, null(), 0);
+                    UpdateWindow(overlay.tip.0);
+                    assert_eq!(partial, snapshot(), "{theme}, offset {position}");
+                }
+            }
+            overlay.hide_tip();
+            drop(overlay);
+            assert_eq!(GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS), before);
+        }
+    }
+    #[test]
+    #[ignore = "opens temporary tips to verify a continuous outer border across the native scrollbar"]
+    fn scrollbar_shares_the_tip_outer_corners() {
+        // SAFETY: this test owns each overlay and queries only its live window and memory DC.
+        unsafe {
+            for theme in ["light", "dark"] {
+                let mut cfg = Config::parse(&crate::config::help().parse().unwrap()).unwrap();
+                cfg.theme = theme.into();
+                let mut overlay = Overlay::new().unwrap();
+                overlay.tip(&"A line of text\n".repeat(100), &cfg).unwrap();
+                UpdateWindow(overlay.tip.0);
+                let mut client = RECT::default();
+                GetClientRect(overlay.tip.0, &mut client);
+                let buffer = overlay.content.as_ref().unwrap().buffer.dc;
+                let background = GetWindowLongPtrW(overlay.tip.0, GWLP_USERDATA) as u32;
+                let border_color = GetPropW(overlay.tip.0, w!("BorderColor")) as usize as u32;
+                let border = GetPropW(overlay.tip.0, w!("BorderWidth")) as usize as i32;
+                let diameter = GetPropW(overlay.tip.0, w!("CornerDiameter")) as usize as i32;
+                // No inner rounded edge or vertical stroke at the text/scrollbar junction.
+                for y in border..diameter {
+                    assert_eq!(GetPixel(buffer, client.right - 1, y), background);
+                    assert_eq!(
+                        GetPixel(buffer, client.right - 1, client.bottom - 2 - y),
+                        background
+                    );
+                }
+                assert_eq!(
+                    GetPixel(buffer, client.right - 1, client.bottom / 2),
+                    background
+                );
+                assert_eq!(GetPixel(buffer, client.right - 1, 0), border_color);
+                let window = overlay.tip.1.get().unwrap();
+                assert!(window.width > client.right);
+                let region = CreateRectRgn(0, 0, 0, 0);
+                assert_ne!(GetWindowRgn(overlay.tip.0, region), 0);
+                assert_eq!(PtInRegion(region, window.width - 1, 0), 0);
+                assert_ne!(PtInRegion(region, client.right - 1, border), 0);
+                DeleteObject(region);
+                // The non-client border resumes on the scrollbar's outer side.
+                for offset in [0, overlay.scroll_limit / 2, overlay.scroll_limit] {
+                    set_tip_offset(overlay.tip.0, offset);
+                    UpdateWindow(overlay.tip.0);
+                    let dc = GetWindowDC(overlay.tip.0);
+                    let outer = GetPixel(dc, window.width - 2, window.height / 2);
+                    ReleaseDC(overlay.tip.0, dc);
+                    assert_eq!(outer, border_color, "{theme}, scroll {offset}");
+                }
+                overlay.tip("Short tip", &cfg).unwrap();
+                UpdateWindow(overlay.shadow.0);
+                UpdateWindow(overlay.tip.0);
+                GetClientRect(overlay.tip.0, &mut client);
+                assert_eq!(overlay.tip.1.get().unwrap().width, client.right);
+                assert_eq!(
+                    GetPixel(
+                        overlay.content.as_ref().unwrap().buffer.dc,
+                        client.right - 2,
+                        client.bottom / 2
+                    ),
+                    border_color
+                );
+                overlay.hide_tip();
+            }
+        }
+    }
+    #[test]
+    fn tips_never_exceed_one_third_of_the_work_area() {
+        for height in [480, 720, 1040, 1080, 1440, 2160] {
+            assert!(super::tip_height_limit(height) * 3 <= height);
+        }
+    }
+    #[test]
+    #[ignore = "opens a temporary tip to verify native scrollbar interaction"]
+    fn tip_scrollbar_tracks_mouse_keyboard_and_shorter_content() {
+        let cfg = Config::parse(&crate::config::help().parse().unwrap()).unwrap();
+        let screen = desktop::screen(desktop::cursor().unwrap(), 0).unwrap();
+        let mut overlay = Overlay::new().unwrap();
+        // SAFETY: this test owns the windows and sends synchronous messages on their UI thread.
+        unsafe {
+            let foreground = GetForegroundWindow();
+            overlay.tip(&"Long tip\n".repeat(4500), &cfg).unwrap();
+            let rect = overlay.tip.1.get().unwrap();
+            assert!(rect.height <= screen.work.height / 3);
+            assert!(overlay.tip_scrollable());
+            assert!(overlay.scroll_limit > 65535);
+            assert_ne!(
+                GetWindowLongW(overlay.tip.0, GWL_STYLE) as u32 & WS_VSCROLL,
+                0
+            );
+            assert_eq!(GetForegroundWindow(), foreground);
+            assert_eq!(
+                SendMessageW(overlay.tip.0, WM_MOUSEACTIVATE, 0, 0),
+                MA_NOACTIVATE as isize
+            );
+            let mut client = RECT::default();
+            GetClientRect(overlay.tip.0, &mut client);
+            let padding = GetPropW(overlay.tip.0, w!("PaddingX")) as usize as i32;
+            assert!(overlay.content.as_ref().unwrap().layout.width <= client.right - padding * 2);
+            let buffer = overlay.content.as_ref().unwrap().buffer.dc;
+            UpdateWindow(overlay.tip.0);
+            for command in [SB_TOP, SB_LINEUP, SB_PAGEUP, SB_ENDSCROLL] {
+                SendMessageW(overlay.tip.0, WM_VSCROLL, command as usize, 0);
+                assert_eq!(GetUpdateRect(overlay.tip.0, null_mut(), 0), 0);
+            }
+            overlay.scroll_tip(-400);
+            SendMessageW(overlay.tip.0, WM_MOUSEWHEEL, 120usize << 16, 0);
+            assert_eq!(GetUpdateRect(overlay.tip.0, null_mut(), 0), 0);
+            SendMessageW(overlay.tip.0, WM_VSCROLL, SB_BOTTOM as usize, 0);
+            let offset = |hwnd| GetPropW(hwnd, w!("TextOffset")) as usize as i32;
+            assert_eq!(offset(overlay.tip.0), overlay.scroll_limit);
+            let mut dirty = RECT::default();
+            assert_ne!(GetUpdateRect(overlay.tip.0, &mut dirty, 0), 0);
+            assert_eq!(dirty.left, padding);
+            assert_eq!(dirty.right, client.right - padding);
+            assert!(dirty.top > 0 && dirty.bottom < client.bottom);
+            UpdateWindow(overlay.tip.0);
+            for command in [SB_BOTTOM, SB_LINEDOWN, SB_PAGEDOWN, SB_ENDSCROLL] {
+                SendMessageW(overlay.tip.0, WM_VSCROLL, command as usize, 0);
+                assert_eq!(GetUpdateRect(overlay.tip.0, null_mut(), 0), 0);
+            }
+            // The visible viewport must contain text after a large jump, not just its background.
+            let background = GetWindowLongPtrW(overlay.tip.0, GWLP_USERDATA) as u32;
+            assert!(
+                (dirty.top..dirty.bottom).any(
+                    |y| (dirty.left..dirty.right).any(|x| GetPixel(buffer, x, y) != background)
+                )
+            );
+            overlay.scroll_tip(-40);
+            assert_eq!(offset(overlay.tip.0), overlay.scroll_limit - 40);
+            let mut info = SCROLLINFO {
+                cbSize: size_of::<SCROLLINFO>() as u32,
+                fMask: SIF_ALL,
+                ..Default::default()
+            };
+            assert_ne!(GetScrollInfo(overlay.tip.0, SB_VERT, &mut info), 0);
+            assert_eq!(info.nPos, offset(overlay.tip.0));
+            SendMessageW(overlay.tip.0, WM_VSCROLL, SB_TOP as usize, 0);
+            overlay.scroll_tip(400);
+            assert_eq!(offset(overlay.tip.0), info.nPage as i32);
+            overlay.scroll_tip(-400);
+            assert_eq!(offset(overlay.tip.0), 0);
+            SendMessageW(
+                overlay.tip.0,
+                WM_MOUSEWHEEL,
+                (u32::from((-120i16) as u16) << 16) as usize,
+                0,
+            );
+            assert_eq!(offset(overlay.tip.0), 120);
+            assert_eq!(overlay.content.as_ref().unwrap().buffer.dc, buffer);
+            overlay.tip("Short tip", &cfg).unwrap();
+            assert!(!overlay.tip_scrollable());
+            assert_eq!(offset(overlay.tip.0), 0);
+            assert_eq!(
+                GetWindowLongW(overlay.tip.0, GWL_STYLE) as u32 & WS_VSCROLL,
+                0
+            );
+            overlay.hide_tip();
+        }
+    }
+    #[test]
+    fn long_tips_can_reach_both_ends_without_overflow() {
+        assert_eq!(super::scroll_offset(0, i32::MAX, 11804), 11804);
+        assert_eq!(super::scroll_offset(11804, i32::MIN, 11804), 0);
+        assert_eq!(super::scroll_offset(400, -40, 11804), 360);
+        assert_eq!(super::scroll_offset(0, 400, 0), 0);
+    }
     use super::*;
     use std::time::{Duration, Instant};
     use windows_sys::Win32::System::Threading::*;
