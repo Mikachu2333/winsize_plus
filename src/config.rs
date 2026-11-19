@@ -4,13 +4,11 @@ use std::{
     fs,
     io::{self, Write},
     path::{Path, PathBuf},
-    ptr::null,
 };
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value};
 use windows_sys::Win32::{
     Foundation::*, Globalization::GetUserDefaultUILanguage, System::Threading::*,
 };
-use windows_sys::core::w;
 
 fn system_zh() -> bool {
     (unsafe { GetUserDefaultUILanguage() } & 0x3ff) == 4
@@ -49,7 +47,6 @@ pub struct Config {
     pub alt: String,
     pub gesture: String,
     pub double_ms: u32,
-    pub wait_ms: u32,
     pub elevate: bool,
     pub autostart: bool,
     pub preview: bool,
@@ -463,7 +460,7 @@ impl Config {
                 return Err(format!("grid.{key}: {name}"));
             }
             let number: u32 = key.parse().map_err(|_| format!("grid.{key}"))?;
-            if number == 0 || number % 10 == 0 || number > 9999 {
+            if number == 0 || number.is_multiple_of(10) || number > 9999 {
                 return Err(format!("grid.{key}: expected monitor * 10 + cell"));
             }
             grid.insert(number, name);
@@ -536,7 +533,6 @@ impl Config {
             double_ms: unsafe {
                 windows_sys::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime()
             },
-            wait_ms: number("tip", "duration_ms", 100, 120000)? as u32,
             elevate: boolean("general", "elevate")?,
             autostart: boolean("general", "autostart")?,
             preview: boolean("general", "preview")?,
@@ -777,6 +773,23 @@ fn english_comments(text: &str) -> String {
 }
 
 fn migrate(doc: &mut DocumentMut) {
+    if let Some(keys) = doc.get_mut("keys").and_then(Item::as_table_mut) {
+        let old = keys
+            .iter()
+            .find(|(key, item)| {
+                key.eq_ignore_ascii_case("f1")
+                    && item
+                        .as_str()
+                        .is_some_and(|name| name.eq_ignore_ascii_case("help"))
+            })
+            .map(|(key, _)| key.to_owned());
+        if let Some(old) = old
+            && !keys.iter().any(|(key, _)| key.eq_ignore_ascii_case("h"))
+        {
+            keys.remove(&old);
+            keys.insert("H", value("Help"));
+        }
+    }
     for key in ["alt", "gesture"] {
         if let Some(item) = doc
             .get_mut("general")
@@ -822,10 +835,9 @@ fn recover(doc: &mut DocumentMut) -> Result<Config, String> {
         .get("crosshair")
         .and_then(|s| s.get("fps"))
         .and_then(Item::as_integer)
+        && rate != rate.clamp(24, 1000)
     {
-        if rate != rate.clamp(24, 1000) {
-            doc["crosshair"]["fps"] = value(rate.clamp(24, 1000));
-        }
+        doc["crosshair"]["fps"] = value(rate.clamp(24, 1000));
     }
     // One invalid field cannot prevent independent settings from being applied.
     for _ in 0..1024 {
@@ -946,10 +958,7 @@ impl Drop for Lock {
 }
 fn lock() -> Result<Lock, String> {
     unsafe {
-        let handle = CreateMutexW(null(), 0, w!("Local\\WinSizeP.Config.v1"));
-        if handle.is_null() {
-            return Err(io::Error::last_os_error().to_string());
-        }
+        let handle = crate::security::config_mutex()?;
         if matches!(
             WaitForSingleObject(handle, 5000),
             WAIT_OBJECT_0 | WAIT_ABANDONED
@@ -1067,6 +1076,28 @@ pub fn load(path: &Path, edit: Option<(&Identity, Switch)>) -> Result<Config, St
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn default_help_key_is_h_and_legacy_migration_respects_custom_bindings() {
+        let mut doc = help().parse::<DocumentMut>().unwrap();
+        assert_eq!(
+            Config::parse(&doc)
+                .unwrap()
+                .keys
+                .get(&u32::from(b'H'))
+                .map(String::as_str),
+            Some("help")
+        );
+        doc["keys"].as_table_mut().unwrap().remove("H");
+        doc["keys"]["F1"] = value("Help");
+        migrate(&mut doc);
+        assert!(doc["keys"].get("F1").is_none());
+        assert_eq!(doc["keys"]["H"].as_str(), Some("Help"));
+        doc["keys"]["H"] = value("Horizontal");
+        doc["keys"]["F1"] = value("Help");
+        migrate(&mut doc);
+        assert_eq!(doc["keys"]["H"].as_str(), Some("Horizontal"));
+        assert_eq!(doc["keys"]["F1"].as_str(), Some("Help"));
+    }
 
     #[test]
     fn accepts_utf8_and_old_unicode_configs() {

@@ -361,6 +361,7 @@ impl Preview {
         }
         if edge {
             self.hover = None;
+            self.highlight(None, cfg)?;
             return Ok(());
         }
         let (key, selected) = if self.grid {
@@ -450,5 +451,13 @@ mod tests {
                 .sum::<i32>(),
             area.width * area.height
         );
+        for cell in 1..=9 {
+            let rect = grid_rect(area, cell);
+            assert_eq!(area.grid(rect.x, rect.y), (cell - 1) as usize);
+            assert_eq!(
+                area.grid(rect.x + rect.width - 1, rect.y + rect.height - 1),
+                (cell - 1) as usize
+            );
+        }
     }
 }

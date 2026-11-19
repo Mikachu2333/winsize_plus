@@ -12,6 +12,7 @@ mod logon;
 mod overlay;
 mod preview;
 mod resident;
+mod security;
 mod settings;
 mod settings_schema;
 mod settings_tooltip;
@@ -96,6 +97,7 @@ pub fn elevated_helper(parameters: &str) -> Result<(), String> {
 }
 
 fn launch_unelevated() -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|error| error.to_string())?;
     // Use the interactive shell's token so a permission change does not inherit this admin token.
     unsafe {
         let mut pid = 0;
@@ -123,7 +125,6 @@ fn launch_unelevated() -> Result<(), String> {
         if ok == 0 {
             return Err(desktop::err());
         }
-        let exe = std::env::current_exe().map_err(|error| error.to_string())?;
         let mut command = desktop::wide(format!(
             "{} --resident",
             quote_argument(&exe.to_string_lossy())

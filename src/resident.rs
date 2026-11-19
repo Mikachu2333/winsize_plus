@@ -103,15 +103,13 @@ impl App {
             !automatic || (cfg.autostart, cfg.elevate) != (self.cfg.autostart, self.cfg.elevate);
         let mut restart = automatic && cfg.elevate != self.cfg.elevate;
         let mut startup_error = None;
-        if sync_task {
-            if let Err(error) = crate::logon::sync(cfg.autostart, cfg.elevate) {
-                // Keep independent settings working when consent is canceled; retry startup on
-                // the next explicit reload/edit instead of repeatedly prompting for UAC.
-                cfg.autostart = self.cfg.autostart;
-                cfg.elevate = self.cfg.elevate;
-                restart = false;
-                startup_error = Some(error);
-            }
+        if sync_task && let Err(error) = crate::logon::sync(cfg.autostart, cfg.elevate) {
+            // Keep independent settings working when consent is canceled; retry startup on
+            // the next explicit reload/edit instead of repeatedly prompting for UAC.
+            cfg.autostart = self.cfg.autostart;
+            cfg.elevate = self.cfg.elevate;
+            restart = false;
+            startup_error = Some(error);
         }
         input::configure(&cfg)?;
         self.frames.reset(cfg.fps);
@@ -304,7 +302,8 @@ impl App {
             }
             input::ALT_RELEASE => {
                 self.hold = None;
-                if !self.preview_latched && self.held_window.take().is_some() {
+                if !self.preview_latched {
+                    self.held_window = None;
                     self.refresh_preview()?;
                 }
                 Ok(())
@@ -373,6 +372,7 @@ impl App {
                 self.held_window = None;
                 self.wait = None;
                 self.preview.hide();
+                input::track_preview(false)?;
                 self.clear();
                 self.frames.reset(self.cfg.fps);
                 self.follow_frame(desktop::cursor()?)
@@ -387,6 +387,8 @@ impl App {
                 input::cancel();
                 self.drag = None;
                 self.clear();
+                self.wait = None;
+                self.hold = None;
                 if self.preview.reset(&self.cfg)? {
                     return Ok(());
                 }
@@ -495,8 +497,8 @@ pub fn run(path: &Path) -> Result<crate::ResidentExit, String> {
             return Err(err());
         }
         let watch = Watch(watch);
-        let snapshot = fs::read(path).ok();
         let cfg = config::load(path, None)?;
+        let snapshot = fs::read(path).ok();
         let overlay = Overlay::new()?;
         let _hooks = input::Hooks::start(&cfg)?;
         let mut app = App {

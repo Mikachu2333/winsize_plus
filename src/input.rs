@@ -40,12 +40,10 @@ struct Input {
     gesture_mask: u8,
     gesture_target: HWND,
     double_ms: u32,
-    wait_ms: u32,
     last_tap: Option<(u32, u32)>,
     pressed: u8,
     tap: Option<(u32, u32)>,
     second: bool,
-    armed_at: u32,
     bound: [u64; 4],
     command: [u64; 4],
     eaten: [u64; 4],
@@ -53,7 +51,6 @@ struct Input {
     preview_enabled: bool,
     preview_tracking: bool,
     mouse: HHOOK,
-    click: bool,
     point: POINT,
     queued: bool,
     tip_visible: bool,
@@ -94,7 +91,6 @@ impl Input {
         unsafe {
             let needed = self.guides
                 || self.preview_tracking
-                || self.click
                 || self.drag.is_some()
                 || (self.target_allowed && self.pressed & self.gesture_mask != 0);
             if needed && self.mouse.is_null() {
@@ -132,6 +128,9 @@ impl Input {
             self.mode = Mode::Idle;
             self.tap = None;
             self.last_tap = None;
+            if let Some(drag) = &mut self.drag {
+                drag.canceled = true;
+            }
             post(CANCEL, 0, 0);
             self.eaten[index] |= flag;
             return true;
@@ -146,10 +145,12 @@ impl Input {
                     self.gesture_target = unsafe { GetForegroundWindow() };
                     self.target_allowed = desktop::allowed(self.gesture_target, &self.exclusions);
                 }
-                if self.pressed & self.gesture_mask == 0 && side & self.gesture_mask != 0 {
-                    if self.preview_enabled && self.target_allowed {
-                        post(ALT_HOLD, self.gesture_target as usize, 0);
-                    }
+                if self.pressed & self.gesture_mask == 0
+                    && side & self.gesture_mask != 0
+                    && self.preview_enabled
+                    && self.target_allowed
+                {
+                    post(ALT_HOLD, self.gesture_target as usize, 0);
                 }
                 self.pressed |= side;
                 let clean = self.pressed == side
@@ -184,11 +185,13 @@ impl Input {
             {
                 if consumed {
                     self.mode = Mode::Wait;
-                    self.armed_at = time;
-                    post(ARMED, unsafe { GetForegroundWindow() } as usize, 0)
+                    post(ARMED, self.gesture_target as usize, 0)
                 } else {
-                    self.last_tap = Some((key, time))
+                    self.last_tap = Some((key, when))
                 }
+            }
+            if !consumed && self.pressed & self.gesture_mask == 0 && self.drag.is_none() {
+                self.target_allowed = false;
             }
             return consumed;
         }
@@ -214,6 +217,10 @@ impl Input {
             return true;
         }
         if self.mode == Mode::Idle {
+            // Ordinary Alt shortcuts (for example Alt+Tab) abandon the pending preview.
+            if self.pressed != 0 {
+                post(CANCEL, 0, 0);
+            }
             return false;
         }
         let eat = match self.mode {
@@ -289,6 +296,11 @@ unsafe extern "system" fn keyboard(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT
                 cell.try_borrow_mut()
                     .is_ok_and(|mut input| input.keyboard(key, down, data.time))
             }) {
+                // Every WinSizeP UI thread has its own hook. Let the other hook observe Esc
+                // before consuming it, so resident tips and settings previews close together.
+                if key == VK_ESCAPE as u32 {
+                    CallNextHookEx(null_mut(), code, wp, lp);
+                }
                 return 1;
             }
         }
@@ -304,14 +316,13 @@ unsafe extern "system" fn mouse(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
                     .is_ok_and(|mut input| match wp as u32 {
                         WM_MOUSEMOVE if input.guides || input.preview_tracking || input.drag.is_some() => {
                             input.point = data.pt;
-                            if let Some(mut drag) = input.drag {
-                                if drag.draggable && !drag.canceled && !drag.active && ((data.pt.x as i64 - drag.start.x as i64).abs() >= GetSystemMetrics(SM_CXDRAG) as i64 || (data.pt.y as i64 - drag.start.y as i64).abs() >= GetSystemMetrics(SM_CYDRAG) as i64) {
+                            if let Some(mut drag) = input.drag
+                                && drag.draggable && !drag.canceled && !drag.active && ((data.pt.x as i64 - drag.start.x as i64).abs() >= GetSystemMetrics(SM_CXDRAG) as i64 || (data.pt.y as i64 - drag.start.y as i64).abs() >= GetSystemMetrics(SM_CYDRAG) as i64) {
                                     drag.active = true;
                                     DRAG_ORIGIN.with(|origin| origin.set(drag.start));
                                     post(DRAG_START, input.gesture_target as usize, isize::from(drag.resize));
                                     input.drag = Some(drag);
                                 }
-                            }
                             if !input.queued {
                                 input.queued = true;
                                 post(MOVE, 0, 0)
@@ -433,7 +444,6 @@ pub fn configure(cfg: &Config) -> Result<(), String> {
         input.move_button = cfg.move_button;
         input.resize_button = cfg.resize_button;
         input.double_ms = cfg.double_ms;
-        input.wait_ms = cfg.wait_ms;
         input.command = [0; 4];
         input.bound = [0; 4];
         for (key, action) in &cfg.keys {

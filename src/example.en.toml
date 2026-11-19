@@ -88,7 +88,7 @@ Minus = "Horizontal"
 Equal = "Cross"
 Backslash = "Vertical"
 Grave = "Command"
-F1 = "Help"
+H = "Help"
 
 [commands]
 ASDF = "Center"
