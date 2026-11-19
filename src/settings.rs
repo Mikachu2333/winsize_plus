@@ -43,6 +43,7 @@ const DROP_FONT: u32 = WM_APP + 81;
 const RESIZE: u32 = WM_APP + 82;
 const HOVER: u32 = WM_APP + 83;
 const EDIT_LAYOUT: u32 = WM_APP + 84;
+const APP_EXIT: u32 = WM_APP + 85;
 const TAB_BASE: i32 = 100;
 const AXIS_H: i32 = 500;
 const AXIS_V: i32 = 501;
@@ -70,6 +71,52 @@ pub fn open() -> Result<(), String> {
         .spawn()
         .map(|_| ())
         .map_err(|e| e.to_string())
+}
+
+/// Ask the settings process to flush its pending edits and leave its message loop.
+/// A failed save leaves both processes running so the error can be corrected.
+pub fn close_for_exit() -> Result<(), String> {
+    unsafe {
+        let hwnd = FindWindowW(CLASS, null());
+        if hwnd.is_null() {
+            return Ok(());
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut result = 0;
+            let timeout = deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis()
+                .clamp(1, 5000) as u32;
+            let sent = SendMessageTimeoutW(
+                hwnd,
+                APP_EXIT,
+                0,
+                0,
+                SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
+                timeout,
+                &mut result,
+            );
+            if sent == 0 {
+                if IsWindow(hwnd) == 0 {
+                    return Ok(());
+                }
+                return Err(format!(
+                    "Cannot close settings / 无法关闭设置窗口: {}",
+                    err()
+                ));
+            }
+            if result == 1 {
+                return Ok(());
+            }
+            if result == 2 && Instant::now() < deadline {
+                // Let a canceled native color dialog return before flushing the editor.
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+            return Err("Settings could not be saved. Correct the indicated field or close its dialog before exiting. / 设置未能保存，请先修正提示的字段或关闭设置中的对话框。".into());
+        }
+    }
 }
 struct Window(HWND);
 impl Drop for Window {
@@ -2169,6 +2216,50 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
             });
             0
         }
+        APP_EXIT => {
+            if !UPDATING.with(Cell::get) {
+                // Synchronous interprocess messages can overtake posted EN_CHANGE notices.
+                // Drain those first so an immediate tray exit still saves the final keystroke.
+                unsafe {
+                    let mut command = MSG::default();
+                    while PeekMessageW(&mut command, hwnd, WM_COMMAND, WM_COMMAND, PM_REMOVE) != 0 {
+                        DispatchMessageW(&command);
+                    }
+                }
+            }
+            let mut accepted = false;
+            let mut handled = false;
+            with_editor(|editor| {
+                handled = true;
+                editor.save()?;
+                editor.preview.hide();
+                editor.overlay.hide_tip();
+                editor.tooltip.hide();
+                editor.overlay.guides(0, &editor.cfg)?;
+                input::track_preview(false)?;
+                input::set_guides(false)?;
+                accepted = true;
+                unsafe {
+                    PostQuitMessage(0);
+                }
+                Ok(())
+            });
+            if !handled {
+                // The native color chooser pumps messages while the editor is borrowed.
+                // Cancel only that owned modal popup, then let the caller retry normally.
+                unsafe {
+                    let popup = GetLastActivePopup(hwnd);
+                    if popup != hwnd
+                        && GetWindow(popup, GW_OWNER) == hwnd
+                        && IsWindowVisible(popup) != 0
+                    {
+                        PostMessageW(popup, WM_COMMAND, IDCANCEL as usize, 0);
+                        return 2;
+                    }
+                }
+            }
+            isize::from(accepted)
+        }
         WM_ACTIVATE if (wp & 0xffff) as u32 == WA_INACTIVE => {
             with_editor(|editor| {
                 editor.preview.hide();
@@ -2252,6 +2343,14 @@ pub fn run(path: &Path) -> Result<(), String> {
         if hwnd.is_null() {
             return Err(err());
         }
+        // Settings may retain an elevated token after the resident is restarted normally.
+        // Only this payload-free lifecycle message is allowed across that boundary.
+        desktop::check(ChangeWindowMessageFilterEx(
+            hwnd,
+            APP_EXIT,
+            MSGFLT_ALLOW,
+            null_mut(),
+        ))?;
         let corners = DWMWCP_ROUND;
         DwmSetWindowAttribute(
             hwnd,
@@ -2399,6 +2498,13 @@ fn message_loop(hwnd: HWND, timer: HANDLE) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "helper process for the tray shutdown integration test"]
+    fn exit_settings_host() {
+        if let Some(path) = std::env::var_os("WINSIZEP_SETTINGS_TEST_CONFIG") {
+            run(Path::new(&path)).unwrap();
+        }
+    }
     #[test]
     fn renamed_mapping_keeps_its_position() {
         let mut doc = "[keys]\nQ='LeftTop'\nG='Guide'\nH='Help'\n"

@@ -169,6 +169,9 @@ impl App {
             }
             "reload" => self.load(false),
             "restart" | "quit" => {
+                if action == "quit" {
+                    crate::settings::close_for_exit()?;
+                }
                 self.exit = Some(if action == "restart" {
                     crate::ResidentExit::Restart(None)
                 } else {
@@ -609,9 +612,173 @@ mod tests {
         },
     };
     use windows_sys::Win32::{
-        System::LibraryLoader::GetModuleHandleW, UI::Input::KeyboardAndMouse::*,
+        System::LibraryLoader::GetModuleHandleW,
+        UI::{
+            Controls::{EM_REPLACESEL, EM_SETSEL},
+            Input::KeyboardAndMouse::*,
+        },
     };
     const TARGET: &str = "WinSizeP preview test target";
+
+    #[test]
+    #[ignore = "opens a temporary settings process and exercises the tray Quit action"]
+    fn tray_quit_closes_settings() {
+        let class = w!("WinSizeP.Settings");
+        assert!(
+            unsafe { FindWindowW(class, null()) }.is_null(),
+            "Close existing settings before running this integration test"
+        );
+        let folder = std::env::current_dir()
+            .unwrap()
+            .join("target/tray-exit-smoke");
+        fs::create_dir_all(&folder).unwrap();
+        let path = folder.join("config.toml");
+        fs::write(&path, config::help()).unwrap();
+        let cfg = Config::parse(&config::help().parse().unwrap()).unwrap();
+        let overlay = Overlay::new().unwrap();
+        let mut app = App {
+            frames: FrameClock::new(cfg.fps).unwrap(),
+            cfg,
+            path: path.clone(),
+            overlay,
+            tray: crate::tray::Tray::new().unwrap(),
+            preview: Preview::new().unwrap(),
+            hold: None,
+            held_window: None,
+            preview_latched: false,
+            preview_until: None,
+            preview_check: None,
+            window: null_mut(),
+            drag: None,
+            command: String::new(),
+            hide: None,
+            wait: None,
+            reload: None,
+            snapshot: None,
+            exit: None,
+        };
+        // Cover both ordinary editing and a native modal color dialog. No scheduled task is touched.
+        for modal in [false, true] {
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "settings::tests::exit_settings_host",
+                    "--nocapture",
+                ])
+                .env("WINSIZEP_SETTINGS_TEST_CONFIG", &path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let checks = (|| -> Result<(), String> {
+                let until = Instant::now() + Duration::from_secs(8);
+                let hwnd = loop {
+                    let hwnd = unsafe { FindWindowW(class, null()) };
+                    if !hwnd.is_null() && unsafe { GetPropW(hwnd, w!("ReadyTab")) } as usize == 1 {
+                        break hwnd;
+                    }
+                    if Instant::now() > until {
+                        return Err("Settings did not open".into());
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                };
+                let page = if modal { 1 } else { 5 };
+                unsafe {
+                    PostMessageW(hwnd, WM_COMMAND, 100 + page, 0);
+                }
+                while unsafe { GetPropW(hwnd, w!("ReadyTab")) } as usize != page + 1 {
+                    if Instant::now() > until {
+                        return Err("Settings page did not load".into());
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                let pane = unsafe { GetDlgItem(hwnd, 2) };
+                if modal {
+                    let doc = config::read_settings(&path)?
+                        .parse::<toml_edit::DocumentMut>()
+                        .map_err(|error| error.to_string())?;
+                    let index = crate::settings_schema::fields(1, 0, &app.cfg, &doc)
+                        .iter()
+                        .position(|field| field.key == "foreground")
+                        .ok_or("Text color setting missing")?;
+                    let color = unsafe { GetDlgItem(pane, 2000 + index as i32 * 16) };
+                    unsafe {
+                        PostMessageW(
+                            hwnd,
+                            WM_COMMAND,
+                            (2000 + index * 16) as usize,
+                            color as isize,
+                        );
+                    }
+                    loop {
+                        let popup = unsafe { GetLastActivePopup(hwnd) };
+                        if popup != hwnd && unsafe { IsWindowVisible(popup) } != 0 {
+                            break;
+                        }
+                        if Instant::now() > until {
+                            return Err("Color dialog did not open".into());
+                        }
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                } else {
+                    let fps = unsafe { GetDlgItem(pane, 2016) };
+                    unsafe {
+                        SendMessageW(fps, EM_SETSEL, 0, -1);
+                        SendMessageW(fps, EM_REPLACESEL, 1, w!("") as isize);
+                    }
+                    if app.act("quit").is_ok()
+                        || app.exit.is_some()
+                        || child
+                            .try_wait()
+                            .map_err(|error| error.to_string())?
+                            .is_some()
+                    {
+                        return Err("Invalid pending input was discarded during Quit".into());
+                    }
+                    unsafe {
+                        SendMessageW(fps, EM_SETSEL, 0, -1);
+                        SendMessageW(fps, EM_REPLACESEL, 1, w!("60") as isize);
+                    }
+                    // Quit immediately, before the usual 450ms save debounce expires.
+                }
+                app.act("quit")?;
+                if !matches!(app.exit.take(), Some(crate::ResidentExit::Quit)) {
+                    return Err("Resident did not accept Quit".into());
+                }
+                let until = Instant::now() + Duration::from_secs(5);
+                loop {
+                    if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+                        if !status.success() {
+                            return Err(format!("Settings exited with {status}"));
+                        }
+                        break;
+                    }
+                    if Instant::now() > until {
+                        return Err("Settings process survived tray Quit".into());
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                if unsafe { IsWindow(hwnd) } != 0 {
+                    return Err("Settings window survived tray Quit".into());
+                }
+                let saved = config::read_settings(&path)?
+                    .parse::<toml_edit::DocumentMut>()
+                    .map_err(|error| error.to_string())?;
+                if saved["crosshair"]["fps"].as_integer() != Some(60) {
+                    return Err("Pending setting was not saved on exit".into());
+                }
+                println!("tray quit: settings closed; pending edits saved; modal={modal}");
+                Ok(())
+            })();
+            if child.try_wait().unwrap().is_none() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            checks.unwrap();
+        }
+    }
 
     #[test]
     #[ignore = "helper process for the global input integration test"]
