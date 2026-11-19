@@ -125,7 +125,11 @@ impl App {
             self.exit = Some(crate::ResidentExit::Restart(Some(self.cfg.elevate)));
             return Ok(());
         }
-        if let Some(error) = startup_error { self.notice(&error) } else { self.config_notice() }
+        if let Some(error) = startup_error {
+            self.notice(&error)
+        } else {
+            self.config_notice()
+        }
     }
     fn config_notice(&mut self) -> Result<(), String> {
         if self.cfg.warnings.is_empty() {

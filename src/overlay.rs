@@ -32,6 +32,26 @@ unsafe extern "system" fn paint(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
                 GetClientRect(hwnd, &mut area);
                 SetDCBrushColor(dc, GetWindowLongPtrW(hwnd, GWLP_USERDATA) as u32);
                 FillRect(dc, &area, GetStockObject(DC_BRUSH));
+                let axis = GetPropW(hwnd, w!("Axis")) as usize;
+                if axis != 0 {
+                    let start = GetPropW(hwnd, w!("GapStart")) as usize as i32;
+                    let end = GetPropW(hwnd, w!("GapEnd")) as usize as i32;
+                    let gap = if axis == 1 {
+                        RECT {
+                            left: start,
+                            right: end,
+                            ..area
+                        }
+                    } else {
+                        RECT {
+                            top: start,
+                            bottom: end,
+                            ..area
+                        }
+                    };
+                    SetDCBrushColor(dc, GetPropW(hwnd, w!("ColorKey")) as usize as u32);
+                    FillRect(dc, &gap, GetStockObject(DC_BRUSH));
+                }
                 let layout = GetPropW(hwnd, w!("TextLayout")) as *const TextLayout;
                 if !layout.is_null() {
                     // SAFETY: the owning overlay removes this property before dropping the boxed layout.
@@ -141,6 +161,27 @@ impl Panel {
         }
         unsafe {
             ShowWindow(self.0, SW_HIDE);
+        }
+    }
+    fn gap(&self, start: i32, end: i32, axis: usize) {
+        unsafe {
+            let old_start = GetPropW(self.0, w!("GapStart")) as usize as i32;
+            let old_end = GetPropW(self.0, w!("GapEnd")) as usize as i32;
+            if (start, end) == (old_start, old_end) {
+                return;
+            }
+            SetPropW(self.0, w!("GapStart"), start as usize as HANDLE);
+            SetPropW(self.0, w!("GapEnd"), end as usize as HANDLE);
+            let mut area = RECT::default();
+            GetClientRect(self.0, &mut area);
+            if axis == 0 {
+                area.left = start.min(old_start);
+                area.right = end.max(old_end);
+            } else {
+                area.top = start.min(old_start);
+                area.bottom = end.max(old_end);
+            }
+            InvalidateRect(self.0, &area, 0);
         }
     }
     fn round(&self, width: i32, height: i32, radius: i32) -> Result<(), String> {
@@ -286,14 +327,20 @@ impl Overlay {
     }
     pub fn guides(&mut self, mode: u8, cfg: &Config) -> Result<(), String> {
         if mode != 0 {
-            while self.segments.len() < 4 {
+            while self.segments.len() < 2 {
                 self.segments.push(Panel::new()?);
             }
         }
         for (index, panel) in self.segments.iter().enumerate() {
-            let line = cfg.lines[index / 2];
+            let line = cfg.lines[index];
             panel.style(line.color, line.opacity);
-            if mode & (1 << (index / 2)) == 0 {
+            unsafe {
+                let key = line.color ^ 0x00ffffff;
+                SetPropW(panel.0, w!("ColorKey"), key as usize as HANDLE);
+                SetPropW(panel.0, w!("Axis"), (index + 1) as HANDLE);
+                SetLayeredWindowAttributes(panel.0, key, line.opacity, LWA_ALPHA | LWA_COLORKEY);
+            }
+            if mode & (1 << index) == 0 {
                 panel.hide()
             }
         }
@@ -342,30 +389,29 @@ impl Overlay {
             let width = scale(line.width, screen.dpi).max(1);
             let cross = (across - width / 2).max(cross_min);
             let thickness = (across - width / 2 + width).min(cross_max) - cross;
-            for (half, (begin, finish)) in [
-                (start, (center - gap).min(end)),
-                ((center + gap).max(start), end),
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                let length = finish - begin;
-                self.segments[axis * 2 + half].show(if axis == 0 {
-                    Rect {
-                        x: begin,
-                        y: cross,
-                        width: length,
-                        height: thickness,
-                    }
-                } else {
-                    Rect {
-                        x: cross,
-                        y: begin,
-                        width: thickness,
-                        height: length,
-                    }
-                });
-            }
+            // Keep each layered surface at a constant size. Only its position and the small
+            // transparent pointer gap change; resizing four surfaces every frame is costly.
+            let panel = &self.segments[axis];
+            panel.show(if axis == 0 {
+                Rect {
+                    x: start,
+                    y: cross,
+                    width: end - start,
+                    height: thickness,
+                }
+            } else {
+                Rect {
+                    x: cross,
+                    y: start,
+                    width: thickness,
+                    height: end - start,
+                }
+            });
+            panel.gap(
+                (center - gap - start).clamp(0, end - start),
+                (center + gap - start).clamp(0, end - start),
+                axis,
+            );
         }
         Ok(())
     }
@@ -437,5 +483,89 @@ impl Drop for Label {
         unsafe {
             RemovePropW(self.panel.0, w!("TextLayout"));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+    use windows_sys::Win32::System::Threading::*;
+    fn cpu_seconds() -> f64 {
+        unsafe {
+            let (mut creation, mut exit, mut kernel, mut user) = (
+                FILETIME::default(),
+                FILETIME::default(),
+                FILETIME::default(),
+                FILETIME::default(),
+            );
+            assert_ne!(
+                GetProcessTimes(
+                    GetCurrentProcess(),
+                    &mut creation,
+                    &mut exit,
+                    &mut kernel,
+                    &mut user
+                ),
+                0
+            );
+            let ticks = |time: FILETIME| {
+                (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime)
+            };
+            (ticks(kernel) + ticks(user)) as f64 / 10_000_000.0
+        }
+    }
+    #[test]
+    #[ignore = "draws crosshair windows and measures real GDI CPU usage; run in release mode"]
+    fn crosshair_cpu_smoke() {
+        let doc = crate::config::help()
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        let cfg = Config::parse(&doc).unwrap();
+        let mut overlay = Overlay::new().unwrap();
+        let screen = desktop::screen(desktop::cursor().unwrap(), 0).unwrap();
+        overlay.guides(3, &cfg).unwrap();
+        for rate in [0.0, 30.0, 60.0] {
+            overlay
+                .guides(if rate == 0.0 { 0 } else { 3 }, &cfg)
+                .unwrap();
+            let mut clock =
+                crate::framerate::FrameClock::new(if rate == 0.0 { 30.0 } else { rate }).unwrap();
+            let start_cpu = cpu_seconds();
+            let start = Instant::now();
+            let mut updates = 0;
+            let mut samples = 0;
+            while start.elapsed() < Duration::from_secs(3) {
+                samples += 1;
+                let point = POINT {
+                    x: screen.full.x + screen.full.width / 2 + samples % 100,
+                    y: screen.full.y + screen.full.height / 2 + samples % 60,
+                };
+                if let Some(point) = clock.moved(point).unwrap() {
+                    overlay.follow(point, &cfg).unwrap();
+                    updates += 1;
+                }
+                unsafe {
+                    if WaitForSingleObject(clock.handle(), 0) == WAIT_OBJECT_0
+                        && let Some(point) = clock.tick()
+                    {
+                        overlay.follow(point, &cfg).unwrap();
+                        updates += 1;
+                    }
+                    let mut msg = MSG::default();
+                    while PeekMessageW(&mut msg, null_mut(), 0, 0, PM_REMOVE) != 0 {
+                        TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let cpu = (cpu_seconds() - start_cpu) / start.elapsed().as_secs_f64() * 100.0;
+            println!(
+                "crosshair fps={rate} inputs={samples} frames={updates} cpu_one_core={cpu:.3}%"
+            );
+            assert!(updates <= (rate.max(30.0) * start.elapsed().as_secs_f64()).ceil() as i32 + 3);
+        }
+        overlay.guides(0, &cfg).unwrap();
     }
 }
