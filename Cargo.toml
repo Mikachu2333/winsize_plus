@@ -5,11 +5,16 @@ edition = "2024"
 
 [dependencies]
 windows = { version = "0.62.2", default-features = false, features = [
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_DirectWrite",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
     "Win32_System_Com",
     "Win32_System_Ole",
     "Win32_System_TaskScheduler",
     "Win32_System_Variant",
 ] }
+windows-numerics = { version = "0.3.1", default-features = false }
 toml_edit = { version = "0.25.19", default-features = false, features = [
     "parse",
     "display",

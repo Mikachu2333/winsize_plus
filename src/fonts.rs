@@ -164,43 +164,6 @@ impl Fonts {
         bold: bool,
         italic: bool,
     ) -> Result<Self, String> {
-        Self::create(
-            primary,
-            fallbacks,
-            size,
-            dpi,
-            bold,
-            italic,
-            CLEARTYPE_QUALITY,
-        )
-    }
-    pub fn new(
-        primary: &str,
-        fallbacks: &[String],
-        size: i32,
-        dpi: i32,
-        bold: bool,
-        italic: bool,
-    ) -> Result<Self, String> {
-        Self::create(
-            primary,
-            fallbacks,
-            size,
-            dpi,
-            bold,
-            italic,
-            ANTIALIASED_QUALITY,
-        )
-    }
-    fn create(
-        primary: &str,
-        fallbacks: &[String],
-        size: i32,
-        dpi: i32,
-        bold: bool,
-        italic: bool,
-        quality: u8,
-    ) -> Result<Self, String> {
         let mut fonts = Vec::new();
         let mut families = Vec::<&str>::new();
         for name in std::iter::once(primary)
@@ -214,8 +177,7 @@ impl Fonts {
                 continue;
             }
             families.push(name);
-            // Transparent overlay text needs grayscale edges; opaque settings use ClearType.
-            fonts.push(Font::with_quality(name, size, dpi, bold, italic, quality)?);
+            fonts.push(Font::new(name, size, dpi, bold, italic)?);
         }
         Ok(Self(fonts))
     }

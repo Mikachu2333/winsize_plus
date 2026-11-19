@@ -7,6 +7,7 @@ mod desktop;
 mod fonts;
 mod framerate;
 mod input;
+mod label_text;
 mod layout;
 mod logon;
 mod overlay;

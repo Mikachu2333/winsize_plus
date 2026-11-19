@@ -439,15 +439,6 @@ impl Drop for Overlay {
 pub struct Label {
     panel: Panel,
 }
-fn premultiply_coverage(coverage: u32, color: u32) -> u32 {
-    let alpha = (coverage & 255)
-        .max((coverage >> 8) & 255)
-        .max((coverage >> 16) & 255);
-    let red = (color & 255) * alpha / 255;
-    let green = ((color >> 8) & 255) * alpha / 255;
-    let blue = ((color >> 16) & 255) * alpha / 255;
-    (alpha << 24) | (red << 16) | (green << 8) | blue
-}
 impl Label {
     pub fn new() -> Result<Self, String> {
         Ok(Self {
@@ -465,61 +456,17 @@ impl Label {
         dpi: i32,
         cfg: &Config,
     ) -> Result<(), String> {
-        let fonts = Fonts::new(
-            &cfg.region_font,
-            &cfg.region_fallbacks,
-            cfg.region_font_size,
-            dpi,
-            cfg.region_bold,
-            cfg.region_italic,
-        )?;
-        let text = Box::new(TextLayout::new(caption, fonts, region.width.max(1))?);
+        let image = crate::label_text::render(caption, region.width, dpi, color, cfg)?;
         let size = Rect {
-            x: region.x + (region.width - text.width) / 2,
-            y: region.y + (region.height - text.height) / 2,
-            width: text.width,
-            height: text.height,
+            x: region.x + (region.width - image.width) / 2,
+            y: region.y + (region.height - image.height) / 2,
+            width: image.width,
+            height: image.height,
         };
-        // Render neutral glyph coverage, then premultiply the desired color. Color-keyed
-        // anti-aliasing mixes text edges with the key color and leaves opaque halos.
+        // SAFETY: Direct2D has finished drawing into the owned premultiplied bitmap.
+        // UpdateLayeredWindow copies it synchronously before Image releases its DC.
         unsafe {
             SetPropW(self.panel.0, w!("PixelAlpha"), 1usize as HANDLE);
-            let dc = GetDC(self.panel.0);
-            let memory = CreateCompatibleDC(dc);
-            if memory.is_null() {
-                ReleaseDC(self.panel.0, dc);
-                return Err(err());
-            }
-            let info = BITMAPINFO {
-                bmiHeader: BITMAPINFOHEADER {
-                    biSize: size_of::<BITMAPINFOHEADER>() as u32,
-                    biWidth: size.width,
-                    biHeight: -size.height,
-                    biPlanes: 1,
-                    biBitCount: 32,
-                    biCompression: BI_RGB,
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
-            let mut bits = null_mut();
-            let bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
-            if bitmap.is_null() {
-                DeleteDC(memory);
-                ReleaseDC(self.panel.0, dc);
-                return Err(err());
-            }
-            let old = SelectObject(memory, bitmap);
-            let pixels = std::slice::from_raw_parts_mut(
-                bits as *mut u32,
-                (size.width * size.height) as usize,
-            );
-            pixels.fill(0);
-            text.draw(memory, 0, 0, 0xffffff, true);
-            GdiFlush();
-            for pixel in pixels.iter_mut() {
-                *pixel = premultiply_coverage(*pixel, color);
-            }
             let position = POINT {
                 x: size.x,
                 y: size.y,
@@ -535,25 +482,17 @@ impl Label {
                 SourceConstantAlpha: 255,
                 AlphaFormat: AC_SRC_ALPHA as u8,
             };
-            let ok = UpdateLayeredWindow(
+            check(UpdateLayeredWindow(
                 self.panel.0,
-                dc,
+                null_mut(),
                 &position,
                 &dimensions,
-                memory,
+                image.dc,
                 &origin,
                 0,
                 &blend,
                 ULW_ALPHA,
-            );
-            let error = err();
-            SelectObject(memory, old);
-            DeleteObject(bitmap);
-            DeleteDC(memory);
-            ReleaseDC(self.panel.0, dc);
-            if ok == 0 {
-                return Err(error);
-            }
+            ))?;
         }
         self.panel.show(size);
         Ok(())
@@ -565,19 +504,6 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
     use windows_sys::Win32::System::Threading::*;
-    #[test]
-    fn transparent_text_edges_have_coverage_not_a_color_key() {
-        let blue = crate::colors::colorref(0x0f6cbd);
-        assert_eq!(premultiply_coverage(0, blue), 0);
-        assert_eq!(premultiply_coverage(0xffffff, blue), 0xff0f6cbd);
-        for coverage in 1..255u32 {
-            let pixel = premultiply_coverage(coverage * 0x010101, blue);
-            assert_eq!(pixel >> 24, coverage);
-            for shift in [0, 8, 16] {
-                assert!((pixel >> shift) & 255 <= coverage);
-            }
-        }
-    }
     fn cpu_seconds() -> f64 {
         unsafe {
             let (mut creation, mut exit, mut kernel, mut user) = (

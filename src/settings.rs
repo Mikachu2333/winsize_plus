@@ -2880,7 +2880,18 @@ mod tests {
                             unsafe {
                                 SetCursorPos(point.x, point.y);
                             }
-                            std::thread::sleep(Duration::from_millis(100));
+                            // Observe the old focus being cleared before waiting for the new one.
+                            // A fixed sleep can still sample the previous region on a busy UI thread.
+                            while overlay_count() == 2 && started.elapsed() < Duration::from_secs(1)
+                            {
+                                std::thread::sleep(Duration::from_millis(10));
+                            }
+                            if overlay_count() == 2 {
+                                return Err(
+                                    "Moving out of the focused region did not restore the grid"
+                                        .into(),
+                                );
+                            }
                             while overlay_count() != 2 && started.elapsed() < Duration::from_secs(5)
                             {
                                 std::thread::sleep(Duration::from_millis(10));
