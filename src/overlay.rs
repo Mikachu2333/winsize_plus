@@ -23,6 +23,10 @@ const CLASS: *const u16 = w!("WinSizeP.Overlay");
 unsafe extern "system" fn paint(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
         match msg {
+            WM_DISPLAYCHANGE | WM_SETTINGCHANGE | WM_DPICHANGED => {
+                crate::input::display_changed();
+                DefWindowProcW(hwnd, msg, wp, lp)
+            }
             WM_NCHITTEST => HTTRANSPARENT as isize,
             WM_ERASEBKGND => 1,
             WM_PAINT => {
@@ -107,7 +111,8 @@ impl Panel {
     }
     pub(crate) fn style(&self, color: u32, alpha: u8) {
         unsafe {
-            SetWindowLongPtrW(self.0, GWLP_USERDATA, color as isize);
+            // windows-sys maps this to SetWindowLongW (i32) on x86.
+            SetWindowLongPtrW(self.0, GWLP_USERDATA, color as _);
             SetLayeredWindowAttributes(self.0, 0, alpha, LWA_ALPHA);
             InvalidateRect(self.0, null(), 0);
         }
@@ -201,6 +206,7 @@ pub struct Overlay {
     mode: u8,
     last_monitor: HMONITOR,
     display: Option<Display>,
+    display_epoch: u64,
 }
 fn scale(value: i32, dpi: i32) -> i32 {
     (value * dpi + 48) / 96
@@ -244,6 +250,7 @@ impl Overlay {
                 mode: 0,
                 last_monitor: null_mut(),
                 display: None,
+                display_epoch: desktop::display_epoch(),
             })
         }
     }
@@ -368,9 +375,10 @@ impl Overlay {
             return Ok(());
         }
         let monitor = unsafe { MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST) };
-        if self.last_monitor != monitor {
+        if self.last_monitor != monitor || self.display_epoch != desktop::display_epoch() {
             self.display = Some(desktop::display(monitor)?);
             self.last_monitor = monitor;
+            self.display_epoch = desktop::display_epoch();
         }
         let screen = self.display.as_ref().ok_or("display")?;
         let area = screen.full;
@@ -401,8 +409,8 @@ impl Overlay {
             let width = scale(line.width, screen.dpi).max(1);
             let cross = (across - width / 2).max(cross_min);
             let thickness = (across - width / 2 + width).min(cross_max) - cross;
-            // Keep each layered surface at a constant size. Only its position and the small
-            // transparent pointer gap change; resizing four surfaces every frame is costly.
+            // Keep two surfaces at monitor length; only their thickness is clipped
+            // at screen edges. Most frames change position and the transparent gap.
             let panel = &self.segments[axis];
             panel.show(if axis == 0 {
                 Rect {

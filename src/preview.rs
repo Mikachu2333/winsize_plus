@@ -165,6 +165,7 @@ pub struct Preview {
     focused: bool,
     hover: Option<(u32, Instant)>,
     pointer: Option<(i32, i32)>,
+    display_epoch: u64,
 }
 impl Preview {
     pub fn visible(&self) -> bool {
@@ -189,6 +190,7 @@ impl Preview {
             focused: false,
             hover: None,
             pointer: None,
+            display_epoch: desktop::display_epoch(),
         })
     }
     pub fn start(&mut self, hwnd: HWND, cfg: &Config) -> Result<(), String> {
@@ -271,6 +273,7 @@ impl Preview {
             cfg.highlight_opacity,
         );
         self.display = Some((monitor, display));
+        self.display_epoch = desktop::display_epoch();
         self.show_base(cfg)?;
         Ok(())
     }
@@ -342,6 +345,7 @@ impl Preview {
             // Mouse hooks can miss moves while a native UI operation is running. Polling
             // only changed coordinates avoids starting a fresh dwell at the old deadline.
             if self.pointer != Some((point.x, point.y))
+                || self.display_epoch != desktop::display_epoch()
                 || self.deadline().is_some_and(|when| Instant::now() >= when)
             {
                 self.follow(point, cfg)?;
@@ -352,7 +356,9 @@ impl Preview {
     pub fn follow(&mut self, point: POINT, cfg: &Config) -> Result<(), String> {
         self.pointer = Some((point.x, point.y));
         let monitor = unsafe { MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST) };
-        if self.display.as_ref().is_none_or(|(old, _)| *old != monitor) {
+        if self.display.as_ref().is_none_or(|(old, _)| *old != monitor)
+            || self.display_epoch != desktop::display_epoch()
+        {
             self.rebuild(monitor, point, cfg)?;
         }
         if let Some(name) = &self.locked {

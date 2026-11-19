@@ -39,6 +39,14 @@ pub fn cursor() -> Result<POINT, String> {
     Ok(point)
 }
 
+thread_local! { static DISPLAY_EPOCH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
+pub fn display_epoch() -> u64 {
+    DISPLAY_EPOCH.with(std::cell::Cell::get)
+}
+pub fn invalidate_displays() {
+    DISPLAY_EPOCH.with(|epoch| epoch.set(epoch.get().wrapping_add(1)));
+}
+
 pub struct Display {
     pub work: Rect,
     pub full: Rect,
@@ -61,9 +69,29 @@ pub fn display(monitor: HMONITOR) -> Result<Display, String> {
             .trim_start_matches(r"\\.\DISPLAY")
             .parse()
             .unwrap_or(1);
-        let (mut dpi, mut second) = (96, 96);
-        if GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi, &mut second) < 0 {
-            dpi = 96;
+        // A hidden window on the monitor has the same PerMonitorV2 context as
+        // the actual UI. GetDpiForMonitor must not be used in that context.
+        let probe = CreateWindowExW(
+            WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+            windows_sys::core::w!("STATIC"),
+            std::ptr::null(),
+            WS_POPUP | WS_DISABLED,
+            info.monitorInfo.rcMonitor.left,
+            info.monitorInfo.rcMonitor.top,
+            1,
+            1,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            std::ptr::null(),
+        );
+        if probe.is_null() {
+            return Err(err());
+        }
+        let dpi = GetDpiForWindow(probe);
+        DestroyWindow(probe);
+        if dpi == 0 {
+            return Err("Cannot determine monitor DPI / 无法读取屏幕 DPI".into());
         }
         Ok(Display {
             work: rect(info.monitorInfo.rcWork),

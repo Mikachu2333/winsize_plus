@@ -26,6 +26,11 @@ pub const ALT_RELEASE: u32 = WM_APP + 8;
 pub const DRAG_START: u32 = WM_APP + 9;
 pub const DRAG_END: u32 = WM_APP + 10;
 pub const GRID_SHOW: u32 = WM_APP + 11;
+pub const DISPLAY_CHANGED: u32 = WM_APP + 12;
+pub fn display_changed() {
+    desktop::invalidate_displays();
+    post(DISPLAY_CHANGED, 0, 0);
+}
 const LEFT: u32 = VK_LMENU as u32;
 const RIGHT: u32 = VK_RMENU as u32;
 
@@ -607,6 +612,7 @@ impl Hooks {
         }
         let (send_events, receive_events) = mpsc::channel();
         let destination = window as usize;
+        EVENTS.with_borrow_mut(|events| *events = Some((send_events.clone(), destination)));
         let event = wake as usize;
         let (commands, receive) = mpsc::channel();
         let (ready, started) = mpsc::sync_channel(1);
@@ -722,6 +728,9 @@ impl Drop for Hooks {
             inbox.take();
         });
         CURRENT.with(|current| current.set(None));
+        EVENTS.with_borrow_mut(|events| {
+            events.take();
+        });
     }
 }
 

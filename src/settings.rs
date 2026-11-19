@@ -2185,11 +2185,15 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
             0
         }
         WM_DPICHANGED | WM_SETTINGCHANGE => {
+            input::display_changed();
             with_editor(|e| {
-                e.save()?;
                 e.dpi = unsafe { GetDpiForWindow(hwnd) }.max(96) as i32;
-                e.font = Font::new("SystemFont", 0, e.dpi, false, false)?;
-                e.hint_font = Font::new("SystemFont", 9, e.dpi, false, false)?;
+                // Keep pending (even temporarily invalid) edits in their controls.
+                // Old fonts remain alive until every control has its replacement.
+                let font = Font::new("SystemFont", 0, e.dpi, false, false)?;
+                let hint = Font::new("SystemFont", 9, e.dpi, false, false)?;
+                let _old_font = std::mem::replace(&mut e.font, font);
+                let _old_hint = std::mem::replace(&mut e.hint_font, hint);
                 crate::settings_paint::reset_fonts();
                 MEASUREMENTS.with_borrow_mut(HashMap::clear);
                 for handle in e
@@ -2199,6 +2203,22 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
                     .chain(std::iter::once(&e.status))
                 {
                     send(*handle, WM_SETFONT, e.font.0 as usize, 1);
+                }
+                for row in e
+                    .rows
+                    .iter()
+                    .chain(e.pages.values().flat_map(|(rows, _)| rows))
+                {
+                    for (slot, handle) in row.controls.iter().enumerate() {
+                        if !handle.is_null() {
+                            send(
+                                *handle,
+                                WM_SETFONT,
+                                if slot == 2 { e.hint_font.0 } else { e.font.0 } as usize,
+                                1,
+                            );
+                        }
+                    }
                 }
                 if message == WM_DPICHANGED {
                     let rect = unsafe { &*(lp as *const RECT) };
@@ -2210,7 +2230,8 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
                         rect.bottom - rect.top,
                     );
                 }
-                e.rebuild()
+                e.layout()?;
+                e.render()
             });
             0
         }
@@ -2542,6 +2563,7 @@ fn message_loop(hwnd: HWND, timer: HANDLE) -> Result<(), String> {
                     break;
                 };
                 match msg.message {
+                    input::DISPLAY_CHANGED => with_editor(|e| e.render()),
                     input::MOVE => with_editor(|e| e.moved(input::moved())),
                     input::CANCEL => with_editor(|e| e.escape()),
                     _ => {}

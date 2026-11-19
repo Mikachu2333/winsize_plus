@@ -309,6 +309,10 @@ impl App {
     }
     fn handle_event(&mut self, msg: MSG) -> Result<(), String> {
         match msg.message {
+            input::DISPLAY_CHANGED => {
+                self.overlay.follow(desktop::cursor()?, &self.cfg)?;
+                self.preview.tick(&self.cfg)
+            }
             crate::tray::MENU => {
                 if let Some(action) = self.tray.menu(&self.cfg, msg.lParam)? {
                     self.act(action)?;
