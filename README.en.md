@@ -6,7 +6,7 @@ A Windows utility for moving and resizing windows with Alt shortcuts, mouse drag
 
 ## Usage
 
-Requires Windows 10 version 1703 or newer (x64 or x86). Building requires Rust 1.88 or newer with MSVC and the Windows SDK. This is a portable application: place it in a user-writable directory so its adjacent configuration can be created and updated.
+Requires Windows 10 version 1703 or newer (x64 only). Building requires Rust 1.88 or newer with MSVC and the Windows SDK, targeting `x86_64-pc-windows-msvc`. This is a portable application: place it in a user-writable directory so its adjacent configuration can be created and updated.
 
 Floating help and tips are capped at one third of the current monitor's work-area height. Overflow adds a vertical scrollbar with arrow buttons and a draggable thumb; mouse wheel, PageUp/PageDown, Up/Down, and Home/End also scroll. Press Esc to close. Oversized tips remain visible instead of expiring while you read them.
 

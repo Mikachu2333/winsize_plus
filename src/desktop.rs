@@ -1,5 +1,5 @@
 use crate::{
-    cli::{Request, Selector},
+    cli::{Request, Selector, Switch},
     config::{self, Config, Identity},
     layout::Rect,
 };
@@ -636,6 +636,50 @@ fn set_frame(hwnd: HWND, wanted: Rect, outer: Rect, frame: Rect) -> Result<(), S
         ))
     }
 }
+pub fn topmost(hwnd: HWND) -> Result<bool, String> {
+    // SAFETY: querying a foreign HWND does not dereference it. A zero style is
+    // valid, so distinguish it from a failed query using the thread's last error.
+    unsafe {
+        SetLastError(ERROR_SUCCESS);
+        let style = GetWindowLongW(hwnd, GWL_EXSTYLE);
+        if style == 0 && GetLastError() != ERROR_SUCCESS {
+            return Err(err());
+        }
+        Ok(style as u32 & WS_EX_TOPMOST != 0)
+    }
+}
+fn set_topmost(hwnd: HWND, mode: Switch) -> Result<(), String> {
+    let current = topmost(hwnd)?;
+    let wanted = mode.value(current);
+    if wanted == current {
+        return Ok(());
+    }
+    // SAFETY: SetWindowPos validates the handle. Keep the request asynchronous
+    // so an unresponsive window procedure cannot block this thread indefinitely.
+    unsafe {
+        check(SetWindowPos(
+            hwnd,
+            if wanted { HWND_TOPMOST } else { HWND_NOTOPMOST },
+            0,
+            0,
+            0,
+            0,
+            SWP_ASYNCWINDOWPOS | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_NOOWNERZORDER,
+        ))?;
+    }
+    // Posting the request only confirms it was queued. Wait for the actual
+    // style before a caller reports success or decides the next toggle.
+    let until = std::time::Instant::now() + std::time::Duration::from_millis(1200);
+    loop {
+        if topmost(hwnd)? == wanted {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= until {
+            return Err("Always-on-top change timed out / 置顶状态切换超时".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
 pub fn apply(
     hwnd: HWND,
     req: &Request,
@@ -668,22 +712,7 @@ pub fn apply(
         position(hwnd, req, cfg, point)?
     }
     if let Some(mode) = req.top {
-        unsafe {
-            let was = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST != 0;
-            check(SetWindowPos(
-                hwnd,
-                if mode.value(was) {
-                    HWND_TOPMOST
-                } else {
-                    HWND_NOTOPMOST
-                },
-                0,
-                0,
-                0,
-                0,
-                SWP_ASYNCWINDOWPOS | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_NOOWNERZORDER,
-            ))?
-        }
+        set_topmost(hwnd, mode)?;
     }
     if let (Some(mode), Some(id)) = (req.ignore, id) {
         if id.name.is_empty() {
@@ -696,6 +725,121 @@ pub fn apply(
 
 #[cfg(test)]
 mod tests {
+    struct TopmostWindow {
+        hwnd: super::HWND,
+        stop: std::sync::mpsc::Sender<()>,
+        owner: Option<std::thread::JoinHandle<()>>,
+    }
+    impl TopmostWindow {
+        fn new(top: bool, delay: std::time::Duration) -> Self {
+            use super::*;
+            let (ready, window) = std::sync::mpsc::sync_channel(1);
+            let (stop, stopped) = std::sync::mpsc::channel();
+            let owner = std::thread::spawn(move || {
+                // SAFETY: the test thread owns this hidden window, pumps its
+                // messages, and destroys it before exiting. No user window is used.
+                unsafe {
+                    let hwnd = CreateWindowExW(
+                        if top { WS_EX_TOPMOST } else { 0 },
+                        windows_sys::core::w!("STATIC"),
+                        std::ptr::null(),
+                        WS_POPUP,
+                        0,
+                        0,
+                        100,
+                        100,
+                        null_mut(),
+                        null_mut(),
+                        null_mut(),
+                        std::ptr::null(),
+                    );
+                    assert!(!hwnd.is_null());
+                    ready.send(hwnd as usize).unwrap();
+                    // Model a busy target that cannot process the posted change yet.
+                    if matches!(
+                        stopped.recv_timeout(delay),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                    ) {
+                        loop {
+                            let mut message = MSG::default();
+                            while PeekMessageW(&mut message, null_mut(), 0, 0, PM_REMOVE) != 0 {
+                                DispatchMessageW(&message);
+                            }
+                            if !matches!(
+                                stopped.recv_timeout(std::time::Duration::from_millis(1)),
+                                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                            ) {
+                                break;
+                            }
+                        }
+                    }
+                    DestroyWindow(hwnd);
+                }
+            });
+            Self {
+                hwnd: window
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap() as _,
+                stop,
+                owner: Some(owner),
+            }
+        }
+    }
+    impl Drop for TopmostWindow {
+        fn drop(&mut self) {
+            let _ = self.stop.send(());
+            self.owner.take().unwrap().join().unwrap();
+        }
+    }
+    #[test]
+    fn topmost_toggle_waits_for_the_target_and_reads_external_changes() {
+        use std::time::Duration;
+        for initial in [false, true] {
+            let window = TopmostWindow::new(initial, Duration::from_millis(150));
+            assert_eq!(topmost(window.hwnd).unwrap(), initial);
+            set_topmost(window.hwnd, Switch::Toggle).unwrap();
+            assert_eq!(topmost(window.hwnd).unwrap(), !initial);
+            set_topmost(window.hwnd, Switch::Toggle).unwrap();
+            assert_eq!(topmost(window.hwnd).unwrap(), initial);
+            for (mode, wanted) in [(Switch::On, true), (Switch::Off, false)] {
+                set_topmost(window.hwnd, mode).unwrap();
+                set_topmost(window.hwnd, mode).unwrap();
+                assert_eq!(topmost(window.hwnd).unwrap(), wanted);
+            }
+            // SAFETY: the fixture keeps this window and its message pump alive.
+            // Change it outside our helper, as another tool or the application would.
+            unsafe {
+                check(SetWindowPos(
+                    window.hwnd,
+                    HWND_TOPMOST,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
+                ))
+                .unwrap();
+            }
+            assert!(topmost(window.hwnd).unwrap());
+            set_topmost(window.hwnd, Switch::Toggle).unwrap();
+            assert!(!topmost(window.hwnd).unwrap());
+        }
+    }
+    #[test]
+    fn topmost_does_not_report_success_when_the_target_stops_processing() {
+        let window = TopmostWindow::new(true, std::time::Duration::from_secs(5));
+        let error = set_topmost(window.hwnd, Switch::Toggle).unwrap_err();
+        assert!(error.contains("timed out"), "{error}");
+        assert!(topmost(window.hwnd).unwrap());
+    }
+    #[test]
+    fn topmost_rejects_invalid_handles_but_accepts_a_zero_extended_style() {
+        assert!(topmost(null_mut()).is_err());
+        let window = TopmostWindow::new(false, std::time::Duration::ZERO);
+        // SAFETY: the fixture owns the window until this assertion finishes.
+        assert_eq!(unsafe { GetWindowLongW(window.hwnd, GWL_EXSTYLE) }, 0);
+        assert!(!topmost(window.hwnd).unwrap());
+    }
     #[test]
     fn version_resources_reject_unaligned_and_out_of_bounds_results() {
         let data = [10u16, 20, 30, 40];

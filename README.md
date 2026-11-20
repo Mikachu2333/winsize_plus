@@ -133,7 +133,7 @@ Windows 窗口位置与大小调整工具，支持 Alt 快捷键、鼠标拖动�
 
 Windows，Rust MSVC 工具链与 Windows SDK：
 
-运行环境为 Windows 10 1703 或更新版本，支持 x64 和 x86；构建需要 Rust 1.88 或更新版本。程序采用便携配置，目录必须允许当前用户写入；请放在个人可写目录，而不是只读目录或受保护的 Program Files。
+运行环境为 Windows 10 1703 或更新版本，仅支持 x64；构建需要 Rust 1.88 或更新版本，目标为 `x86_64-pc-windows-msvc`。程序采用便携配置，目录必须允许当前用户写入；请放在个人可写目录，而不是只读目录或受保护的 Program Files。
 
 ```powershell
 cargo build --release

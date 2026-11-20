@@ -296,8 +296,7 @@ impl Panel {
     }
     pub(crate) fn style(&self, color: u32, alpha: u8) {
         unsafe {
-            // windows-sys maps this to SetWindowLongW (i32) on x86.
-            SetWindowLongPtrW(self.0, GWLP_USERDATA, color as _);
+            SetWindowLongPtrW(self.0, GWLP_USERDATA, color as isize);
             SetLayeredWindowAttributes(self.0, 0, alpha, LWA_ALPHA);
             InvalidateRect(self.0, null(), 0);
         }
@@ -457,6 +456,10 @@ impl Overlay {
     #[cfg(test)]
     pub fn tip_visible(&self) -> bool {
         self.tip.1.get().is_some()
+    }
+    #[cfg(test)]
+    pub fn tip_text(&self) -> &str {
+        &self.tip_text
     }
     pub fn tip(&mut self, text: &str, cfg: &Config) -> Result<(), String> {
         let screen = desktop::screen(desktop::cursor()?, 0)?;
@@ -1212,8 +1215,8 @@ mod multi_monitor_regressions {
                 },
             ] {
                 overlay.follow(p, &cfg).unwrap();
-                for axis in 0..2 {
-                    let actual = desktop::bounds(overlay.segments[axis].0).unwrap().0;
+                for panel in &overlay.segments {
+                    let actual = desktop::bounds(panel.0).unwrap().0;
                     assert!(actual.x >= d.full.x && actual.y >= d.full.y, "{actual:?}");
                     assert!(
                         actual.x + actual.width <= d.full.x + d.full.width,

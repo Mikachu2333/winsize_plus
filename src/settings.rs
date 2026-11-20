@@ -338,7 +338,7 @@ impl Editor {
                 if !hwnd.is_null() {
                     unsafe {
                         ShowWindow(hwnd, SW_HIDE);
-                        SetWindowLongPtrW(hwnd, GWLP_ID, -GetDlgCtrlID(hwnd) as _);
+                        SetWindowLongPtrW(hwnd, GWLP_ID, -GetDlgCtrlID(hwnd) as isize);
                     }
                 }
             }
@@ -359,7 +359,7 @@ impl Editor {
                 for hwnd in row.controls {
                     if !hwnd.is_null() {
                         unsafe {
-                            SetWindowLongPtrW(hwnd, GWLP_ID, -GetDlgCtrlID(hwnd) as _);
+                            SetWindowLongPtrW(hwnd, GWLP_ID, -GetDlgCtrlID(hwnd) as isize);
                             ShowWindow(hwnd, SW_SHOWNOACTIVATE);
                         }
                     }

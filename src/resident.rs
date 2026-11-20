@@ -275,10 +275,14 @@ impl App {
             }
             "borders" => {
                 if self.preview.visible() {
-                    self.held_window = None;
-                    self.preview.hide();
-                    input::track_preview(false)?;
+                    self.close_preview()?;
                     self.notice(self.cfg.tr("Outlines hidden", "框线已隐藏"))
+                } else if !self.cfg.preview {
+                    self.close_preview()?;
+                    self.notice(self.cfg.tr(
+                        "Region outlines disabled in settings",
+                        "分区框线已在设置中禁用",
+                    ))
                 } else {
                     self.held_window = Some(self.window);
                     self.preview_latched = true;
@@ -313,9 +317,7 @@ impl App {
                     })?;
                     input::configure(&self.cfg)?;
                 } else if name == "top" {
-                    let top = unsafe {
-                        GetWindowLongW(self.window, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST != 0
-                    };
+                    let top = desktop::topmost(self.window)?;
                     self.notice(if top {
                         self.cfg.tr("Always on top enabled", "已置顶")
                     } else {
@@ -454,9 +456,14 @@ impl App {
                 Ok(())
             }
             input::ACTION => {
-                self.close_preview()?;
+                let action = self.cfg.keys.get(&(msg.wParam as u32)).cloned();
+                // Borders must inspect the visible preview before deciding
+                // whether to show or hide it.
+                if action.as_deref() != Some("borders") {
+                    self.close_preview()?;
+                }
                 self.clear();
-                if let Some(action) = self.cfg.keys.get(&(msg.wParam as u32)).cloned() {
+                if let Some(action) = action {
                     self.act(&action)?
                 }
                 Ok(())
@@ -770,6 +777,74 @@ mod tests {
         },
     };
     const TARGET: &str = "WinSizeP preview test target";
+
+    #[test]
+    #[ignore = "opens temporary outlines, tips and a tray icon; no config is changed"]
+    fn borders_notice_reflects_visibility_and_clears_old_deadlines() {
+        let _dpi = crate::test_support::Dpi::new();
+        let mut cfg = crate::test_support::cfg();
+        cfg.preview = false;
+        let overlay = Overlay::new().unwrap();
+        let _hooks = input::Hooks::start(&cfg).unwrap();
+        let mut app = App {
+            cast: crate::cast::Visuals::new(),
+            mousecast: false,
+            keycast: false,
+            frames: FrameClock::new(cfg.fps).unwrap(),
+            cfg,
+            path: PathBuf::new(),
+            overlay,
+            tray: crate::tray::Tray::new().unwrap(),
+            preview: Preview::new().unwrap(),
+            held_window: None,
+            preview_latched: false,
+            preview_until: Some(Instant::now()),
+            preview_check: Some(Instant::now()),
+            window: null_mut(),
+            drag: None,
+            command: String::new(),
+            hide: None,
+            reload: None,
+            snapshot: None,
+            exit: None,
+        };
+        app.act("borders").unwrap();
+        assert!(!app.preview.visible());
+        assert!(app.held_window.is_none());
+        assert!(app.preview_until.is_none() && app.preview_check.is_none());
+        assert_eq!(
+            app.overlay.tip_text(),
+            app.cfg.tr(
+                "Region outlines disabled in settings",
+                "分区框线已在设置中禁用"
+            )
+        );
+        app.cfg.preview = true;
+        app.cfg.keys.insert(0x42, "borders".into());
+        app.act("borders").unwrap();
+        assert!(app.preview.visible());
+        assert_eq!(
+            app.overlay.tip_text(),
+            app.cfg.tr("Outlines shown", "框线已显示")
+        );
+        app.preview_until = Some(Instant::now());
+        app.preview_check = Some(Instant::now());
+        app.handle_event(MSG {
+            message: input::ACTION,
+            wParam: 0x42,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(!app.preview.visible());
+        assert!(app.held_window.is_none() && !app.preview_latched);
+        assert!(app.preview_until.is_none() && app.preview_check.is_none());
+        app.deadlines().unwrap();
+        assert!(app.overlay.tip_visible());
+        assert_eq!(
+            app.overlay.tip_text(),
+            app.cfg.tr("Outlines hidden", "框线已隐藏")
+        );
+    }
 
     #[test]
     #[ignore = "opens temporary overlays and a tray icon; no startup task or config is changed"]

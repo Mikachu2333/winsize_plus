@@ -1,4 +1,9 @@
 fn main() -> std::io::Result<()> {
+    if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() != Ok("x86_64") {
+        return Err(std::io::Error::other(
+            "WinSizeP supports x64 only; build with --target x86_64-pc-windows-msvc",
+        ));
+    }
     let icon = "assets/winsizep.ico";
     println!("cargo:rerun-if-changed={icon}");
     println!("cargo:rerun-if-changed=assets/winsizep.manifest");
