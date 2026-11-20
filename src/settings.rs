@@ -1506,6 +1506,9 @@ impl Editor {
                 _ => {}
             }
         }
+        if !self.preview.warnings().is_empty() {
+            self.status(&self.preview.warnings().join("\n"));
+        }
         input::set_guides(guides != 0)?;
         input::track_preview(self.preview.visible())
     }
@@ -2304,6 +2307,20 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
                                 if slot == 2 { e.hint_font.0 } else { e.font.0 } as usize,
                                 1,
                             );
+                            let mut class = [0u16; 32];
+                            let len = unsafe {
+                                GetClassNameW(*handle, class.as_mut_ptr(), class.len() as i32)
+                            };
+                            if String::from_utf16_lossy(&class[..len.max(0) as usize])
+                                .eq_ignore_ascii_case("COMBOBOX")
+                            {
+                                send(
+                                    *handle,
+                                    CB_SETITEMHEIGHT,
+                                    0,
+                                    (e.font.height() + e.s(14)) as isize,
+                                );
+                            }
                         }
                     }
                 }

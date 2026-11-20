@@ -73,28 +73,29 @@ impl Drop for Region {
 
 fn outline(
     panel: &Panel,
-    rectangles: &[(Rect, Rect)],
+    rectangles: &[(Rect, Rect, Rect, i32)],
     desktop: Rect,
-    width: i32,
 ) -> Result<(), String> {
     let shape = Region::new()?;
     let strip = Region::new()?;
     unsafe {
-        for &(rect, area) in rectangles {
+        for &(rect, area, clip, width) in rectangles {
             if rect.width <= 0 || rect.height <= 0 {
                 continue;
             }
             for line in strokes(rect, area, width) {
-                let left = line.x.max(desktop.x);
+                let left = line.x.max(desktop.x).max(clip.x);
                 let right = line
                     .x
                     .saturating_add(line.width)
-                    .min(desktop.x.saturating_add(desktop.width));
-                let top = line.y.max(desktop.y);
+                    .min(desktop.x.saturating_add(desktop.width))
+                    .min(clip.x.saturating_add(clip.width));
+                let top = line.y.max(desktop.y).max(clip.y);
                 let bottom = line
                     .y
                     .saturating_add(line.height)
-                    .min(desktop.y.saturating_add(desktop.height));
+                    .min(desktop.y.saturating_add(desktop.height))
+                    .min(clip.y.saturating_add(clip.height));
                 if right > left && bottom > top {
                     desktop::check(SetRectRgn(
                         strip.0,
@@ -116,6 +117,8 @@ struct PresetRegion {
     name: String,
     rect: Rect,
     area: Rect,
+    dpi: i32,
+    virtual_area: bool,
 }
 
 fn contains(rect: Rect, point: POINT) -> bool {
@@ -166,6 +169,7 @@ pub struct Preview {
     hover: Option<(u32, Instant)>,
     pointer: Option<(i32, i32)>,
     display_epoch: u64,
+    warnings: Vec<String>,
 }
 impl Preview {
     pub fn visible(&self) -> bool {
@@ -191,6 +195,7 @@ impl Preview {
             hover: None,
             pointer: None,
             display_epoch: desktop::display_epoch(),
+            warnings: Vec::new(),
         })
     }
     pub fn start(&mut self, hwnd: HWND, cfg: &Config) -> Result<(), String> {
@@ -238,35 +243,87 @@ impl Preview {
             cfg.outline.color
         }
     }
-    fn rebuild(&mut self, monitor: HMONITOR, point: POINT, cfg: &Config) -> Result<(), String> {
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
+    }
+    fn rebuild(&mut self, monitor: HMONITOR, _point: POINT, cfg: &Config) -> Result<(), String> {
         let display = desktop::display(monitor)?;
         let virtual_area = desktop::desktop();
+        let displays = desktop::displays()?;
         self.regions.clear();
+        self.warnings.clear();
         for (name, layout) in &cfg.presets {
-            let area = if layout.monitor == 0 || layout.monitor == display.number {
-                display.work
-            } else {
-                desktop::screen(point, layout.monitor)?.work
-            };
-            let rect = layout.resolve(area, self.frame, virtual_area)?;
-            if rect.width > 0 && rect.height > 0 {
-                self.regions.push(PresetRegion {
+            let result = (|| -> Result<PresetRegion, String> {
+                let target = if layout.monitor == 0 {
+                    &display
+                } else {
+                    displays
+                        .iter()
+                        .find(|d| d.number == layout.monitor)
+                        .ok_or_else(|| {
+                            format!(
+                                "Monitor {} is unavailable / 屏幕 {} 不可用",
+                                layout.monitor, layout.monitor
+                            )
+                        })?
+                };
+                let rect = layout.resolve(target.work, self.frame, virtual_area)?;
+                let virtual_layout = layout.uses_virtual_desktop();
+                Ok(PresetRegion {
                     name: name.clone(),
                     rect,
-                    area,
-                });
+                    area: if virtual_layout {
+                        virtual_area
+                    } else {
+                        target.work
+                    },
+                    dpi: target.dpi,
+                    virtual_area: virtual_layout,
+                })
+            })();
+            match result {
+                Ok(region) => self.regions.push(region),
+                Err(error) => self
+                    .warnings
+                    .push(format!("{}: {error}", cfg.display_name(name))),
             }
         }
+        if self
+            .locked
+            .as_ref()
+            .is_some_and(|name| !self.regions.iter().any(|r| &r.name == name))
+        {
+            return Err(self.warnings.join("\n"));
+        }
         self.regions.sort_by(|a, b| a.name.cmp(&b.name));
+        let width = |dpi: i32| (cfg.outline.width * dpi / 96).max(1);
         let all: Vec<_> = if self.grid {
             (1..=9)
-                .map(|cell| (grid_rect(display.full, cell), display.full))
+                .map(|cell| {
+                    (
+                        grid_rect(display.full, cell),
+                        display.full,
+                        display.full,
+                        width(display.dpi),
+                    )
+                })
                 .collect()
         } else {
-            self.regions.iter().map(|r| (r.rect, r.area)).collect()
+            self.regions
+                .iter()
+                .flat_map(|r| {
+                    if r.virtual_area {
+                        displays
+                            .iter()
+                            .map(|d| (r.rect, r.area, d.full, width(d.dpi)))
+                            .collect::<Vec<_>>()
+                    } else {
+                        vec![(r.rect, r.area, r.area, width(r.dpi))]
+                    }
+                })
+                .collect()
         };
-        let width = (cfg.outline.width * display.dpi / 96).max(1);
-        outline(&self.base, &all, virtual_area, width)?;
+        outline(&self.base, &all, virtual_area)?;
         self.base.style(Self::color(cfg), cfg.outline.opacity);
         self.highlight.style(
             unsafe { GetSysColor(COLOR_HIGHLIGHT) },
@@ -314,7 +371,7 @@ impl Preview {
         self.label.hide();
         if let Some(index) = selected {
             let region = &self.regions[index];
-            let dpi = self.display.as_ref().unwrap().1.dpi;
+            let dpi = region.dpi;
             // Selection uses a translucent interior fill; the ordinary outline stays unchanged.
             self.highlight.show(region.rect);
             self.label.show(
@@ -477,6 +534,8 @@ mod tests {
             name: name.into(),
             rect,
             area: rect,
+            dpi: 96,
+            virtual_area: false,
         }
     }
     #[test]
@@ -520,5 +579,107 @@ mod tests {
                 (cell - 1) as usize
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod multi_monitor_regressions {
+    use super::*;
+    use crate::test_support::{Dpi, displays, point};
+
+    #[test]
+    #[ignore = "requires an interactive desktop; some cases need mixed DPI monitors"]
+    fn fixed_monitor_label_uses_destination_dpi() {
+        let _dpi = Dpi::new();
+        let Some(displays) = crate::test_support::require_displays(true) else {
+            return;
+        };
+        let low = &displays.first().unwrap().1;
+        let high = &displays.last().unwrap().1;
+        let _overlay = overlay::Overlay::new().unwrap();
+        let mut cfg = crate::test_support::cfg();
+        cfg.presets.clear();
+        cfg.presets.insert(
+            "remote".into(),
+            format!("0|0|100sw|100sh|{}", high.number).parse().unwrap(),
+        );
+        let mut preview = Preview::new().unwrap();
+        preview.locked = Some("remote".into());
+        preview.follow(point(low), &cfg).unwrap();
+        let actual = overlay::label_rect(&preview.label);
+        let expected = crate::label_text::render(
+            "remote",
+            high.work.width,
+            high.dpi,
+            Preview::color(&cfg),
+            &cfg,
+        )
+        .unwrap();
+        println!(
+            "pointer dpi={} destination dpi={} label={}x{} expected={}x{}",
+            low.dpi, high.dpi, actual.width, actual.height, expected.width, expected.height
+        );
+        preview.hide();
+        assert_eq!(
+            (actual.width, actual.height),
+            (expected.width, expected.height),
+            "Fixed-monitor labels must use that monitor's DPI"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires an interactive desktop; some cases need mixed DPI monitors"]
+    fn virtual_desktop_outline_reaches_second_monitor() {
+        let _dpi = Dpi::new();
+        let Some(displays) = crate::test_support::require_displays(false) else {
+            return;
+        };
+        let primary = &displays[0].1;
+        let virtual_area = desktop::desktop();
+        let _overlay = overlay::Overlay::new().unwrap();
+        let mut cfg = crate::test_support::cfg();
+        cfg.presets.clear();
+        cfg.presets
+            .insert("span".into(), "0|0|100vw|100vh".parse().unwrap());
+        let mut preview = Preview::new().unwrap();
+        preview.follow(point(primary), &cfg).unwrap();
+        let r = &preview.regions[0];
+        assert_eq!(r.rect, virtual_area);
+        let shape = Region::new().unwrap();
+        assert_ne!(unsafe { GetWindowRgn(preview.base.0, shape.0) }, 0);
+        let x = virtual_area.width - 1;
+        let y = 100;
+        let contains = unsafe { PtInRegion(shape.0, x, y) } != 0;
+        println!(
+            "virtual={virtual_area:?} clipping={:?} far edge present={contains}",
+            r.area
+        );
+        preview.hide();
+        assert!(
+            contains,
+            "Virtual-desktop preset outline is clipped to the pointer monitor"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires an interactive desktop; some cases need mixed DPI monitors"]
+    fn one_overflowing_preset_does_not_disable_other_previews() {
+        let _dpi = Dpi::new();
+        let displays = displays();
+        let d = &displays[0].1;
+        let _overlay = overlay::Overlay::new().unwrap();
+        let mut doc = crate::config::help()
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        doc["presets"]["Huge"] = toml_edit::value("0|0|999999999999sw|100sh");
+        let cfg = Config::parse(&doc).unwrap();
+        let mut preview = Preview::new().unwrap();
+        let result = preview.follow(point(d), &cfg);
+        println!("parse accepted=true preview result={result:?}");
+        preview.hide();
+        assert!(
+            result.is_ok(),
+            "One invalid resolved preset disables every valid preset preview"
+        );
     }
 }

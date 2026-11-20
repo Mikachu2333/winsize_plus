@@ -133,3 +133,7 @@ cargo test
 ```
 
 The executable is `target/release/winsizep.exe`. Change the product version only in `Cargo.toml` under `[package].version`; command output and Windows version resources derive from it.
+
+Explicit monitor numbers must identify a connected display; unavailable monitors report an error. Invalid region expressions are skipped in previews with a diagnostic. Cross-monitor positioning verifies the final visible frame and reports a timeout if the target does not accept the requested rectangle.
+
+Interactive multi-monitor regressions can be run with `cargo test multi_monitor_regressions -- --ignored --test-threads=1`. Cases requiring a second monitor or different DPI values automatically return with a `SKIPPED` explanation when that hardware is unavailable; the other cases still run. Set `WINSIZEP_TEST_SINGLE_MONITOR=1` to exercise that skip path without changing the display layout.

@@ -85,7 +85,11 @@ impl App {
         self.held_window = Some(window);
         self.preview_latched = latched;
         self.refresh_preview()?;
-        self.status(&self.cfg.show.clone())?;
+        if self.preview.warnings().is_empty() {
+            self.status(&self.cfg.show.clone())?;
+        } else {
+            self.notice(&self.preview.warnings().join("\n"))?;
+        }
         // The default tip and outlines share one deadline, including a hidden default tip.
         self.preview_until = (!self.overlay.tip_scrollable())
             .then(|| self.hide.unwrap_or_else(|| later(self.cfg.duration)));

@@ -133,3 +133,7 @@ cargo test
 ```
 
 程序位于 `target/release/winsizep.exe`。版本号只修改 `Cargo.toml` 的 `[package].version`，命令输出和 Windows 资源由此生成。
+
+显式指定的屏号必须对应已连接显示器，否则会报告错误。无效区域表达式在预览中单独跳过并提示原因。跨屏定位会核对最终可见边框；目标窗口未接受请求的位置尺寸时会报告超时。
+
+交互式多屏回归测试：`cargo test multi_monitor_regressions -- --ignored --test-threads=1`。缺少第二屏或不同 DPI 的显示器时，相应测试自动输出 `SKIPPED` 原因并返回，其他用例仍会执行。设置 `WINSIZEP_TEST_SINGLE_MONITOR=1` 可在不改变显示布局的情况下验证单屏跳过路径。

@@ -480,3 +480,6 @@ mod tests {
         assert_eq!(super::quote_argument("a\"b"), "\"a\\\"b\"");
     }
 }
+
+#[cfg(test)]
+mod test_support;

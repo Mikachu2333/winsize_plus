@@ -47,6 +47,7 @@ pub fn invalidate_displays() {
     DISPLAY_EPOCH.with(|epoch| epoch.set(epoch.get().wrapping_add(1)));
 }
 
+#[derive(Clone, Debug)]
 pub struct Display {
     pub work: Rect,
     pub full: Rect,
@@ -68,7 +69,7 @@ pub fn display(monitor: HMONITOR) -> Result<Display, String> {
         let number = device
             .trim_start_matches(r"\\.\DISPLAY")
             .parse()
-            .unwrap_or(1);
+            .map_err(|_| format!("Unknown display device / 未知屏幕设备: {device}"))?;
         // A hidden window on the monitor has the same PerMonitorV2 context as
         // the actual UI. GetDpiForMonitor must not be used in that context.
         let probe = CreateWindowExW(
@@ -101,43 +102,36 @@ pub fn display(monitor: HMONITOR) -> Result<Display, String> {
         })
     }
 }
-struct SearchDisplay {
-    wanted: u32,
-    found: HMONITOR,
-}
 unsafe extern "system" fn enum_monitor(
     monitor: HMONITOR,
     _: HDC,
     _: *mut RECT,
     data: LPARAM,
 ) -> i32 {
-    let search = unsafe { &mut *(data as *mut SearchDisplay) };
-    if display(monitor).is_ok_and(|screen| screen.number == search.wanted) {
-        search.found = monitor;
-        0
-    } else {
-        1
+    // SAFETY: EnumDisplayMonitors calls this synchronously with the live vector below.
+    unsafe { &mut *(data as *mut Vec<HMONITOR>) }.push(monitor);
+    1
+}
+pub fn displays() -> Result<Vec<Display>, String> {
+    let mut monitors = Vec::<HMONITOR>::new();
+    unsafe {
+        check(EnumDisplayMonitors(
+            null_mut(),
+            std::ptr::null(),
+            Some(enum_monitor),
+            from_mut(&mut monitors) as isize,
+        ))?;
     }
+    monitors.into_iter().map(display).collect()
 }
 pub fn screen(point: POINT, wanted: u32) -> Result<Display, String> {
-    unsafe {
-        let mut search = SearchDisplay {
-            wanted,
-            found: null_mut(),
-        };
-        if wanted != 0 {
-            EnumDisplayMonitors(
-                null_mut(),
-                std::ptr::null(),
-                Some(enum_monitor),
-                from_mut(&mut search) as isize,
-            );
-        }
-        display(if search.found.is_null() {
-            MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST)
-        } else {
-            search.found
-        })
+    if wanted == 0 {
+        display(unsafe { MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST) })
+    } else {
+        displays()?
+            .into_iter()
+            .find(|screen| screen.number == wanted)
+            .ok_or_else(|| format!("Monitor {wanted} is unavailable / 屏幕 {wanted} 不可用"))
     }
 }
 pub fn desktop() -> Rect {
@@ -181,15 +175,19 @@ fn process_path(hwnd: HWND) -> String {
         if process.is_null() {
             return String::new();
         }
-        let mut buf = [0u16; 512];
-        let mut len = buf.len() as u32;
-        let ok = QueryFullProcessImageNameW(process, 0, buf.as_mut_ptr(), &mut len);
+        let mut buf = vec![0u16; 512];
+        let result = loop {
+            let mut len = buf.len() as u32;
+            if QueryFullProcessImageNameW(process, 0, buf.as_mut_ptr(), &mut len) != 0 {
+                break String::from_utf16_lossy(&buf[..len as usize]);
+            }
+            if GetLastError() != ERROR_INSUFFICIENT_BUFFER || buf.len() >= 32768 {
+                break String::new();
+            }
+            buf.resize((buf.len() * 2).min(32768), 0);
+        };
         CloseHandle(process);
-        if ok == 0 {
-            String::new()
-        } else {
-            String::from_utf16_lossy(&buf[..len as usize])
-        }
+        result
     }
 }
 pub fn window_text(hwnd: HWND, format: &str) -> String {
@@ -341,8 +339,12 @@ fn eligible(hwnd: HWND) -> bool {
     }
 }
 pub fn allowed(hwnd: HWND, exclusions: &[Identity]) -> bool {
-    eligible(hwnd)
-        && (exclusions.is_empty() || !exclusions.iter().any(|rule| rule.matches(&identity(hwnd))))
+    eligible(hwnd) && (exclusions.is_empty() || !excluded_or_unknown(&identity(hwnd), exclusions))
+}
+fn excluded_or_unknown(id: &Identity, exclusions: &[Identity]) -> bool {
+    exclusions
+        .iter()
+        .any(|rule| rule.matches(id) || (!rule.name.is_empty() && id.name.is_empty()))
 }
 fn matches(hwnd: HWND, selector: &Selector) -> bool {
     eligible(hwnd)
@@ -531,42 +533,63 @@ fn position(hwnd: HWND, req: &Request, cfg: &Config, point: POINT) -> Result<(),
         if IsHungAppWindow(hwnd) != 0 {
             return Err("Window unresponsive / 窗口无响应".into());
         }
+        let area = preset
+            .map(|layout| screen(point, layout.monitor))
+            .transpose()?;
+        let resolve = |frame: Rect| -> Result<Rect, String> {
+            let base = match (preset, &area) {
+                (Some(layout), Some(area)) => layout.resolve(area.work, frame, desktop())?,
+                _ => frame,
+            };
+            let (width, height) = req.size.unwrap_or((base.width, base.height));
+            Ok(Rect {
+                x: req.x.unwrap_or(base.x),
+                y: req.y.unwrap_or(base.y),
+                width,
+                height,
+            })
+        };
+        // Reject missing monitors and invalid rectangles before restoring a maximized target.
+        let (outer, frame) = bounds(hwnd)?;
+        frame_position(resolve(frame)?, outer, frame)?;
         restore(hwnd)?;
         let (outer, frame) = bounds(hwnd)?;
-        let base = if let Some(layout) = preset {
-            layout.resolve(screen(point, layout.monitor)?.work, frame, desktop())?
-        } else {
-            frame
-        };
-        let (width, height) = req.size.unwrap_or((base.width, base.height));
-        let wanted = Rect {
-            x: req.x.unwrap_or(base.x),
-            y: req.y.unwrap_or(base.y),
-            width,
-            height,
-        };
-        let dpi = GetDpiForWindow(hwnd);
+        let wanted = resolve(frame)?;
         set_frame(hwnd, wanted, outer, frame)?;
-        // Cross-thread positioning is asynchronous. Give the target a bounded
-        // opportunity to update its DPI before correcting its nonclient frame.
-        let until = std::time::Instant::now() + std::time::Duration::from_millis(100);
-        while std::time::Instant::now() < until && GetDpiForWindow(hwnd) == dpi {
-            if bounds(hwnd).is_ok_and(|(_, current)| current != frame || current == wanted) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        if dpi != 0 && GetDpiForWindow(hwnd) != dpi {
+        // A posted move is not a completed move. Both the target's DPI handler and
+        // DWM's visible frame can settle later; require a stable observed result.
+        use std::time::{Duration, Instant};
+        let until = Instant::now() + Duration::from_millis(1200);
+        let mut observed = (outer, frame, GetDpiForWindow(hwnd));
+        let mut stable = Instant::now();
+        let mut last_request = Instant::now();
+        let mut corrections = 0;
+        while Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
             let (outer, frame) = bounds(hwnd)?;
-            if frame != wanted {
+            let current = (outer, frame, GetDpiForWindow(hwnd));
+            if current != observed {
+                observed = current;
+                stable = Instant::now();
+            }
+            if stable.elapsed() < Duration::from_millis(60) {
+                continue;
+            }
+            if frame == wanted {
+                return Ok(());
+            }
+            if corrections < 4 && last_request.elapsed() >= Duration::from_millis(180) {
                 set_frame(hwnd, wanted, outer, frame)?;
+                last_request = Instant::now();
+                stable = Instant::now();
+                corrections += 1;
             }
         }
-        Ok(())
+        Err("Window did not reach the requested rectangle (timed out or constrained) / 窗口未达到请求的位置尺寸（超时或受窗口限制）".into())
     }
 }
 
-fn set_frame(hwnd: HWND, wanted: Rect, outer: Rect, frame: Rect) -> Result<(), String> {
+fn frame_position(wanted: Rect, outer: Rect, frame: Rect) -> Result<Rect, String> {
     let overflow = "Invalid rectangle / 矩形越界";
     let offset = |value: i32, raw: i32, visible: i32| {
         i32::try_from(i64::from(value) + i64::from(raw) - i64::from(visible)).map_err(|_| overflow)
@@ -585,6 +608,20 @@ fn set_frame(hwnd: HWND, wanted: Rect, outer: Rect, frame: Rect) -> Result<(), S
     {
         return Err(overflow.into());
     }
+    Ok(Rect {
+        x,
+        y,
+        width,
+        height,
+    })
+}
+fn set_frame(hwnd: HWND, wanted: Rect, outer: Rect, frame: Rect) -> Result<(), String> {
+    let Rect {
+        x,
+        y,
+        width,
+        height,
+    } = frame_position(wanted, outer, frame)?;
     unsafe {
         check(SetWindowPos(
             hwnd,
@@ -610,7 +647,7 @@ pub fn apply(
     let id = (req.ignore.is_some() || !cfg.exclusions.is_empty()).then(|| identity(hwnd));
     let excluded = id
         .as_ref()
-        .is_some_and(|id| cfg.exclusions.iter().any(|rule| rule.matches(id)));
+        .is_some_and(|id| excluded_or_unknown(id, &cfg.exclusions));
     if excluded
         && req.ignore.is_none_or(|mode| mode.value(true))
         && (req.geometry() || req.top.is_some())
@@ -782,6 +819,246 @@ mod tests {
                 y: -20,
                 ..frame
             }
+        );
+    }
+}
+
+#[cfg(test)]
+mod multi_monitor_regressions {
+    use super::*;
+    use crate::test_support::{Dpi, displays, point};
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+            mpsc,
+        },
+        time::{Duration, Instant},
+    };
+
+    unsafe extern "system" fn proc(hwnd: HWND, message: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+        if message == WM_DPICHANGED {
+            let delay = unsafe { GetPropW(hwnd, windows_sys::core::w!("AuditDelay")) } as usize;
+            if delay != 0 {
+                std::thread::sleep(Duration::from_millis(delay as u64));
+            }
+            let r = unsafe { &*(lp as *const RECT) };
+            unsafe {
+                SetWindowPos(
+                    hwnd,
+                    null_mut(),
+                    r.left,
+                    r.top,
+                    r.right - r.left,
+                    r.bottom - r.top,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+            return 0;
+        }
+        if message == WM_APP + 77 {
+            let events = unsafe {
+                &*(GetPropW(hwnd, windows_sys::core::w!("AuditEvents")) as *const AtomicUsize)
+            };
+            events.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(300));
+            return 0;
+        }
+        if message == WM_CLOSE {
+            unsafe {
+                DestroyWindow(hwnd);
+                PostQuitMessage(0);
+            }
+            return 0;
+        }
+        unsafe { DefWindowProcW(hwnd, message, wp, lp) }
+    }
+
+    fn target(d: &Display, delay: usize) -> (usize, std::thread::JoinHandle<()>, Arc<AtomicUsize>) {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let x = d.work.x + 40;
+        let y = d.work.y + 40;
+        let events = Arc::new(AtomicUsize::new(0));
+        let copy = events.clone();
+        let worker = std::thread::spawn(move || {
+            let _dpi = Dpi::new();
+            unsafe {
+                let name = windows_sys::core::w!("WinSizeP.EdgeAudit.Target");
+                let module =
+                    windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(std::ptr::null());
+                RegisterClassW(&WNDCLASSW {
+                    lpszClassName: name,
+                    lpfnWndProc: Some(proc),
+                    hInstance: module,
+                    ..Default::default()
+                });
+                let window = CreateWindowExW(
+                    WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+                    name,
+                    windows_sys::core::w!("WinSizeP audit temporary target"),
+                    WS_OVERLAPPEDWINDOW,
+                    x,
+                    y,
+                    800,
+                    600,
+                    null_mut(),
+                    null_mut(),
+                    module,
+                    std::ptr::null(),
+                );
+                assert!(!window.is_null());
+                SetPropW(window, windows_sys::core::w!("AuditDelay"), delay as HANDLE);
+                SetPropW(
+                    window,
+                    windows_sys::core::w!("AuditEvents"),
+                    Arc::as_ptr(&copy) as HANDLE,
+                );
+                ShowWindow(window, SW_SHOWNOACTIVATE);
+                tx.send(window as usize).unwrap();
+                let mut message = MSG::default();
+                while GetMessageW(&mut message, null_mut(), 0, 0) > 0 {
+                    TranslateMessage(&message);
+                    DispatchMessageW(&message);
+                }
+            }
+        });
+        (
+            rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            worker,
+            events,
+        )
+    }
+
+    fn probe(delay: usize, busy: bool) -> Option<(Result<(), String>, Rect, Rect, u128)> {
+        let _dpi = Dpi::new();
+        let displays = crate::test_support::require_displays(true)?;
+        let low = &displays.first().unwrap().1;
+        let high = &displays.last().unwrap().1;
+        let (handle, worker, events) = target(low, delay);
+        let hwnd = handle as HWND;
+        if busy {
+            unsafe {
+                PostMessageW(hwnd, WM_APP + 77, 0, 0);
+            }
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while events.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(events.load(Ordering::SeqCst), 1);
+        }
+        let wanted = Rect {
+            x: high.work.x + 100,
+            y: high.work.y + 100,
+            width: 1000,
+            height: 700,
+        };
+        let request = Request {
+            x: Some(wanted.x),
+            y: Some(wanted.y),
+            size: Some((wanted.width, wanted.height)),
+            ..Default::default()
+        };
+        let start = Instant::now();
+        let result = position(hwnd, &request, &crate::test_support::cfg(), point(high));
+        let elapsed = start.elapsed().as_millis();
+        let at_return = bounds(hwnd).unwrap().1;
+        std::thread::sleep(Duration::from_millis(600));
+        let eventual = bounds(hwnd).unwrap().1;
+        println!(
+            "delay={delay} busy={busy} result={result:?} elapsed_ms={elapsed} requested={wanted:?} at_return={at_return:?} eventual={eventual:?} dpi={}",
+            unsafe { GetDpiForWindow(hwnd) }
+        );
+        unsafe {
+            PostMessageW(hwnd, WM_CLOSE, 0, 0);
+        }
+        worker.join().unwrap();
+        Some((result, wanted, eventual, elapsed))
+    }
+
+    #[test]
+    #[ignore = "requires an interactive desktop; some cases need mixed DPI monitors"]
+    fn position_corrects_immediate_cross_dpi_target() {
+        let Some((result, wanted, actual, _)) = probe(0, false) else {
+            return;
+        };
+        result.unwrap();
+        assert_eq!(actual, wanted);
+    }
+
+    #[test]
+    #[ignore = "requires an interactive desktop; some cases need mixed DPI monitors"]
+    fn position_verifies_busy_cross_dpi_target_before_success() {
+        let Some((result, wanted, actual, _)) = probe(0, true) else {
+            return;
+        };
+        assert!(
+            result.is_err() || actual == wanted,
+            "The operation reports success but the target eventually settles at a different frame"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires an interactive desktop; some cases need mixed DPI monitors"]
+    fn process_identity_handles_long_executable_paths() {
+        let _dpi = Dpi::new();
+        let d = displays();
+        let (handle, worker, _) = target(&d[0].1, 0);
+        let path = std::env::current_exe().unwrap();
+        let expected = path.file_name().unwrap().to_string_lossy();
+        let id = identity(handle as HWND);
+        let rule = crate::config::Identity {
+            name: expected.into_owned(),
+            ..Default::default()
+        };
+        unsafe {
+            PostMessageW(handle as HWND, WM_CLOSE, 0, 0);
+        }
+        worker.join().unwrap();
+        println!(
+            "executable_path_length={} expected_name={} actual_name={:?} exclusion_matches={}",
+            path.as_os_str().encode_wide().count(),
+            rule.name,
+            id.name,
+            rule.matches(&id)
+        );
+        assert!(
+            rule.matches(&id),
+            "A long executable path must not bypass a process-name exclusion"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires an interactive desktop; some cases need mixed DPI monitors"]
+    fn invalid_preset_must_not_restore_a_maximized_window() {
+        let _dpi = Dpi::new();
+        let d = displays();
+        let (handle, worker, _) = target(&d[0].1, 0);
+        let hwnd = handle as HWND;
+        unsafe {
+            ShowWindowAsync(hwnd, SW_MAXIMIZE);
+        }
+        let end = Instant::now() + Duration::from_secs(2);
+        while unsafe { IsZoomed(hwnd) } == 0 && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_ne!(unsafe { IsZoomed(hwnd) }, 0);
+        let mut cfg = crate::test_support::cfg();
+        cfg.presets
+            .insert("bad".into(), "0|0|999999999999sw|100sh".parse().unwrap());
+        let request = Request {
+            preset: Some("bad".into()),
+            ..Default::default()
+        };
+        let result = position(hwnd, &request, &cfg, point(&d[0].1));
+        let still_maximized = unsafe { IsZoomed(hwnd) } != 0;
+        unsafe {
+            PostMessageW(hwnd, WM_CLOSE, 0, 0);
+        }
+        worker.join().unwrap();
+        println!("invalid preset result={result:?} still_maximized={still_maximized}");
+        assert!(
+            result.is_err() && still_maximized,
+            "Reject invalid geometry before altering the target state"
         );
     }
 }

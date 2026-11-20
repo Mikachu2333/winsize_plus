@@ -102,6 +102,9 @@ impl FromStr for Layout {
 }
 
 impl Layout {
+    pub fn uses_virtual_desktop(&self) -> bool {
+        self.virtual_origin
+    }
     pub fn resolve(&self, screen: Rect, window: Rect, desktop: Rect) -> Result<Rect, String> {
         let origin = if self.virtual_origin { desktop } else { screen };
         let factors = [
@@ -126,11 +129,19 @@ impl Layout {
             }
             Ok(value as i32)
         };
-        Ok(Rect {
+        let rect = Rect {
             x: eval(0, origin.x)?,
             y: eval(1, origin.y)?,
             width: eval(2, 0)?,
             height: eval(3, 0)?,
-        })
+        };
+        if rect.width <= 0
+            || rect.height <= 0
+            || rect.x.checked_add(rect.width).is_none()
+            || rect.y.checked_add(rect.height).is_none()
+        {
+            return Err("Invalid rectangle / 矩形越界".into());
+        }
+        Ok(rect)
     }
 }

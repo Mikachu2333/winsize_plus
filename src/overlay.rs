@@ -388,6 +388,9 @@ pub struct Overlay {
     shadow: Panel,
     content: Option<Box<TipContent>>,
     scroll_limit: i32,
+    tip_text: String,
+    tip_display: Option<Display>,
+    tip_epoch: u64,
     segments: Vec<Panel>,
     mode: u8,
     last_monitor: HMONITOR,
@@ -433,6 +436,9 @@ impl Overlay {
                 tip,
                 content: None,
                 scroll_limit: 0,
+                tip_text: String::new(),
+                tip_display: None,
+                tip_epoch: desktop::display_epoch(),
                 segments: Vec::new(),
                 mode: 0,
                 last_monitor: null_mut(),
@@ -452,6 +458,10 @@ impl Overlay {
     }
     pub fn tip(&mut self, text: &str, cfg: &Config) -> Result<(), String> {
         let screen = desktop::screen(desktop::cursor()?, 0)?;
+        self.tip_on(text, cfg, screen)
+    }
+    fn tip_on(&mut self, text: &str, cfg: &Config, screen: Display) -> Result<(), String> {
+        self.tip_text = text.to_owned();
         let dpi = screen.dpi;
         let border = scale(1, dpi).max(1);
         let horizontal = scale(10, dpi) + border;
@@ -581,6 +591,36 @@ impl Overlay {
         }
         crate::input::tip_visible(true);
         crate::input::tip_scrollable(self.scroll_limit > 0, self.tip.0 as usize);
+        self.tip_display = Some(screen);
+        self.tip_epoch = desktop::display_epoch();
+        Ok(())
+    }
+    fn refresh_tip(&mut self, cfg: &Config) -> Result<(), String> {
+        if self.tip.1.get().is_none() {
+            return Ok(());
+        }
+        if self.tip_epoch == desktop::display_epoch()
+            && self.tip_display.as_ref().is_some_and(|d| {
+                d.dpi
+                    == unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(self.tip.0) } as i32
+            })
+        {
+            return Ok(());
+        }
+        let screen =
+            desktop::display(unsafe { MonitorFromWindow(self.tip.0, MONITOR_DEFAULTTONEAREST) })?;
+        if self.tip_display.as_ref().is_some_and(|old| {
+            old.dpi == screen.dpi && old.work == screen.work && old.number == screen.number
+        }) {
+            self.tip_epoch = desktop::display_epoch();
+            return Ok(());
+        }
+        let offset = unsafe { GetPropW(self.tip.0, w!("TextOffset")) } as usize as i32;
+        let old_limit = self.scroll_limit.max(1);
+        self.tip_on(&self.tip_text.clone(), cfg, screen)?;
+        let offset =
+            (i64::from(offset) * i64::from(self.scroll_limit) / i64::from(old_limit)) as i32;
+        set_tip_offset(self.tip.0, offset);
         Ok(())
     }
     pub fn scroll_tip(&mut self, delta: i32) {
@@ -634,6 +674,7 @@ impl Overlay {
         Ok(())
     }
     pub fn follow(&mut self, point: POINT, cfg: &Config) -> Result<(), String> {
+        self.refresh_tip(cfg)?;
         if self.mode == 0 {
             return Ok(());
         }
@@ -1121,5 +1162,105 @@ mod tests {
             assert!(updates <= (rate.max(30.0) * start.elapsed().as_secs_f64()).ceil() as i32 + 3);
         }
         overlay.guides(0, &cfg).unwrap();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn label_rect(label: &Label) -> Rect {
+    desktop::bounds(label.panel.0).unwrap().0
+}
+
+#[cfg(test)]
+mod multi_monitor_regressions {
+    use super::*;
+    use crate::test_support::{Dpi, displays, point};
+
+    #[test]
+    #[ignore = "requires an interactive desktop; some cases need mixed DPI monitors"]
+    fn crosshair_tracks_both_real_dpis_and_monitor_edges() {
+        let _dpi = Dpi::new();
+        let cfg = crate::test_support::cfg();
+        let mut overlay = Overlay::new().unwrap();
+        overlay.guides(3, &cfg).unwrap();
+        for (_, d) in displays() {
+            for p in [
+                point(&d),
+                POINT {
+                    x: d.full.x,
+                    y: d.full.y,
+                },
+                POINT {
+                    x: d.full.x + d.full.width - 1,
+                    y: d.full.y + d.full.height - 1,
+                },
+            ] {
+                overlay.follow(p, &cfg).unwrap();
+                for axis in 0..2 {
+                    let actual = desktop::bounds(overlay.segments[axis].0).unwrap().0;
+                    assert!(actual.x >= d.full.x && actual.y >= d.full.y, "{actual:?}");
+                    assert!(
+                        actual.x + actual.width <= d.full.x + d.full.width,
+                        "{actual:?}"
+                    );
+                    assert!(
+                        actual.y + actual.height <= d.full.y + d.full.height,
+                        "{actual:?}"
+                    );
+                }
+            }
+        }
+        overlay.guides(0, &cfg).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an interactive desktop; some cases need mixed DPI monitors"]
+    fn visible_tip_relayouts_after_dpi_change() {
+        let _dpi = Dpi::new();
+        let Some(all) = crate::test_support::require_displays(true) else {
+            return;
+        };
+        let cfg = crate::test_support::cfg();
+        let mut overlay = Overlay::new().unwrap();
+        overlay.tip("Monitor change audit", &cfg).unwrap();
+        let old_dpi =
+            unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(overlay.tip.0) } as i32;
+        let destination = &all.iter().find(|(_, d)| d.dpi != old_dpi).unwrap().1;
+        let before = overlay.content.as_ref().unwrap().layout.height;
+        let rect = overlay.tip.1.get().unwrap();
+        overlay.tip.show(Rect {
+            x: destination.work.x + 100,
+            y: destination.work.y + 100,
+            ..rect
+        });
+        crate::test_support::pump();
+        // The resident's DISPLAY_CHANGED branch calls follow and preview.tick only.
+        overlay.follow(point(destination), &cfg).unwrap();
+        let actual = overlay.content.as_ref().unwrap().layout.height;
+        let expected = TextLayout::new(
+            "Monitor change audit",
+            Fonts::opaque(
+                &cfg.font,
+                &cfg.font_fallbacks,
+                cfg.font_size,
+                destination.dpi,
+                cfg.font_bold,
+                cfg.font_italic,
+            )
+            .unwrap(),
+            destination.work.width,
+        )
+        .unwrap()
+        .height;
+        let new_dpi =
+            unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(overlay.tip.0) } as i32;
+        overlay.hide_tip();
+        println!(
+            "tip dpi={old_dpi}->{new_dpi} old_height={before} actual_height={actual} expected_height={expected}"
+        );
+        assert_eq!(new_dpi, destination.dpi);
+        assert_eq!(
+            actual, expected,
+            "Visible tip retains its old text layout across a real WM_DPICHANGED"
+        );
     }
 }
