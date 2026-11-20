@@ -140,6 +140,12 @@ fn describe(section: &str, key: &str) -> (&'static str, &'static str, &'static s
                 "Hotkeys toggle the current session; this setting controls the initial state.",
                 "快捷键切换本次运行的状态；此设置决定启动时的初始状态。",
             ),
+            "swap_side_buttons" => (
+                "Swap upper/lower side buttons",
+                "对调上下侧键显示",
+                "Enabled by default: X1 appears below X2. Turn off to restore X1 above X2; button actions do not change.",
+                "默认开启：X1 显示在 X2 下方。关闭后恢复 X1 在上、X2 在下；实际按键功能不变。",
+            ),
             "duration_ms" => (
                 "Display duration (ms)",
                 "显示时长（毫秒）",

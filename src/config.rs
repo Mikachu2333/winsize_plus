@@ -59,6 +59,7 @@ pub struct CastStyle {
 #[derive(Clone, Debug)]
 pub struct MouseStyle {
     pub enabled: bool,
+    pub swap_side_buttons: bool,
     pub radius: i32,
     pub opacity: u8,
     pub color: u32,
@@ -805,6 +806,7 @@ impl Config {
         Ok(Self {
             mousecast: MouseStyle {
                 enabled: boolean("mousecast", "enabled")?,
+                swap_side_buttons: boolean("mousecast", "swap_side_buttons")?,
                 radius: number("mousecast", "radius", 4, 64)? as i32,
                 opacity: number("mousecast", "opacity", 96, 224)? as u8,
                 color: crate::colors::accent(),
@@ -1017,6 +1019,12 @@ fn migrate(doc: &mut DocumentMut) -> Result<(), String> {
             "font_size",
         ] {
             mouse.remove(old);
+        }
+        if !mouse.contains_key("swap_side_buttons") {
+            if let Some(radius) = mouse.get("radius").and_then(Item::as_integer) {
+                mouse["radius"] = value(((radius.clamp(4, 64) * 2 + 1) / 3).max(4));
+            }
+            mouse["swap_side_buttons"] = value(true);
         }
         if let Some(alpha) = mouse.get("opacity").and_then(Item::as_integer)
             && !(96..=224).contains(&alpha)
@@ -1455,20 +1463,42 @@ pub fn load_snapshot(path: &Path, edit: Option<(&Identity, Switch)>) -> Result<L
 mod tests {
     use super::*;
     #[test]
+    fn side_button_setting_defaults_to_swapped_and_migrates_size_only_once() {
+        let mut doc = help().parse::<DocumentMut>().unwrap();
+        assert!(Config::parse(&doc).unwrap().mousecast.swap_side_buttons);
+        doc["mousecast"]
+            .as_table_mut()
+            .unwrap()
+            .remove("swap_side_buttons");
+        doc["mousecast"]["radius"] = value(14);
+        migrate(&mut doc).unwrap();
+        assert_eq!(doc["mousecast"]["radius"].as_integer(), Some(9));
+        assert_eq!(doc["mousecast"]["swap_side_buttons"].as_bool(), Some(true));
+        doc["mousecast"]["swap_side_buttons"] = value(false);
+        migrate(&mut doc).unwrap();
+        let cfg = Config::parse(&doc).unwrap();
+        assert_eq!(cfg.mousecast.radius, 9);
+        assert!(!cfg.mousecast.swap_side_buttons);
+    }
+    #[test]
     fn old_mouse_animation_settings_migrate_once_to_compact_shapes() {
         let mut doc = help().parse::<DocumentMut>().unwrap();
+        doc["mousecast"]
+            .as_table_mut()
+            .unwrap()
+            .remove("swap_side_buttons");
         doc["mousecast"]["radius"] = value(28);
         doc["mousecast"]["duration_ms"] = value(450);
         doc["mousecast"]["fade_ms"] = value(250);
         doc["mousecast"]["ring_width"] = value(3);
         doc["mousecast"]["font"] = value("Arial");
         migrate(&mut doc).unwrap();
-        assert_eq!(doc["mousecast"]["radius"].as_integer(), Some(14));
+        assert_eq!(doc["mousecast"]["radius"].as_integer(), Some(9));
         for key in ["duration_ms", "fade_ms", "ring_width", "font"] {
             assert!(doc["mousecast"].get(key).is_none());
         }
         migrate(&mut doc).unwrap();
-        assert_eq!(doc["mousecast"]["radius"].as_integer(), Some(14));
+        assert_eq!(doc["mousecast"]["radius"].as_integer(), Some(9));
         Config::parse(&doc).unwrap();
     }
     #[test]
@@ -1500,7 +1530,7 @@ mod tests {
         doc["keycast"]["font_size"] = value(32);
         doc["keycast"]["history"] = value(999);
         let cfg = recover(&mut doc).unwrap();
-        assert_eq!(cfg.mousecast.radius, 14);
+        assert_eq!(cfg.mousecast.radius, 9);
         assert_eq!(cfg.keycast.font_size, 32);
         assert_eq!(cfg.keycast.history, 4);
         assert!(cfg.warnings.iter().any(|w| w.contains("mousecast.radius")));

@@ -57,6 +57,13 @@ impl Shape {
             _ => return None,
         })
     }
+    fn side_mapping(self, swap: bool) -> Self {
+        match (self, swap) {
+            (Self::Side1, true) => Self::Side2,
+            (Self::Side2, true) => Self::Side1,
+            _ => self,
+        }
+    }
     fn contains(self, x: f32, y: f32) -> bool {
         let circle = x * x + y * y <= 1.0;
         match self {
@@ -376,6 +383,7 @@ impl MouseVisuals {
         let Some((index, shape)) = Shape::input(button) else {
             return Ok(());
         };
+        let shape = shape.side_mapping(style.swap_side_buttons);
         if self.slots.is_empty() {
             self.prepare(point, style)?;
         }
@@ -508,7 +516,7 @@ impl MouseVisuals {
     pub fn preview(&mut self, step: usize, point: POINT, style: &MouseStyle) -> Result<(), String> {
         self.clear();
         self.prepare(point, style)?;
-        let sequence = [1, 2, 4, 8, 9];
+        let sequence = [1, 2, 4, 5, 6, 8, 9];
         let button = sequence[step % sequence.len()];
         self.event(button, 0, point, style)?;
         if button < 8 {
@@ -529,6 +537,20 @@ impl MouseVisuals {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn swapping_side_indicators_keeps_button_slots_and_other_shapes() {
+        let (x1_slot, x1) = Shape::input(5).unwrap();
+        let (x2_slot, x2) = Shape::input(6).unwrap();
+        assert_eq!((x1_slot, x2_slot), (3, 4));
+        assert!(x1.side_mapping(true).contains(-0.8, 0.1));
+        assert!(x2.side_mapping(true).contains(-0.8, -0.1));
+        assert!(x1.side_mapping(false).contains(-0.8, -0.1));
+        assert!(x2.side_mapping(false).contains(-0.8, 0.1));
+        for button in [1, 2, 4, 8, 9, 10, 11] {
+            let (_, shape) = Shape::input(button).unwrap();
+            assert_eq!(shape.side_mapping(true), shape);
+        }
+    }
     #[test]
     fn derived_fills_remain_distinct_on_light_and_dark_surfaces() {
         for base in [

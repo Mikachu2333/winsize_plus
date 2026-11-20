@@ -60,7 +60,8 @@ gap = 12
 
 [mousecast]
 enabled = false # Initial state; Alt+M toggles the running display.
-radius = 14
+swap_side_buttons = true # Exchange the upper/lower side-button indicators.
+radius = 9
 opacity = 160 # Filled shapes use theme-derived colors; timing is fixed at about 0.5 s.
 
 [keycast]
