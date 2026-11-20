@@ -29,6 +29,23 @@ struct Style {
 }
 impl Style {
     fn new(cfg: &Config, dpi: i32) -> Self {
+        Self::fonts(
+            &cfg.region_font,
+            &cfg.region_fallbacks,
+            cfg.region_font_size,
+            cfg.region_bold,
+            cfg.region_italic,
+            dpi,
+        )
+    }
+    fn fonts(
+        font: &str,
+        fallbacks: &[String],
+        points: i32,
+        bold: bool,
+        italic: bool,
+        dpi: i32,
+    ) -> Self {
         let face = fonts::system_face(dpi);
         let length = face
             .lfFaceName
@@ -37,8 +54,8 @@ impl Style {
             .unwrap_or(32);
         let system = String::from_utf16_lossy(&face.lfFaceName[..length]);
         let mut families = Vec::<String>::new();
-        for family in std::iter::once(cfg.region_font.as_str())
-            .chain(cfg.region_fallbacks.iter().take(3).map(String::as_str))
+        for family in std::iter::once(font)
+            .chain(fallbacks.iter().take(3).map(String::as_str))
             .chain(std::iter::once("SystemFont"))
         {
             let family = if family.eq_ignore_ascii_case("SystemFont") {
@@ -52,9 +69,9 @@ impl Style {
         }
         Self {
             families,
-            points: cfg.region_font_size,
-            bold: cfg.region_bold,
-            italic: cfg.region_italic,
+            points,
+            bold,
+            italic,
         }
     }
 }
@@ -133,13 +150,10 @@ impl Renderer {
         width: i32,
         dpi: i32,
         color: u32,
-        cfg: &Config,
+        style: Style,
     ) -> Result<Image, String> {
         let scale = dpi.max(1) as f32 / 96.0;
-        let format = self
-            .format(Style::new(cfg, dpi))
-            .map_err(|e| e.to_string())?
-            .clone();
+        let format = self.format(style).map_err(|e| e.to_string())?.clone();
         let units: Vec<u16> = caption.encode_utf16().collect();
         // SAFETY: layout and drawing use owned buffers and resources on this UI thread.
         unsafe {
@@ -306,7 +320,26 @@ pub fn render(
         }
         slot.as_mut()
             .unwrap()
-            .render(caption, width, dpi, color, cfg)
+            .render(caption, width, dpi, color, Style::new(cfg, dpi))
+    })
+}
+pub fn annotation(
+    caption: &str,
+    width: i32,
+    dpi: i32,
+    cfg: &crate::config::CastStyle,
+) -> Result<Image, String> {
+    RENDERER.with_borrow_mut(|slot| {
+        if slot.is_none() {
+            *slot = Some(Renderer::new().map_err(|e| e.to_string())?);
+        }
+        slot.as_mut().unwrap().render(
+            caption,
+            width,
+            dpi,
+            cfg.foreground,
+            Style::fonts(&cfg.font, &[], cfg.font_size, false, false, dpi),
+        )
     })
 }
 

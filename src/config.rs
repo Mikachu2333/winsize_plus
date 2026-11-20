@@ -43,7 +43,25 @@ pub struct Line {
     pub color: u32,
     pub opacity: u8,
 }
+#[derive(Clone, Debug)]
+pub struct CastStyle {
+    pub enabled: bool,
+    pub duration: u32,
+    pub fade: u32,
+    pub font: String,
+    pub font_size: i32,
+    pub foreground: u32,
+    pub background: u32,
+    pub opacity: u8,
+    pub history: usize,
+    pub position: String,
+    pub radius: i32,
+    pub ring_width: i32,
+    pub color: u32,
+}
 pub struct Config {
+    pub mousecast: CastStyle,
+    pub keycast: CastStyle,
     pub zh: bool,
     pub alt: String,
     pub gesture: String,
@@ -169,6 +187,8 @@ pub const ACTIONS: &[&str] = &[
     "reload",
     "settings",
     "borders",
+    "mousecast",
+    "keycast",
 ];
 pub const ALIASES: &[(&str, &str)] = &[
     ("ver", "version"),
@@ -197,6 +217,11 @@ pub fn command_name(text: &str) -> String {
 }
 
 pub fn standard_name(name: &str) -> String {
+    match name {
+        "mousecast" => return "MouseCast".into(),
+        "keycast" => return "KeyCast".into(),
+        _ => {}
+    }
     if let Some((_, action)) = ALIASES.iter().find(|(alias, _)| *alias == name) {
         return standard_name(action);
     }
@@ -462,9 +487,26 @@ impl Config {
                 ));
             }
         }
+        let mut visual = Vec::new();
         if !crosshair.is_empty() {
-            sections.push(vec![crosshair.join(self.tr(";  ", "；"))]);
+            visual.push(crosshair.join(self.tr(";  ", "；")));
         }
+        let mut casts = Vec::new();
+        for (name, en, zh) in [
+            ("mousecast", "mouse annotations", "鼠标标注"),
+            ("keycast", "keyboard annotations", "键盘标注"),
+        ] {
+            for (key, action) in &bindings {
+                if action.as_str() == name {
+                    shown.insert(**key);
+                    casts.push(format!("Alt + {} = {}", key_name(**key), self.tr(en, zh)));
+                }
+            }
+        }
+        if !casts.is_empty() {
+            visual.push(casts.join(self.tr(";  ", "；")));
+        }
+        sections.push(visual);
         let mut other = Vec::new();
         for (key, action) in bindings {
             if shown.contains(key) {
@@ -729,7 +771,50 @@ impl Config {
                 _ => 6,
             }))
         };
+        let cast = |section: &'static str| -> Result<CastStyle, String> {
+            Ok(CastStyle {
+                enabled: boolean(section, "enabled")?,
+                duration: number(section, "duration_ms", 100, 10000)? as u32,
+                fade: number(section, "fade_ms", 0, 3000)? as u32,
+                font: font(section)?,
+                font_size: number(section, "font_size", 6, 72)? as i32,
+                foreground: color(section, "foreground")?,
+                background: color(section, "background")?,
+                opacity: number(section, "opacity", 32, 255)? as u8,
+                history: if section == "keycast" {
+                    number(section, "history", 1, 8)? as usize
+                } else {
+                    5
+                },
+                position: if section == "keycast" {
+                    choice(
+                        section,
+                        "position",
+                        &["bottom-left", "bottom-right", "top-left", "top-right"],
+                    )?
+                } else {
+                    "pointer".into()
+                },
+                radius: if section == "mousecast" {
+                    number(section, "radius", 8, 128)? as i32
+                } else {
+                    0
+                },
+                ring_width: if section == "mousecast" {
+                    number(section, "ring_width", 1, 16)? as i32
+                } else {
+                    0
+                },
+                color: if section == "mousecast" {
+                    color(section, "color")?
+                } else {
+                    0
+                },
+            })
+        };
         Ok(Self {
+            mousecast: cast("mousecast")?,
+            keycast: cast("keycast")?,
             zh: language == "zh-CN" || (language == "auto" && system_zh()),
             alt: choice("shortcuts", "alt", &["left", "right", "both"])?,
             gesture: choice("shortcuts", "gesture", &["left", "right", "both", "off"])?,
@@ -919,6 +1004,22 @@ fn document(text: &str) -> Result<(DocumentMut, bool), String> {
 }
 
 fn migrate(doc: &mut DocumentMut) -> Result<(), String> {
+    // Introduce each shortcut only once, preserving occupied/disabled virtual-key aliases
+    // and intentionally empty maps. The new fixed sections mark the completed migration.
+    for (section, key, action) in [("mousecast", "M", "MouseCast"), ("keycast", "K", "KeyCast")] {
+        if doc.get(section).is_none()
+            && let Some(keys) = doc.get_mut("keys").and_then(Item::as_table_mut)
+            && !keys.is_empty()
+            && !keys.iter().any(|(name, item)| {
+                vk(name) == vk(key)
+                    || item
+                        .as_str()
+                        .is_some_and(|v| v.eq_ignore_ascii_case(action))
+            })
+        {
+            keys.insert(key, value(action));
+        }
+    }
     // Validate the destination before removing any legacy fields. A malformed
     // document must remain available for correction instead of panicking in a callback.
     if doc
@@ -1334,6 +1435,41 @@ pub fn load_snapshot(path: &Path, edit: Option<(&Identity, Switch)>) -> Result<L
 mod tests {
     use super::*;
     #[test]
+    fn annotation_migration_preserves_existing_shortcuts_and_runs_once() {
+        let mut doc = help().parse::<DocumentMut>().unwrap();
+        doc.as_table_mut().remove("mousecast");
+        doc.as_table_mut().remove("keycast");
+        doc["keys"].as_table_mut().unwrap().remove("M");
+        doc["keys"].as_table_mut().unwrap().remove("K");
+        doc["keys"]["VK:4D"] = value("Help");
+        migrate(&mut doc).unwrap();
+        assert!(doc["keys"].get("M").is_none());
+        assert_eq!(doc["keys"]["VK:4D"].as_str(), Some("Help"));
+        assert_eq!(doc["keys"]["K"].as_str(), Some("KeyCast"));
+        recover(&mut doc).unwrap();
+        doc["keys"].as_table_mut().unwrap().remove("K");
+        migrate(&mut doc).unwrap();
+        assert!(doc["keys"].get("K").is_none());
+        doc.as_table_mut().remove("mousecast");
+        doc.as_table_mut().remove("keycast");
+        doc["keys"] = Item::Table(Table::new());
+        migrate(&mut doc).unwrap();
+        assert!(doc["keys"].as_table().unwrap().is_empty());
+    }
+    #[test]
+    fn invalid_annotation_fields_recover_without_losing_independent_styles() {
+        let mut doc = help().parse::<DocumentMut>().unwrap();
+        doc["mousecast"]["radius"] = value(-1);
+        doc["keycast"]["font_size"] = value(32);
+        doc["keycast"]["history"] = value(999);
+        let cfg = recover(&mut doc).unwrap();
+        assert_eq!(cfg.mousecast.radius, 28);
+        assert_eq!(cfg.keycast.font_size, 32);
+        assert_eq!(cfg.keycast.history, 4);
+        assert!(cfg.warnings.iter().any(|w| w.contains("mousecast.radius")));
+        assert!(cfg.warnings.iter().any(|w| w.contains("keycast.history")));
+    }
+    #[test]
     fn help_omits_disabled_mouse_actions_and_uses_readable_key_names() {
         let mut doc = help().parse::<DocumentMut>().unwrap();
         doc["general"]["language"] = value("en");
@@ -1357,7 +1493,8 @@ mod tests {
                 "Q\tW\tE\t\tLeftTop\tFullTop\tRightTop\n",
                 "A\tS\tD\t->\tFullLeft\tCenter\tFullRight\n",
                 "Z\tX\tC\t\tLeftBottom\tFullBottom\tRightBottom\n\n",
-                "L toggle crosshair;  = both axes;  \\ vertical;  - horizontal\n\n",
+                "L toggle crosshair;  = both axes;  \\ vertical;  - horizontal\n",
+                "Alt + M = mouse annotations;  Alt + K = keyboard annotations\n\n",
             )),
             "{text}"
         );
@@ -1375,7 +1512,11 @@ mod tests {
             assert!(sections.iter().all(|section| !section.is_empty()
                 && !section.starts_with('\n')
                 && !section.ends_with('\n')));
-            assert_eq!(sections[3].lines().count(), 1);
+            assert_eq!(sections[3].lines().count(), 2);
+            let casts = sections[3].lines().nth(1).unwrap();
+            assert!(casts.contains("Alt + M =") && casts.contains("Alt + K ="));
+            assert_eq!(text.matches("Alt + M =").count(), 1);
+            assert_eq!(text.matches("Alt + K =").count(), 1);
             assert!(!sections[3].contains([':', '：']));
             if language == "zh-CN" {
                 assert!(sections[3].contains("L 显示或隐藏十字线；= 双线；\\ 竖线；- 横线"));

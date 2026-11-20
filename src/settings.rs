@@ -188,6 +188,8 @@ impl Row {
     }
 }
 struct Editor {
+    cast: crate::cast::Visuals,
+    cast_next: Option<Instant>,
     window: Window,
     panes: [HWND; 2],
     tabs: Vec<HWND>,
@@ -1466,6 +1468,11 @@ impl Editor {
         }
     }
     fn render(&mut self) -> Result<(), String> {
+        self.cast.clear();
+        self.cast_next = None;
+        unsafe {
+            SetTimer(self.window.0, 1, 100, None);
+        }
         self.preview.hide();
         self.overlay.hide_tip();
         if !unsafe { GetPropW(self.window.0, w!("PreviewSuspended")) }.is_null() {
@@ -1503,6 +1510,22 @@ impl Editor {
                 }
                 3 => self.preview.start(self.window.0, &self.cfg)?,
                 6 => self.preview.grid(self.window.0, &self.cfg)?,
+                7 | 8 => {
+                    self.cast
+                        .preview(self.tab == 7, desktop::cursor()?, &self.cfg)?;
+                    let style = if self.tab == 7 {
+                        &self.cfg.mousecast
+                    } else {
+                        &self.cfg.keycast
+                    };
+                    self.cast_next = Some(
+                        Instant::now()
+                            + Duration::from_millis(u64::from(style.duration + style.fade) + 300),
+                    );
+                    unsafe {
+                        SetTimer(self.window.0, 1, 16, None);
+                    }
+                }
                 _ => {}
             }
         }
@@ -1510,7 +1533,7 @@ impl Editor {
             self.status(&self.preview.warnings().join("\n"));
         }
         input::set_guides(guides != 0)?;
-        input::track_preview(self.preview.visible())
+        input::track_preview(self.preview.visible() || self.cast_next.is_some())
     }
     fn commit_document(&mut self, draft: DocumentMut) -> Result<(), String> {
         Config::parse(&draft)?;
@@ -1692,7 +1715,7 @@ impl Editor {
             self.active_combo = None;
             self.tooltip.hide();
         }
-        if (TAB_BASE..TAB_BASE + 7).contains(&id) && event == BN_CLICKED {
+        if (TAB_BASE..TAB_BASE + TABS.len() as i32).contains(&id) && event == BN_CLICKED {
             self.save()?;
             return self.switch_page((id - TAB_BASE) as usize, self.axis);
         }
@@ -1786,6 +1809,18 @@ impl Editor {
             self.render()?;
         }
         let now = Instant::now();
+        self.cast.tick(&self.cfg)?;
+        if self.cast_next.is_some_and(|when| now >= when) {
+            self.cast
+                .preview(self.tab == 7, desktop::cursor()?, &self.cfg)?;
+            let style = if self.tab == 7 {
+                &self.cfg.mousecast
+            } else {
+                &self.cfg.keycast
+            };
+            self.cast_next =
+                Some(now + Duration::from_millis(u64::from(style.duration + style.fade) + 300));
+        }
         // Native combo popups capture the pointer and do not reliably deliver list mouse-move
         // messages to subclasses. Hit-test the open list on the existing UI timer as well.
         if let Some(combo) = self.active_combo {
@@ -1917,6 +1952,19 @@ impl Editor {
         }
     }
     fn escape(&mut self) -> Result<(), String> {
+        self.cast.clear();
+        self.cast_next = None;
+        if matches!(self.tab, 7 | 8) {
+            self.live = false;
+            for row in &self.rows {
+                if matches!(row.field.kind, Kind::Preview) {
+                    send(row.c(0), BM_SETCHECK, 0, 0);
+                }
+            }
+            unsafe {
+                SetTimer(self.window.0, 1, 100, None);
+            }
+        }
         self.tooltip.hide();
         self.overlay.hide_tip();
         if !self.preview.reset(&self.cfg)? {
@@ -2580,6 +2628,8 @@ pub fn run(path: &Path) -> Result<(), String> {
             }
         }
         let mut editor = Editor {
+            cast: crate::cast::Visuals::new(),
+            cast_next: None,
             window,
             panes,
             tabs: Vec::new(),
@@ -2672,7 +2722,11 @@ fn message_loop(hwnd: HWND, timer: HANDLE) -> Result<(), String> {
                         e.overlay.scroll_tip(msg.wParam as i32);
                         Ok(())
                     }),
-                    input::DISPLAY_CHANGED => with_editor(|e| e.render()),
+                    input::DISPLAY_CHANGED => with_editor(|e| {
+                        e.overlay.follow(desktop::cursor()?, &e.cfg)?;
+                        e.preview.tick(&e.cfg)?;
+                        e.cast.tick(&e.cfg)
+                    }),
                     input::MOVE => with_editor(|e| e.moved(input::moved())),
                     input::CANCEL => with_editor(|e| e.escape()),
                     _ => {}
@@ -2892,7 +2946,7 @@ mod tests {
                         SWP_NOZORDER | SWP_NOACTIVATE,
                     );
                 }
-                for tab in 0..7 {
+                for tab in 0..TABS.len() as i32 {
                     let start = Instant::now();
                     unsafe {
                         PostMessageW(hwnd, WM_COMMAND, (TAB_BASE + tab) as usize, 0);
@@ -2948,7 +3002,7 @@ mod tests {
                         snapshot(hwnd, &output.join("fonts.bmp"));
                     }
                 }
-                for tab in [0, 1, 2, 3, 4, 5, 6] {
+                for tab in 0..TABS.len() as i32 {
                     let start = Instant::now();
                     unsafe {
                         PostMessageW(hwnd, WM_COMMAND, (TAB_BASE + tab) as usize, 0);
@@ -2977,7 +3031,7 @@ mod tests {
                     }
                     count
                 };
-                for tab in [1, 2, 3, 5, 6] {
+                for tab in [1, 2, 3, 5, 6, 7, 8] {
                     send(hwnd, WM_COMMAND, (TAB_BASE + tab) as usize, 0);
                     wait_tab(hwnd, tab as usize)?;
                     let pane = unsafe { GetDlgItem(hwnd, 2) };

@@ -1,7 +1,7 @@
 use crate::config::{self, Config};
 use toml_edit::DocumentMut;
 
-pub const TABS: [(&str, &str); 7] = [
+pub const TABS: [(&str, &str); 9] = [
     ("General", "通用"),
     ("Tips", "提示框"),
     ("Screen regions", "屏幕分区"),
@@ -9,6 +9,8 @@ pub const TABS: [(&str, &str); 7] = [
     ("Quick actions", "快捷操作"),
     ("Crosshair", "十字线"),
     ("Right-click grid", "右键九宫格"),
+    ("Mouse annotations", "鼠标标注"),
+    ("Keyboard annotations", "键盘标注"),
 ];
 #[derive(Clone)]
 pub enum Kind {
@@ -61,6 +63,7 @@ pub enum ChoiceContext {
     Theme,
     Font,
     Action,
+    Position,
 }
 
 pub fn option(cfg: &Config, context: ChoiceContext, value: &str) -> String {
@@ -102,6 +105,12 @@ pub fn option(cfg: &Config, context: ChoiceContext, value: &str) -> String {
         (Action, "borders") => ("Toggle region outlines", "显示 / 隐藏框线"),
         (Action, "reload") => ("Reload configuration", "重载配置"),
         (Action, "settings") => ("Open settings", "打开设置"),
+        (Action, "mousecast") => ("Toggle mouse annotations", "开启 / 关闭鼠标标注"),
+        (Action, "keycast") => ("Toggle keyboard annotations", "开启 / 关闭键盘标注"),
+        (Position, "bottom-left") => ("Bottom left", "左下"),
+        (Position, "bottom-right") => ("Bottom right", "右下"),
+        (Position, "top-left") => ("Top left", "左上"),
+        (Position, "top-right") => ("Top right", "右上"),
         _ => (value, value),
     };
     cfg.tr(en, zh).to_owned()
@@ -115,6 +124,94 @@ fn choices(cfg: &Config, context: ChoiceContext, values: &[&str]) -> Kind {
     )
 }
 fn describe(section: &str, key: &str) -> (&'static str, &'static str, &'static str, &'static str) {
+    if matches!(section, "mousecast" | "keycast") {
+        return match key {
+            "enabled" => (
+                "Enable on startup",
+                "启动时启用",
+                "Hotkeys toggle the current session; this setting controls the initial state.",
+                "快捷键切换本次运行的状态；此设置决定启动时的初始状态。",
+            ),
+            "duration_ms" => (
+                "Display duration (ms)",
+                "显示时长（毫秒）",
+                "Keep each annotation visible for 100–10000 ms before fading.",
+                "每次标注保持 100–10000 毫秒后开始淡出。",
+            ),
+            "fade_ms" => (
+                "Fade duration (ms)",
+                "淡出时长（毫秒）",
+                "0–3000 ms; zero hides immediately after the display duration.",
+                "0–3000 毫秒；0 表示显示时长结束后立即隐藏。",
+            ),
+            "radius" => (
+                "Click radius",
+                "点击半径",
+                "8–128 logical pixels, scaled per monitor.",
+                "8–128 逻辑像素，按屏幕 DPI 缩放。",
+            ),
+            "ring_width" => (
+                "Ring thickness",
+                "圆环粗细",
+                "1–16 logical pixels.",
+                "1–16 逻辑像素。",
+            ),
+            "color" => (
+                "Click ring color",
+                "点击圆环颜色",
+                "Color of the expanding click indicator.",
+                "点击扩散圆环的颜色。",
+            ),
+            "background" => (
+                "Background",
+                "背景颜色",
+                "Annotation label background.",
+                "标注标签的背景颜色。",
+            ),
+            "foreground" => (
+                "Text color",
+                "文字颜色",
+                "Annotation label text.",
+                "标注标签的文字颜色。",
+            ),
+            "opacity" => (
+                "Opacity",
+                "不透明度",
+                "32–255; affects the label and click indicator.",
+                "32–255，作用于标签及点击指示。",
+            ),
+            "font" => (
+                "Font",
+                "字体",
+                "SystemFont uses the Windows UI font.",
+                "SystemFont 使用 Windows 界面字体。",
+            ),
+            "font_size" => (
+                "Font size (pt)",
+                "字号（磅）",
+                "6–72 points, scaled per monitor.",
+                "6–72 磅，按屏幕 DPI 缩放。",
+            ),
+            "history" => (
+                "Visible keystrokes",
+                "显示条数",
+                "1–8 labels; identical consecutive keys show a repeat count.",
+                "1–8 条；连续相同按键显示重复次数。",
+            ),
+            "position" => (
+                "Position",
+                "显示位置",
+                "Corner of the monitor containing the pointer when a key is pressed.",
+                "按键时鼠标所在显示器的指定角落。",
+            ),
+            _ => (
+                "Setting",
+                "设置项",
+                "Changes apply automatically.",
+                "更改自动应用。",
+            ),
+        };
+    }
     match (section, key) {
         ("general", "language") => (
             "Interface language",
@@ -338,10 +435,15 @@ pub fn fields(tab: usize, axis: usize, cfg: &Config, doc: &DocumentMut) -> Vec<F
         4 => &["keys", "commands", "shortcuts"],
         5 if axis != 1 => &["crosshair", "horizontal"],
         5 => &["crosshair", "vertical"],
+        7 => &["mousecast"],
+        8 => &["keycast"],
         _ => &["grid"],
     };
-    if matches!(tab, 2 | 3 | 5 | 6) {
+    if matches!(tab, 2 | 3 | 5 | 6 | 7 | 8) {
         fields.push(Field { section: String::new(), key: String::new(), label: cfg.tr("Live desktop preview", "实时桌面预览").into(), hint: cfg.tr("Esc closes or resets the preview. Region preview requires selecting a region below.", "Esc 关闭或重置预览；分区预览还需选中下方的分区。").into(), kind: Kind::Preview });
+        if tab >= 7 {
+            fields.last_mut().unwrap().hint=cfg.tr("Repeats a sample animation without capturing input. Esc stops it; previews pause while settings is inactive.","循环播放示例动画，不捕获输入。Esc 停止预览；设置窗口失焦时暂停。").into();
+        }
     }
     if tab == 0 {
         fields.push(Field { section: String::new(), key: String::new(), label: cfg.tr("Changes are saved and applied automatically", "更改后自动保存并应用").into(), hint: cfg.tr("Manual file edits take precedence over conflicting GUI edits. To allow an excluded window again, remove its exclusion from the configuration file.", "文件中的手动修改优先于 GUI 的冲突修改。若要重新允许已排除的窗口，请从配置文件中移除对应排除项。").into(), kind: Kind::Note });
@@ -362,7 +464,7 @@ pub fn fields(tab: usize, axis: usize, cfg: &Config, doc: &DocumentMut) -> Vec<F
         let mapping = matches!(*section, "presets" | "keys" | "commands" | "grid");
         for (key, item) in table {
             if !mapping
-                && ((key == "opacity" && *section != "outline")
+                && ((key == "opacity" && !matches!(*section, "outline" | "mousecast" | "keycast"))
                     || DEFAULTS
                         .get(section)
                         .and_then(|table| table.get(key))
@@ -405,6 +507,9 @@ pub fn fields(tab: usize, axis: usize, cfg: &Config, doc: &DocumentMut) -> Vec<F
                     }
                     ("tip", "show") => &["window", "time", "monitor", "off"],
                     ("tip", "theme") => &["system", "light", "dark"],
+                    ("keycast", "position") => {
+                        &["bottom-left", "bottom-right", "top-left", "top-right"]
+                    }
                     _ => &[],
                 };
                 if !values.is_empty() {
@@ -413,6 +518,7 @@ pub fn fields(tab: usize, axis: usize, cfg: &Config, doc: &DocumentMut) -> Vec<F
                         ("shortcuts", "alt" | "gesture") => ChoiceContext::AltSide,
                         ("shortcuts", _) => ChoiceContext::MouseButton,
                         ("tip", "show") => ChoiceContext::TipContent,
+                        ("keycast", "position") => ChoiceContext::Position,
                         _ => ChoiceContext::Theme,
                     };
                     kind = choices(cfg, context, values);

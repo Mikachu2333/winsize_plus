@@ -24,6 +24,7 @@ Left Alt is the default. Hold Alt with a key, or double-tap Alt, release it, the
 | Alt + Q/W/E, A/S/D, Z/X/C | Apply nine presets; S centers the window at 80% of the work area |
 | Alt + P | Toggle always on top |
 | Alt + L | Toggle the crosshair |
+| Alt + M / Alt + K | Toggle mouse / keyboard annotations |
 | Alt + U | Exclude the current window |
 | Alt + grave/backtick | Enter a command; Enter runs it |
 | Alt + H | Show help; Esc closes it, with no timeout |
@@ -31,13 +32,13 @@ Left Alt is the default. Hold Alt with a key, or double-tap Alt, release it, the
 
 Mouse actions use the window active when Alt was pressed. Move and resize can be disabled independently or assigned to the left, right, middle, or two side buttons. Help reflects the bindings. To allow an excluded window again, remove its `[[exclusions]]` entry from the configuration file.
 
-Help arranges region bindings in five keyboard rows: function keys, numbers and symbols, and the three letter rows. Empty rows are omitted, followed by one line of crosshair controls and then other keys. The tip measures key and region columns independently using the configured fonts and wraps oversized rows.
+Help arranges region bindings in five keyboard rows: function keys, numbers and symbols, and the three letter rows. Empty rows are omitted. Crosshair controls occupy one line, followed immediately by mouse and keyboard annotation shortcuts together on the next line; this group has a blank line before and after it. Other keys follow. The tip measures key and region columns independently using the configured fonts and wraps oversized rows.
 
 The program's settings window and its color dialog are automatically excluded without configuration.
 
 ## Settings and previews
 
-Seven pages cover General, Tips, Screen regions, Region outlines, Quick actions, Crosshair, and Right-click grid. The interface supports Chinese, English, and the system language.
+Nine pages cover General, Tips, Screen regions, Region outlines, Quick actions, Crosshair, Right-click grid, Mouse annotations, and Keyboard annotations. The interface supports Chinese, English, and the system language.
 
 - The program creates, updates, and removes its logon task. Changing elevation updates task permissions; Windows requests UAC consent when needed.
 - Font choices use their own typefaces. `SystemFont` means the system UI font. Add up to three fallback families and drag to reorder them. Sizes use points; tips default to 12 pt.
@@ -47,6 +48,10 @@ Seven pages cover General, Tips, Screen regions, Region outlines, Quick actions,
 - Configure each crosshair axis separately, or choose Both axes to apply a shared style. Both axes share one FPS value, an integer from 24 to 1000, defaulting to 30 and clamping to the limits. No continuous drawing occurs while stationary.
 
 Default colors use Fluent neutrals and blue, with Windows system colors for interaction states. Existing custom colors are preserved.
+
+Mouse annotations show expanding click rings and labels for left/right/middle buttons, side buttons, and vertical/horizontal scrolling. Keyboard annotations show physical key names, Ctrl/Alt/Shift/Win combinations, recent entries, and consecutive repeat counts. They pass input through and do not take focus. Both are off by default; Alt+M and Alt+K toggle the current session, while each settings page's “Enable on startup” controls the next launch. Existing occupied or disabled shortcuts are preserved during migration.
+
+Each annotation page offers a looping sample preview, font, colors, opacity, display duration, and fade duration. Mouse settings include ring size and thickness; keyboard settings include history length and screen corner. Previews stop with Esc and pause when settings loses focus. Annotations use the pointer's monitor and its DPI. Input is displayed temporarily in memory and never logged to disk; keyboard labels represent keys rather than IME-composed text. The interaction design was informed by KeyCastOW.
 
 ## Region expressions
 
@@ -82,6 +87,7 @@ Commands and presets share name normalization, including case, surrounding white
 | Top | Pin | Toggle always on top |
 | Ignore | Exclude | Exclude window |
 | Guide | — | Toggle crosshair |
+| MouseCast / KeyCast | — | Toggle mouse / keyboard annotations |
 | Horizontal | — | Show horizontal crosshair, then hide on repeat; Alt + Minus by default |
 | Vertical | — | Show vertical crosshair, then hide on repeat; Alt + Backslash by default |
 | Cross | — | Show both axes, then hide on repeat; Alt + Equal by default |

@@ -144,6 +144,14 @@ impl Tray {
         let entries = [
             ("settings", cfg.tr("Settings…", "设置…")),
             ("help", cfg.tr("Help", "帮助")),
+            (
+                "mousecast",
+                cfg.tr("Toggle mouse annotations", "切换鼠标标注"),
+            ),
+            (
+                "keycast",
+                cfg.tr("Toggle keyboard annotations", "切换键盘标注"),
+            ),
             ("reload", cfg.tr("Reload configuration", "重载配置")),
             ("version", cfg.tr("Version", "版本")),
             ("quit", cfg.tr("Exit", "退出")),

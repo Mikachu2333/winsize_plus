@@ -647,8 +647,13 @@ mod multi_monitor_regressions {
         assert_eq!(r.rect, virtual_area);
         let shape = Region::new().unwrap();
         assert_ne!(unsafe { GetWindowRgn(preview.base.0, shape.0) }, 0);
-        let x = virtual_area.width - 1;
-        let y = 100;
+        let rightmost = &displays
+            .iter()
+            .max_by_key(|(_, d)| d.full.x + d.full.width)
+            .unwrap()
+            .1;
+        let x = rightmost.full.x + rightmost.full.width - 1 - virtual_area.x;
+        let y = rightmost.full.y + rightmost.full.height / 2 - virtual_area.y;
         let contains = unsafe { PtInRegion(shape.0, x, y) } != 0;
         println!(
             "virtual={virtual_area:?} clipping={:?} far edge present={contains}",

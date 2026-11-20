@@ -91,7 +91,7 @@ pub fn draw(root: HWND, draw: &DRAWITEMSTRUCT) {
                     );
                 }
             }
-        } else if (100..107).contains(&draw.CtlID) {
+        } else if (100..100 + crate::settings_schema::TABS.len() as u32).contains(&draw.CtlID) {
             let selected = GetPropW(draw.hwndItem, w!("SelectedTab")) as usize != 0;
             FillRect(dc, &rect, GetSysColorBrush(COLOR_WINDOW));
             SelectObject(dc, GetStockObject(DC_BRUSH));

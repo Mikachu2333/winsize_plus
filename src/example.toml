@@ -46,6 +46,31 @@ fill_opacity = 48 # Translucent selection fill.
 [crosshair]
 fps = 30 # Integer, clamped to 24..1000.
 
+[mousecast]
+enabled = false # Initial state; Alt+M toggles the running display.
+duration_ms = 450
+fade_ms = 250
+radius = 28
+ring_width = 3
+color = "#0078D4"
+background = "#292929"
+foreground = "#FFFFFF"
+opacity = 220
+font = "SystemFont"
+font_size = 12
+
+[keycast]
+enabled = false # Initial state; Alt+K toggles the running display.
+duration_ms = 1500
+fade_ms = 350
+history = 4
+position = "bottom-left"
+background = "#292929"
+foreground = "#FFFFFF"
+opacity = 220
+font = "SystemFont"
+font_size = 18
+
 [horizontal]
 width = 2
 color = "#C80000"
@@ -89,6 +114,8 @@ L = "Guide"
 Minus = "Horizontal"
 Equal = "Cross"
 Backslash = "Vertical"
+M = "MouseCast"
+K = "KeyCast"
 Grave = "Command"
 H = "Help"
 

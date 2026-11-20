@@ -40,6 +40,9 @@ fn later(ms: u32) -> Instant {
     Instant::now() + Duration::from_millis(ms.into())
 }
 struct App {
+    cast: crate::cast::Visuals,
+    mousecast: bool,
+    keycast: bool,
     cfg: Config,
     path: PathBuf,
     overlay: Overlay,
@@ -143,7 +146,15 @@ impl App {
             restart = false;
             startup_error = Some(error);
         }
+        if cfg.mousecast.enabled != self.cfg.mousecast.enabled {
+            self.mousecast = cfg.mousecast.enabled;
+        }
+        if cfg.keycast.enabled != self.cfg.keycast.enabled {
+            self.keycast = cfg.keycast.enabled;
+        }
+        self.cast.clear();
         input::configure(&cfg)?;
+        input::set_casting(self.mousecast, self.keycast)?;
         self.frames.reset(cfg.fps);
         self.overlay.guides(self.overlay.mode(), &cfg)?;
         self.cfg = cfg;
@@ -174,6 +185,35 @@ impl App {
     }
     fn act(&mut self, action: &str) -> Result<(), String> {
         match action {
+            "mousecast" | "keycast" => {
+                let enabled = if action == "mousecast" {
+                    self.mousecast = !self.mousecast;
+                    if !self.mousecast {
+                        self.cast.clear_mouse();
+                    }
+                    self.mousecast
+                } else {
+                    self.keycast = !self.keycast;
+                    if !self.keycast {
+                        self.cast.clear_keys();
+                    }
+                    self.keycast
+                };
+                input::set_casting(self.mousecast, self.keycast)?;
+                let name = if action == "mousecast" {
+                    self.cfg.tr("Mouse annotations", "鼠标标注")
+                } else {
+                    self.cfg.tr("Keyboard annotations", "键盘标注")
+                };
+                self.notice(&format!(
+                    "{name}: {}",
+                    if enabled {
+                        self.cfg.tr("On", "开启")
+                    } else {
+                        self.cfg.tr("Off", "关闭")
+                    }
+                ))
+            }
             "settings" => crate::settings::open(),
             "time" | "monitor" => self.status(action),
             "version" => self.notice(concat!("WinSizeP ", env!("CARGO_PKG_VERSION"))),
@@ -318,6 +358,18 @@ impl App {
     }
     fn handle_event(&mut self, msg: MSG) -> Result<(), String> {
         match msg.message {
+            input::CAST_KEY if self.keycast => {
+                if let Some(text) = crate::cast::key_caption(msg.wParam as u32, msg.lParam as u32) {
+                    self.cast.key(text, input::cast_point(), &self.cfg)?;
+                }
+                Ok(())
+            }
+            input::CAST_MOUSE if self.mousecast => self.cast.mouse(
+                msg.wParam as u32,
+                msg.lParam as u32,
+                input::cast_point(),
+                &self.cfg,
+            ),
             input::TIP_SCROLL => {
                 self.overlay.scroll_tip(msg.wParam as i32);
                 self.hide = None;
@@ -325,6 +377,7 @@ impl App {
                 Ok(())
             }
             input::DISPLAY_CHANGED => {
+                self.cast.tick(&self.cfg)?;
                 self.overlay.follow(desktop::cursor()?, &self.cfg)?;
                 self.preview.tick(&self.cfg)
             }
@@ -448,6 +501,9 @@ impl App {
     }
     fn deadlines(&mut self) -> Result<(), String> {
         let now = Instant::now();
+        if self.cast.deadline().is_some_and(|when| now >= when) {
+            self.cast.tick(&self.cfg)?;
+        }
         if self.preview_until.is_some_and(|when| now >= when) {
             input::cancel();
             self.close_preview()?;
@@ -480,6 +536,7 @@ impl App {
     }
     fn timeout(&self) -> u32 {
         [
+            self.cast.deadline(),
             self.hide,
             self.reload,
             self.preview.deadline(),
@@ -542,7 +599,11 @@ pub fn run(path: &Path, recovery: Option<&str>) -> Result<crate::ResidentExit, S
         let snapshot = Some(loaded.bytes);
         let overlay = Overlay::new()?;
         let _hooks = input::Hooks::start(&cfg)?;
+        input::set_casting(cfg.mousecast.enabled, cfg.keycast.enabled)?;
         let mut app = App {
+            cast: crate::cast::Visuals::new(),
+            mousecast: cfg.mousecast.enabled,
+            keycast: cfg.keycast.enabled,
             frames: FrameClock::new(cfg.fps)?,
             cfg,
             path: path.into(),
@@ -642,6 +703,81 @@ mod tests {
     const TARGET: &str = "WinSizeP preview test target";
 
     #[test]
+    #[ignore = "opens temporary overlays and a tray icon; no startup task or config is changed"]
+    fn annotation_actions_toggle_independently_and_dispatch_input() {
+        let _dpi = crate::test_support::Dpi::new();
+        let cfg = crate::test_support::cfg();
+        let overlay = Overlay::new().unwrap();
+        let _hooks = input::Hooks::start(&cfg).unwrap();
+        let mut app = App {
+            cast: crate::cast::Visuals::new(),
+            mousecast: false,
+            keycast: false,
+            frames: FrameClock::new(cfg.fps).unwrap(),
+            cfg,
+            path: PathBuf::new(),
+            overlay,
+            tray: crate::tray::Tray::new().unwrap(),
+            preview: Preview::new().unwrap(),
+            held_window: None,
+            preview_latched: false,
+            preview_until: None,
+            preview_check: None,
+            window: null_mut(),
+            drag: None,
+            command: String::new(),
+            hide: None,
+            reload: None,
+            snapshot: None,
+            exit: None,
+        };
+        app.handle_event(MSG {
+            message: input::ACTION,
+            wParam: 0x4b,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(app.keycast && !app.mousecast);
+        app.handle_event(MSG {
+            message: input::CAST_KEY,
+            wParam: 0x41,
+            lParam: crate::cast::CTRL as isize,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(app.cast.deadline().is_some());
+        app.handle_event(MSG {
+            message: input::ACTION,
+            wParam: 0x4d,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(app.keycast && app.mousecast);
+        app.handle_event(MSG {
+            message: input::CAST_MOUSE,
+            wParam: 1,
+            ..Default::default()
+        })
+        .unwrap();
+        app.handle_event(MSG {
+            message: input::ACTION,
+            wParam: 0x4b,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(!app.keycast && app.mousecast);
+        app.handle_event(MSG {
+            message: input::ACTION,
+            wParam: 0x4d,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(!app.keycast && !app.mousecast);
+        app.cast.tick(&app.cfg).unwrap();
+        assert!(app.cast.deadline().is_none());
+    }
+
+    #[test]
     #[ignore = "opens a temporary settings process and exercises the tray Quit action"]
     fn tray_quit_closes_settings() {
         let class = w!("WinSizeP.Settings");
@@ -658,6 +794,9 @@ mod tests {
         let cfg = Config::parse(&config::help().parse().unwrap()).unwrap();
         let overlay = Overlay::new().unwrap();
         let mut app = App {
+            cast: crate::cast::Visuals::new(),
+            mousecast: false,
+            keycast: false,
             frames: FrameClock::new(cfg.fps).unwrap(),
             cfg,
             path: path.clone(),
@@ -923,6 +1062,9 @@ mod tests {
         let overlay = Overlay::new().unwrap();
         let _hooks = input::Hooks::start(&cfg).unwrap();
         let mut app = App {
+            cast: crate::cast::Visuals::new(),
+            mousecast: false,
+            keycast: false,
             frames: FrameClock::new(cfg.fps).unwrap(),
             cfg,
             path: PathBuf::new(),

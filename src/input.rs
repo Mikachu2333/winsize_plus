@@ -28,6 +28,8 @@ pub const DRAG_END: u32 = WM_APP + 10;
 pub const GRID_SHOW: u32 = WM_APP + 11;
 pub const DISPLAY_CHANGED: u32 = WM_APP + 12;
 pub const TIP_SCROLL: u32 = WM_APP + 13;
+pub const CAST_KEY: u32 = WM_APP + 14;
+pub const CAST_MOUSE: u32 = WM_APP + 15;
 pub fn display_changed() {
     desktop::invalidate_displays();
     post(DISPLAY_CHANGED, 0, 0);
@@ -69,6 +71,9 @@ struct Input {
     exclusions: Vec<Identity>,
     move_button: Option<u32>,
     resize_button: Option<u32>,
+    cast_mouse: bool,
+    cast_keys: bool,
+    cast_toggles: [u64; 4],
     drag: Option<PointerAction>,
 }
 #[derive(Clone, Copy)]
@@ -184,6 +189,7 @@ impl Input {
     fn update_mouse(&mut self) -> Result<(), String> {
         unsafe {
             let needed = self.guides
+                || self.cast_mouse
                 || self.preview_tracking
                 || self.drag.is_some()
                 || (self.tip_scrollable && self.tip_window != 0)
@@ -211,6 +217,13 @@ impl Input {
             if !down {
                 self.eaten[index] &= !flag;
             }
+            return true;
+        }
+        if down && self.pressed & self.alt_mask != 0 && self.cast_toggles[index] & flag != 0 {
+            post(ACTION, key as usize, 0);
+            self.eaten[index] |= flag;
+            self.tap = None;
+            self.last_tap = None;
             return true;
         }
         if down && self.tip_scrollable && matches!(key, 0x21..=0x24 | 0x26 | 0x28) {
@@ -400,6 +413,22 @@ unsafe extern "system" fn keyboard(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT
             } else {
                 data.vkCode
             };
+            let casting = INPUT.with_borrow(|input| {
+                input.cast_keys
+                    && (key >= 256 || {
+                        let (index, flag) = bit(key);
+                        input.pressed & input.alt_mask == 0 || input.cast_toggles[index] & flag == 0
+                    })
+            });
+            if casting && down {
+                let detail = cast_modifiers()
+                    | ((data.scanCode & 255) << 8)
+                    | (u32::from(data.flags & LLKHF_EXTENDED != 0) << 16);
+                let mut point = POINT::default();
+                if GetCursorPos(&mut point) != 0 {
+                    post_event(CAST_KEY, key as usize, detail as isize, Some(point));
+                }
+            }
             if INPUT.with(|cell| {
                 cell.try_borrow_mut()
                     .is_ok_and(|mut input| input.keyboard(key, down, data.time))
@@ -419,6 +448,30 @@ unsafe extern "system" fn mouse(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
         if code == HC_ACTION as i32 {
             let data = &*(lp as *const MSLLHOOKSTRUCT);
+            if INPUT.with_borrow(|input| input.cast_mouse) {
+                let action = match wp as u32 {
+                    WM_MOUSEWHEEL => Some(if (data.mouseData >> 16) as i16 > 0 {
+                        8
+                    } else {
+                        9
+                    }),
+                    WM_MOUSEHWHEEL => Some(if (data.mouseData >> 16) as i16 > 0 {
+                        11
+                    } else {
+                        10
+                    }),
+                    message => mouse_button(message, data.mouseData)
+                        .and_then(|(button, down)| down.then_some(button)),
+                };
+                if let Some(action) = action {
+                    post_event(
+                        CAST_MOUSE,
+                        action as usize,
+                        cast_modifiers() as isize,
+                        Some(data.pt),
+                    );
+                }
+            }
             // Clicking the tip's scrollbar must not dismiss an Alt preview or begin a drag.
             let tip_window = INPUT.with_borrow(|input| {
                 if input.tip_scrollable
@@ -504,6 +557,37 @@ pub fn drag_origin() -> POINT {
         .filter(|(kind, _)| *kind == DRAG_START)
         .map(|(_, point)| point)
         .unwrap_or_default()
+}
+fn cast_modifiers() -> u32 {
+    let mut flags = 0;
+    for (key, flag) in [
+        (VK_CONTROL, crate::cast::CTRL),
+        (VK_MENU, crate::cast::ALT),
+        (VK_SHIFT, crate::cast::SHIFT),
+        (VK_LWIN, crate::cast::WIN),
+        (VK_RWIN, crate::cast::WIN),
+    ] {
+        if unsafe { GetAsyncKeyState(key as i32) } < 0 {
+            flags |= flag;
+        }
+    }
+    flags
+}
+pub fn cast_point() -> POINT {
+    CURRENT
+        .with(Cell::get)
+        .filter(|(kind, _)| matches!(*kind, CAST_KEY | CAST_MOUSE))
+        .map(|(_, point)| point)
+        .unwrap_or_default()
+}
+pub fn set_casting(mouse: bool, keys: bool) -> Result<(), String> {
+    on_hook(move || {
+        INPUT.with_borrow_mut(|input| {
+            input.cast_mouse = mouse;
+            input.cast_keys = keys;
+            input.update_mouse()
+        })
+    })?
 }
 fn mouse_button(message: u32, data: u32) -> Option<(u32, bool)> {
     Some(match message {
@@ -620,11 +704,15 @@ pub fn configure(cfg: &Config) -> Result<(), String> {
             input.double_ms = double_ms;
             input.command = [0; 4];
             input.bound = [0; 4];
+            input.cast_toggles = [0; 4];
             for (key, action) in &keys {
                 let (index, flag) = bit(*key);
                 input.bound[index] |= flag;
                 if action == "command" {
                     input.command[index] |= flag;
+                }
+                if matches!(action.as_str(), "mousecast" | "keycast") {
+                    input.cast_toggles[index] |= flag;
                 }
             }
             input.update_mouse()
@@ -796,6 +884,78 @@ impl Drop for Hooks {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn annotation_hotkeys_work_without_a_target_and_consume_only_their_keys() {
+        let hooks = super::Hooks::escape_only().unwrap();
+        super::configure(&crate::test_support::cfg()).unwrap();
+        super::on_hook(|| {
+            super::INPUT.with_borrow_mut(|input| {
+                input.pressed = 1;
+                input.target_allowed = false;
+                assert!(input.keyboard(0x4d, true, 1));
+                assert!(input.keyboard(0x4d, true, 2));
+                assert!(input.keyboard(0x4d, false, 3));
+                assert!(!input.keyboard(0x4a, true, 4));
+            })
+        })
+        .unwrap();
+        let event = super::next_event().unwrap();
+        assert_eq!((event.message, event.wParam), (super::ACTION, 0x4d));
+        drop(hooks);
+    }
+    #[test]
+    fn annotation_hooks_observe_keys_and_mouse_without_consuming_input() {
+        let _hooks = super::Hooks::escape_only().unwrap();
+        super::set_casting(true, true).unwrap();
+        super::on_hook(|| unsafe {
+            let key = super::KBDLLHOOKSTRUCT {
+                vkCode: 0x41,
+                scanCode: 0x1e,
+                ..Default::default()
+            };
+            assert_eq!(
+                super::keyboard(
+                    super::HC_ACTION as i32,
+                    super::WM_KEYDOWN as usize,
+                    (&key as *const _) as isize
+                ),
+                0
+            );
+            let mouse = super::MSLLHOOKSTRUCT {
+                pt: super::POINT { x: -100, y: 250 },
+                ..Default::default()
+            };
+            assert_eq!(
+                super::mouse(
+                    super::HC_ACTION as i32,
+                    super::WM_LBUTTONDOWN as usize,
+                    (&mouse as *const _) as isize
+                ),
+                0
+            );
+        })
+        .unwrap();
+        let key = super::next_event().unwrap();
+        assert_eq!((key.message, key.wParam), (super::CAST_KEY, 0x41));
+        let mouse = super::next_event().unwrap();
+        assert_eq!((mouse.message, mouse.wParam), (super::CAST_MOUSE, 1));
+        let point = super::cast_point();
+        assert_eq!((point.x, point.y), (-100, 250));
+        super::set_casting(false, false).unwrap();
+        super::on_hook(|| super::INPUT.with_borrow(|input| assert!(input.mouse.is_null())))
+            .unwrap();
+    }
+    #[test]
+    fn annotation_sample_preview_can_be_canceled_with_escape() {
+        let _hooks = super::Hooks::escape_only().unwrap();
+        super::track_preview(true).unwrap();
+        let eaten =
+            super::on_hook(|| super::INPUT.with_borrow_mut(|input| input.keyboard(27, true, 1)))
+                .unwrap();
+        assert!(eaten);
+        assert_eq!(super::next_event().unwrap().message, super::CANCEL);
+        super::track_preview(false).unwrap();
+    }
     #[test]
     fn scrolling_keys_are_consumed_only_for_an_overflowing_tip() {
         let _hooks = super::Hooks::escape_only().unwrap();

@@ -361,7 +361,7 @@ impl Panel {
             InvalidateRect(self.0, &area, 0);
         }
     }
-    fn round(&self, width: i32, height: i32, radius: i32) -> Result<(), String> {
+    pub(crate) fn round(&self, width: i32, height: i32, radius: i32) -> Result<(), String> {
         unsafe {
             let region = CreateRoundRectRgn(0, 0, width, height, radius, radius);
             if region.is_null() {
@@ -812,6 +812,21 @@ impl Label {
             width: image.width,
             height: image.height,
         };
+        self.image(&image, size.x, size.y, 255)
+    }
+    pub(crate) fn image(
+        &self,
+        image: &crate::label_text::Image,
+        x: i32,
+        y: i32,
+        alpha: u8,
+    ) -> Result<(), String> {
+        let size = Rect {
+            x,
+            y,
+            width: image.width,
+            height: image.height,
+        };
         // SAFETY: Direct2D has finished drawing into the owned premultiplied bitmap.
         // UpdateLayeredWindow copies it synchronously before Image releases its DC.
         unsafe {
@@ -828,7 +843,7 @@ impl Label {
             let blend = BLENDFUNCTION {
                 BlendOp: AC_SRC_OVER as u8,
                 BlendFlags: 0,
-                SourceConstantAlpha: 255,
+                SourceConstantAlpha: alpha,
                 AlphaFormat: AC_SRC_ALPHA as u8,
             };
             check(UpdateLayeredWindow(
