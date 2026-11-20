@@ -1470,6 +1470,7 @@ impl Editor {
     fn render(&mut self) -> Result<(), String> {
         self.cast.clear();
         self.cast_next = None;
+        input::annotation_preview(false)?;
         unsafe {
             SetTimer(self.window.0, 1, 100, None);
         }
@@ -1513,15 +1514,12 @@ impl Editor {
                 7 | 8 => {
                     self.cast
                         .preview(self.tab == 7, desktop::cursor()?, &self.cfg)?;
-                    let style = if self.tab == 7 {
-                        &self.cfg.mousecast
+                    let duration = if self.tab == 7 {
+                        crate::mouse_cast::PREVIEW_INTERVAL.as_millis() as u64
                     } else {
-                        &self.cfg.keycast
+                        u64::from(self.cfg.keycast.duration + self.cfg.keycast.fade) + 300
                     };
-                    self.cast_next = Some(
-                        Instant::now()
-                            + Duration::from_millis(u64::from(style.duration + style.fade) + 300),
-                    );
+                    self.cast_next = Some(Instant::now() + Duration::from_millis(duration));
                     unsafe {
                         SetTimer(self.window.0, 1, 16, None);
                     }
@@ -1533,7 +1531,8 @@ impl Editor {
             self.status(&self.preview.warnings().join("\n"));
         }
         input::set_guides(guides != 0)?;
-        input::track_preview(self.preview.visible() || self.cast_next.is_some())
+        input::annotation_preview(self.cast_next.is_some())?;
+        input::track_preview(self.preview.visible())
     }
     fn commit_document(&mut self, draft: DocumentMut) -> Result<(), String> {
         Config::parse(&draft)?;
@@ -1813,13 +1812,12 @@ impl Editor {
         if self.cast_next.is_some_and(|when| now >= when) {
             self.cast
                 .preview(self.tab == 7, desktop::cursor()?, &self.cfg)?;
-            let style = if self.tab == 7 {
-                &self.cfg.mousecast
+            let duration = if self.tab == 7 {
+                crate::mouse_cast::PREVIEW_INTERVAL.as_millis() as u64
             } else {
-                &self.cfg.keycast
+                u64::from(self.cfg.keycast.duration + self.cfg.keycast.fade) + 300
             };
-            self.cast_next =
-                Some(now + Duration::from_millis(u64::from(style.duration + style.fade) + 300));
+            self.cast_next = Some(now + Duration::from_millis(duration));
         }
         // Native combo popups capture the pointer and do not reliably deliver list mouse-move
         // messages to subclasses. Hit-test the open list on the existing UI timer as well.
@@ -1952,6 +1950,7 @@ impl Editor {
         }
     }
     fn escape(&mut self) -> Result<(), String> {
+        input::annotation_preview(false)?;
         self.cast.clear();
         self.cast_next = None;
         if matches!(self.tab, 7 | 8) {
@@ -2723,6 +2722,8 @@ fn message_loop(hwnd: HWND, timer: HANDLE) -> Result<(), String> {
                         Ok(())
                     }),
                     input::DISPLAY_CHANGED => with_editor(|e| {
+                        e.cfg.mousecast.color = crate::colors::accent();
+                        e.cfg.mousecast.dark = crate::overlay::dark();
                         e.overlay.follow(desktop::cursor()?, &e.cfg)?;
                         e.preview.tick(&e.cfg)?;
                         e.cast.tick(&e.cfg)

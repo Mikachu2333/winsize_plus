@@ -11,6 +11,7 @@ mod input;
 mod label_text;
 mod layout;
 mod logon;
+mod mouse_cast;
 mod overlay;
 mod preview;
 mod resident;

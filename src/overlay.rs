@@ -396,6 +396,7 @@ pub struct Overlay {
     last_monitor: HMONITOR,
     display: Option<Display>,
     display_epoch: u64,
+    _renderer: crate::label_text::Session,
 }
 fn scale(value: i32, dpi: i32) -> i32 {
     (value * dpi + 48) / 96
@@ -444,6 +445,7 @@ impl Overlay {
                 last_monitor: null_mut(),
                 display: None,
                 display_epoch: desktop::display_epoch(),
+                _renderer: crate::label_text::Session::new(),
             })
         }
     }

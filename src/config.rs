@@ -55,12 +55,17 @@ pub struct CastStyle {
     pub opacity: u8,
     pub history: usize,
     pub position: String,
+}
+#[derive(Clone, Debug)]
+pub struct MouseStyle {
+    pub enabled: bool,
     pub radius: i32,
-    pub ring_width: i32,
+    pub opacity: u8,
     pub color: u32,
+    pub dark: bool,
 }
 pub struct Config {
-    pub mousecast: CastStyle,
+    pub mousecast: MouseStyle,
     pub keycast: CastStyle,
     pub zh: bool,
     pub alt: String,
@@ -795,25 +800,16 @@ impl Config {
                 } else {
                     "pointer".into()
                 },
-                radius: if section == "mousecast" {
-                    number(section, "radius", 8, 128)? as i32
-                } else {
-                    0
-                },
-                ring_width: if section == "mousecast" {
-                    number(section, "ring_width", 1, 16)? as i32
-                } else {
-                    0
-                },
-                color: if section == "mousecast" {
-                    color(section, "color")?
-                } else {
-                    0
-                },
             })
         };
         Ok(Self {
-            mousecast: cast("mousecast")?,
+            mousecast: MouseStyle {
+                enabled: boolean("mousecast", "enabled")?,
+                radius: number("mousecast", "radius", 4, 64)? as i32,
+                opacity: number("mousecast", "opacity", 96, 224)? as u8,
+                color: crate::colors::accent(),
+                dark: crate::overlay::dark(),
+            },
             keycast: cast("keycast")?,
             zh: language == "zh-CN" || (language == "auto" && system_zh()),
             alt: choice("shortcuts", "alt", &["left", "right", "both"])?,
@@ -1004,6 +1000,30 @@ fn document(text: &str) -> Result<(DocumentMut, bool), String> {
 }
 
 fn migrate(doc: &mut DocumentMut) -> Result<(), String> {
+    if let Some(mouse) = doc.get_mut("mousecast").and_then(Item::as_table_mut) {
+        if (mouse.contains_key("ring_width") || mouse.contains_key("duration_ms"))
+            && let Some(radius) = mouse.get("radius").and_then(Item::as_integer)
+        {
+            mouse["radius"] = value((radius / 2).clamp(4, 64));
+        }
+        for old in [
+            "duration_ms",
+            "fade_ms",
+            "ring_width",
+            "color",
+            "background",
+            "foreground",
+            "font",
+            "font_size",
+        ] {
+            mouse.remove(old);
+        }
+        if let Some(alpha) = mouse.get("opacity").and_then(Item::as_integer)
+            && !(96..=224).contains(&alpha)
+        {
+            mouse["opacity"] = value(alpha.clamp(96, 224));
+        }
+    }
     // Introduce each shortcut only once, preserving occupied/disabled virtual-key aliases
     // and intentionally empty maps. The new fixed sections mark the completed migration.
     for (section, key, action) in [("mousecast", "M", "MouseCast"), ("keycast", "K", "KeyCast")] {
@@ -1435,6 +1455,23 @@ pub fn load_snapshot(path: &Path, edit: Option<(&Identity, Switch)>) -> Result<L
 mod tests {
     use super::*;
     #[test]
+    fn old_mouse_animation_settings_migrate_once_to_compact_shapes() {
+        let mut doc = help().parse::<DocumentMut>().unwrap();
+        doc["mousecast"]["radius"] = value(28);
+        doc["mousecast"]["duration_ms"] = value(450);
+        doc["mousecast"]["fade_ms"] = value(250);
+        doc["mousecast"]["ring_width"] = value(3);
+        doc["mousecast"]["font"] = value("Arial");
+        migrate(&mut doc).unwrap();
+        assert_eq!(doc["mousecast"]["radius"].as_integer(), Some(14));
+        for key in ["duration_ms", "fade_ms", "ring_width", "font"] {
+            assert!(doc["mousecast"].get(key).is_none());
+        }
+        migrate(&mut doc).unwrap();
+        assert_eq!(doc["mousecast"]["radius"].as_integer(), Some(14));
+        Config::parse(&doc).unwrap();
+    }
+    #[test]
     fn annotation_migration_preserves_existing_shortcuts_and_runs_once() {
         let mut doc = help().parse::<DocumentMut>().unwrap();
         doc.as_table_mut().remove("mousecast");
@@ -1463,7 +1500,7 @@ mod tests {
         doc["keycast"]["font_size"] = value(32);
         doc["keycast"]["history"] = value(999);
         let cfg = recover(&mut doc).unwrap();
-        assert_eq!(cfg.mousecast.radius, 28);
+        assert_eq!(cfg.mousecast.radius, 14);
         assert_eq!(cfg.keycast.font_size, 32);
         assert_eq!(cfg.keycast.history, 4);
         assert!(cfg.warnings.iter().any(|w| w.contains("mousecast.radius")));

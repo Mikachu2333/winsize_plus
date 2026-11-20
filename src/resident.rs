@@ -132,7 +132,7 @@ impl App {
         }
         let loaded = config::load_snapshot(&self.path, None)?;
         let mut cfg = loaded.config;
-        self.snapshot = Some(loaded.bytes);
+        let snapshot = loaded.bytes;
         let sync_task =
             !automatic || (cfg.autostart, cfg.elevate) != (self.cfg.autostart, self.cfg.elevate);
         let mut restart =
@@ -153,12 +153,16 @@ impl App {
             self.keycast = cfg.keycast.enabled;
         }
         self.cast.clear();
+        if self.mousecast {
+            self.cast.prepare_mouse(desktop::cursor()?, &cfg)?;
+        }
         input::configure(&cfg)?;
         input::set_casting(self.mousecast, self.keycast)?;
         self.frames.reset(cfg.fps);
         self.overlay.guides(self.overlay.mode(), &cfg)?;
         self.cfg = cfg;
         self.close_preview()?;
+        self.snapshot = Some(snapshot);
         if restart {
             self.exit = Some(crate::ResidentExit::Restart(Some(self.cfg.elevate)));
             return Ok(());
@@ -186,20 +190,29 @@ impl App {
     fn act(&mut self, action: &str) -> Result<(), String> {
         match action {
             "mousecast" | "keycast" => {
-                let enabled = if action == "mousecast" {
-                    self.mousecast = !self.mousecast;
-                    if !self.mousecast {
-                        self.cast.clear_mouse();
-                    }
-                    self.mousecast
+                let mouse = if action == "mousecast" {
+                    !self.mousecast
                 } else {
-                    self.keycast = !self.keycast;
-                    if !self.keycast {
-                        self.cast.clear_keys();
-                    }
+                    self.mousecast
+                };
+                let keys = if action == "keycast" {
+                    !self.keycast
+                } else {
                     self.keycast
                 };
-                input::set_casting(self.mousecast, self.keycast)?;
+                if mouse && !self.mousecast {
+                    self.cast.prepare_mouse(desktop::cursor()?, &self.cfg)?;
+                }
+                input::set_casting(mouse, keys)?;
+                self.mousecast = mouse;
+                self.keycast = keys;
+                if !mouse {
+                    self.cast.clear_mouse();
+                }
+                if !keys {
+                    self.cast.clear_keys();
+                }
+                let enabled = if action == "mousecast" { mouse } else { keys };
                 let name = if action == "mousecast" {
                     self.cfg.tr("Mouse annotations", "鼠标标注")
                 } else {
@@ -377,6 +390,8 @@ impl App {
                 Ok(())
             }
             input::DISPLAY_CHANGED => {
+                self.cfg.mousecast.color = crate::colors::accent();
+                self.cfg.mousecast.dark = crate::overlay::dark();
                 self.cast.tick(&self.cfg)?;
                 self.overlay.follow(desktop::cursor()?, &self.cfg)?;
                 self.preview.tick(&self.cfg)
@@ -409,6 +424,9 @@ impl App {
             input::TYPE => self.typed(msg.wParam as u32),
             input::MOVE => {
                 let point = input::moved();
+                if self.mousecast {
+                    self.cast.follow_mouse(point, &self.cfg)?;
+                }
                 if self.preview.visible() {
                     self.preview.follow(point, &self.cfg)?;
                 }
@@ -622,6 +640,9 @@ pub fn run(path: &Path, recovery: Option<&str>) -> Result<crate::ResidentExit, S
             snapshot,
             exit: None,
         };
+        if app.mousecast {
+            app.cast.prepare_mouse(desktop::cursor()?, &app.cfg)?;
+        }
         let mut msg = MSG::default();
         if let Some(problem) = recovery {
             app.notice(problem)?;

@@ -1,6 +1,11 @@
 //! DirectWrite labels rendered directly to premultiplied BGRA for layered windows.
 use crate::{config::Config, desktop, fonts};
-use std::{cell::RefCell, ptr::null_mut};
+use std::{
+    cell::{Cell, RefCell},
+    marker::PhantomData,
+    ptr::null_mut,
+    rc::Rc,
+};
 use windows::{
     Win32::{
         Foundation::RECT,
@@ -18,6 +23,46 @@ use windows_sys::Win32::{Globalization::GetUserDefaultLocaleName, Graphics::Gdi:
 
 thread_local! {
     static RENDERER: RefCell<Option<Renderer>> = const { RefCell::new(None) };
+    static SESSIONS: Cell<usize> = const {Cell::new(0)};
+}
+
+/// Own graphics on the UI thread while its message loop is alive. Releasing WARP
+/// from an FLS/TLS destructor during ExitProcess can schedule work after Windows
+/// has already shut down its thread pool (TppRaiseInvalidParameter, 0xc000000d).
+pub(crate) struct Session(PhantomData<Rc<()>>);
+impl Session {
+    pub(crate) fn new() -> Self {
+        SESSIONS.with(|count| count.set(count.get() + 1));
+        Self(PhantomData)
+    }
+}
+impl Drop for Session {
+    fn drop(&mut self) {
+        let last = SESSIONS.with(|count| {
+            let remaining = count.get() - 1;
+            count.set(remaining);
+            remaining == 0
+        });
+        if last {
+            let renderer = RENDERER.with_borrow_mut(Option::take);
+            drop(renderer); // Drop COM resources outside the RefCell borrow and loader shutdown.
+        }
+    }
+}
+fn with_renderer<T>(draw: impl FnOnce(&mut Renderer) -> Result<T, String>) -> Result<T, String> {
+    if SESSIONS.with(Cell::get) == 0 {
+        // Standalone calls must not leave graphics resources for a TLS destructor.
+        return draw(&mut Renderer::new().map_err(|e| e.to_string())?);
+    }
+    RENDERER.with(|cell| {
+        let mut slot = cell
+            .try_borrow_mut()
+            .map_err(|_| "Renderer is already drawing / 正在绘制".to_owned())?;
+        if slot.is_none() {
+            *slot = Some(Renderer::new().map_err(|e| e.to_string())?);
+        }
+        draw(slot.as_mut().unwrap())
+    })
 }
 
 #[derive(PartialEq, Eq)]
@@ -81,6 +126,13 @@ struct Renderer {
     draw: ID2D1Factory,
     target: Option<ID2D1DCRenderTarget>,
     format: Option<(Style, IDWriteTextFormat)>,
+}
+impl Drop for Renderer {
+    fn drop(&mut self) {
+        // Release device resources before their factories, during Session teardown.
+        self.target.take();
+        self.format.take();
+    }
 }
 impl Renderer {
     fn new() -> windows::core::Result<Self> {
@@ -248,8 +300,7 @@ pub struct Image {
     pub height: i32,
     bitmap: HBITMAP,
     previous: HGDIOBJ,
-    #[cfg(test)]
-    bits: *const u32,
+    bits: *mut u32,
 }
 impl Image {
     fn new(width: i32, height: i32) -> Result<Self, String> {
@@ -291,10 +342,23 @@ impl Image {
                 height,
                 bitmap,
                 previous,
-                #[cfg(test)]
                 bits: bits.cast(),
             })
         }
+    }
+    pub(crate) fn pixels(width: i32, height: i32, pixels: &[u32]) -> Result<Self, String> {
+        if width <= 0
+            || height <= 0
+            || usize::try_from(i64::from(width) * i64::from(height)).ok() != Some(pixels.len())
+        {
+            return Err("Invalid bitmap dimensions".into());
+        }
+        let image = Self::new(width, height)?;
+        // SAFETY: the checked dimensions equal the owned 32-bit DIB allocation.
+        unsafe {
+            std::ptr::copy_nonoverlapping(pixels.as_ptr(), image.bits, pixels.len());
+        }
+        Ok(image)
     }
 }
 impl Drop for Image {
@@ -314,14 +378,7 @@ pub fn render(
     color: u32,
     cfg: &Config,
 ) -> Result<Image, String> {
-    RENDERER.with_borrow_mut(|slot| {
-        if slot.is_none() {
-            *slot = Some(Renderer::new().map_err(|e| e.to_string())?);
-        }
-        slot.as_mut()
-            .unwrap()
-            .render(caption, width, dpi, color, Style::new(cfg, dpi))
-    })
+    with_renderer(|renderer| renderer.render(caption, width, dpi, color, Style::new(cfg, dpi)))
 }
 pub fn annotation(
     caption: &str,
@@ -329,11 +386,8 @@ pub fn annotation(
     dpi: i32,
     cfg: &crate::config::CastStyle,
 ) -> Result<Image, String> {
-    RENDERER.with_borrow_mut(|slot| {
-        if slot.is_none() {
-            *slot = Some(Renderer::new().map_err(|e| e.to_string())?);
-        }
-        slot.as_mut().unwrap().render(
+    with_renderer(|renderer| {
+        renderer.render(
             caption,
             width,
             dpi,
@@ -346,6 +400,58 @@ pub fn annotation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "child process for the graphics shutdown regression"]
+    fn graphics_shutdown_child() {
+        if std::env::var_os("WINSIZEP_GRAPHICS_EXIT_TEST").is_none() {
+            return;
+        }
+        let cfg = crate::test_support::cfg();
+        {
+            let _overlay = crate::overlay::Overlay::new().unwrap();
+            for n in 0..25 {
+                render("Exit lifetime 中文", 400, 96 + n % 2 * 144, 0, &cfg).unwrap();
+            }
+        }
+        assert!(RENDERER.with_borrow(Option::is_none));
+    }
+    #[test]
+    #[ignore = "starts isolated processes to verify Direct2D releases before ExitProcess"]
+    fn graphics_resources_survive_repeated_process_shutdown() {
+        use std::os::windows::process::CommandExt;
+        for _ in 0..12 {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "--ignored",
+                    "label_text::tests::graphics_shutdown_child",
+                ])
+                .env("WINSIZEP_GRAPHICS_EXIT_TEST", "1")
+                .creation_flags(0x08000000)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+    #[test]
+    fn last_graphics_session_releases_renderer_before_thread_exit() {
+        let cfg = crate::test_support::cfg();
+        let first = Session::new();
+        let second = Session::new();
+        render("lifetime", 200, 96, 0, &cfg).unwrap();
+        assert!(RENDERER.with_borrow(Option::is_some));
+        drop(first);
+        assert!(RENDERER.with_borrow(Option::is_some));
+        drop(second);
+        assert!(RENDERER.with_borrow(Option::is_none));
+        render("standalone", 200, 96, 0, &cfg).unwrap();
+        assert!(RENDERER.with_borrow(Option::is_none));
+    }
     fn pixels(image: &Image) -> &[u32] {
         // SAFETY: the bitmap owns these pixels until image is dropped; EndDraw has completed.
         unsafe { std::slice::from_raw_parts(image.bits, (image.width * image.height) as usize) }

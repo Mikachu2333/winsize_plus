@@ -11,6 +11,19 @@ pub const CHECKER_SHADE: u32 = 0xe0e0e0;
 pub const SHADOW_LIGHT_ALPHA: u8 = 36; // Fluent colorNeutralShadowKey: 14%.
 pub const SHADOW_DARK_ALPHA: u8 = 71; // Fluent colorNeutralShadowKey: 28%.
 
+pub fn accent() -> u32 {
+    let mut argb = 0;
+    let mut opaque = 0;
+    // SAFETY: DWM only writes two stack-owned scalar values.
+    if unsafe { windows_sys::Win32::Graphics::Dwm::DwmGetColorizationColor(&mut argb, &mut opaque) }
+        >= 0
+    {
+        colorref(argb & 0x00ff_ffff)
+    } else {
+        unsafe { GetSysColor(windows_sys::Win32::Graphics::Gdi::COLOR_HIGHLIGHT) }
+    }
+}
+
 pub fn secondary_text() -> u32 {
     let background = unsafe { GetSysColor(COLOR_WINDOW) };
     let candidate = if luminance(background) < 0.5 {

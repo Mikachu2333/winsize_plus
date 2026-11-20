@@ -5,7 +5,11 @@ use crate::{
 use std::{
     cell::{Cell, RefCell},
     ptr::{null, null_mut},
-    sync::mpsc,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread::JoinHandle,
     time::Duration,
 };
@@ -61,6 +65,7 @@ struct Input {
     guides: bool,
     preview_enabled: bool,
     preview_tracking: bool,
+    annotation_preview: bool,
     mouse: HHOOK,
     point: POINT,
     queued: bool,
@@ -72,6 +77,8 @@ struct Input {
     move_button: Option<u32>,
     resize_button: Option<u32>,
     cast_mouse: bool,
+    cast_buttons: u32,
+    cast_wheel_time: Option<u32>,
     cast_keys: bool,
     cast_toggles: [u64; 4],
     drag: Option<PointerAction>,
@@ -87,22 +94,58 @@ struct PointerAction {
 }
 thread_local! {static INPUT:RefCell<Input>=RefCell::new(Input::default());}
 thread_local! {
-    static EVENTS: RefCell<Option<(mpsc::Sender<QueuedEvent>, usize)>> = const { RefCell::new(None) };
+    static EVENTS: RefCell<Option<EventSender>> = const { RefCell::new(None) };
     static INBOX: RefCell<Option<mpsc::Receiver<QueuedEvent>>> = const { RefCell::new(None) };
     static CURRENT: Cell<Option<(u32, POINT)>> = const { Cell::new(None) };
     static DRIVER: RefCell<Option<Driver>> = const { RefCell::new(None) };
 }
 const WAKE: u32 = WM_APP + 90;
+const SCROLL_READY: u32 = WM_APP + 91;
+#[derive(Clone, Copy)]
 struct QueuedEvent {
     message: u32,
     wp: usize,
     lp: isize,
     point: Option<POINT>,
 }
+#[derive(Default)]
+struct PendingScroll {
+    latest: [Option<QueuedEvent>; 2],
+    queued: bool,
+}
+struct EventSender {
+    send: mpsc::Sender<QueuedEvent>,
+    window: usize,
+    scroll: Arc<Mutex<PendingScroll>>,
+    stopped: Arc<AtomicBool>,
+}
 /// Consume owned event data only in the outer application loop. A native modal
 /// loop may dispatch the HWND wakeup, but cannot discard the channel's contents.
 pub fn next_event() -> Option<MSG> {
-    let event = INBOX.with_borrow(|inbox| inbox.as_ref()?.try_recv().ok())?;
+    let mut event = INBOX.with_borrow(|inbox| inbox.as_ref()?.try_recv().ok())?;
+    if event.message == SCROLL_READY {
+        event = EVENTS.with_borrow(|events| {
+            let events = events.as_ref()?;
+            let (event, more) = {
+                let mut pending = events.scroll.lock().ok()?;
+                let event = pending.latest[0]
+                    .take()
+                    .or_else(|| pending.latest[1].take())?;
+                let more = pending.latest.iter().any(Option::is_some);
+                pending.queued = more;
+                (event, more)
+            };
+            if more {
+                let _ = events.send.send(QueuedEvent {
+                    message: SCROLL_READY,
+                    wp: 0,
+                    lp: 0,
+                    point: None,
+                });
+            }
+            Some(event)
+        })?;
+    }
     // Leave a wakeup for any backlog after an outer loop's bounded drain, even
     // when a modal loop already consumed all original wakeup messages.
     DRIVER.with_borrow(|driver| {
@@ -127,8 +170,17 @@ enum Control {
 }
 struct Driver {
     commands: mpsc::Sender<Control>,
-    wake: HANDLE,
+    wake: Arc<WakeEvent>,
     window: HWND,
+}
+struct WakeEvent(usize);
+impl Drop for WakeEvent {
+    fn drop(&mut self) {
+        // SAFETY: the last Arc owns the event; the hook worker retains its Arc until it exits.
+        unsafe {
+            CloseHandle(self.0 as HANDLE);
+        }
+    }
 }
 fn on_hook<R: Send + 'static>(action: impl FnOnce() -> R + Send + 'static) -> Result<R, String> {
     DRIVER.with_borrow(|driver| {
@@ -136,18 +188,23 @@ fn on_hook<R: Send + 'static>(action: impl FnOnce() -> R + Send + 'static) -> Re
             return Ok(action());
         };
         let (send, receive) = mpsc::sync_channel(1);
+        let canceled = Arc::new(AtomicBool::new(false));
+        let pending = canceled.clone();
         driver
             .commands
             .send(Control::Run(Box::new(move || {
-                let _ = send.send(action());
+                if !pending.load(Ordering::Acquire) {
+                    let _ = send.send(action());
+                }
             })))
             .map_err(|_| "Input thread stopped".to_owned())?;
         // SAFETY: Hooks owns the event until the worker has joined; no window messages
         // or UI-owned references cross this channel.
-        desktop::check(unsafe { SetEvent(driver.wake) })?;
-        receive
-            .recv_timeout(Duration::from_secs(2))
-            .map_err(|_| "Input thread did not respond".into())
+        desktop::check(unsafe { SetEvent(driver.wake.0 as HANDLE) })?;
+        receive.recv_timeout(Duration::from_secs(2)).map_err(|_| {
+            canceled.store(true, Ordering::Release);
+            "Input thread did not respond".into()
+        })
     })
 }
 fn mask(text: &str) -> u8 {
@@ -166,23 +223,40 @@ fn post(message: u32, wp: usize, lp: isize) {
 }
 fn post_event(message: u32, wp: usize, lp: isize, point: Option<POINT>) -> bool {
     EVENTS.with_borrow(|events| {
-        let Some((send, hwnd)) = events else {
+        let Some(events) = events else {
             return false;
         };
-        if send
-            .send(QueuedEvent {
-                message,
-                wp,
-                lp,
-                point,
-            })
-            .is_err()
-        {
+        if events.stopped.load(Ordering::Acquire) {
+            return false;
+        }
+        let mut event = QueuedEvent {
+            message,
+            wp,
+            lp,
+            point,
+        };
+        if message == CAST_MOUSE && (8..=11).contains(&wp) {
+            let Ok(mut pending) = events.scroll.lock() else {
+                return false;
+            };
+            pending.latest[usize::from(wp >= 10)] = Some(event);
+            if pending.queued {
+                return true;
+            }
+            pending.queued = true;
+            event = QueuedEvent {
+                message: SCROLL_READY,
+                wp: 0,
+                lp: 0,
+                point: None,
+            };
+        }
+        if events.send.send(event).is_err() {
             return false;
         }
         // Only integers cross the window-message boundary. On queue saturation the
         // next outer-loop drain still reads the owned event; MOVE can retry waking.
-        unsafe { PostMessageW(*hwnd as HWND, WAKE, 0, 0) != 0 }
+        unsafe { PostMessageW(events.window as HWND, WAKE, 0, 0) != 0 }
     })
 }
 impl Input {
@@ -242,6 +316,7 @@ impl Input {
         if down
             && key == VK_ESCAPE as u32
             && (self.tip_visible
+                || self.annotation_preview
                 || self.preview_tracking
                 || self.mode != Mode::Idle
                 || self.drag.is_some())
@@ -391,6 +466,9 @@ impl Input {
 }
 unsafe extern "system" fn keyboard(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
+        if hook_stopped() {
+            return CallNextHookEx(null_mut(), code, wp, lp);
+        }
         if code == HC_ACTION as i32 {
             let data = &*(lp as *const KBDLLHOOKSTRUCT);
             let down = matches!(wp as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
@@ -413,12 +491,15 @@ unsafe extern "system" fn keyboard(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT
             } else {
                 data.vkCode
             };
-            let casting = INPUT.with_borrow(|input| {
-                input.cast_keys
-                    && (key >= 256 || {
-                        let (index, flag) = bit(key);
-                        input.pressed & input.alt_mask == 0 || input.cast_toggles[index] & flag == 0
-                    })
+            let casting = INPUT.with(|cell| {
+                cell.try_borrow().is_ok_and(|input| {
+                    input.cast_keys
+                        && (key >= 256 || {
+                            let (index, flag) = bit(key);
+                            input.pressed & input.alt_mask == 0
+                                || input.cast_toggles[index] & flag == 0
+                        })
+                })
             });
             if casting && down {
                 let detail = cast_modifiers()
@@ -446,34 +527,34 @@ unsafe extern "system" fn keyboard(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT
 }
 unsafe extern "system" fn mouse(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
+        if hook_stopped() {
+            return CallNextHookEx(null_mut(), code, wp, lp);
+        }
         if code == HC_ACTION as i32 {
             let data = &*(lp as *const MSLLHOOKSTRUCT);
-            if INPUT.with_borrow(|input| input.cast_mouse) {
-                let action = match wp as u32 {
-                    WM_MOUSEWHEEL => Some(if (data.mouseData >> 16) as i16 > 0 {
-                        8
-                    } else {
-                        9
-                    }),
-                    WM_MOUSEHWHEEL => Some(if (data.mouseData >> 16) as i16 > 0 {
-                        11
-                    } else {
-                        10
-                    }),
-                    message => mouse_button(message, data.mouseData)
-                        .and_then(|(button, down)| down.then_some(button)),
-                };
-                if let Some(action) = action {
-                    post_event(
-                        CAST_MOUSE,
-                        action as usize,
-                        cast_modifiers() as isize,
-                        Some(data.pt),
-                    );
-                }
+            if INPUT.with(|cell| cell.try_borrow().is_ok_and(|input| input.cast_mouse))
+                && let Some((action, flags)) = cast_mouse_action(wp as u32, data.mouseData)
+            {
+                INPUT.with(|cell| {
+                    if let Ok(mut input) = cell.try_borrow_mut() {
+                        if action < 8 {
+                            if flags & crate::mouse_cast::RELEASE == 0 {
+                                input.cast_buttons |= 1 << action;
+                            } else {
+                                input.cast_buttons &= !(1 << action);
+                            }
+                        } else {
+                            input.cast_wheel_time = Some(data.time);
+                        }
+                    }
+                });
+                post_event(CAST_MOUSE, action as usize, flags as isize, Some(data.pt));
             }
             // Clicking the tip's scrollbar must not dismiss an Alt preview or begin a drag.
-            let tip_window = INPUT.with_borrow(|input| {
+            let tip_window = INPUT.with(|cell| {
+                let Ok(input) = cell.try_borrow() else {
+                    return 0;
+                };
                 if input.tip_scrollable
                     && input.drag.is_none()
                     && input.tip_window != 0
@@ -500,7 +581,8 @@ unsafe extern "system" fn mouse(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
             let eaten = INPUT.with(|cell| {
                 cell.try_borrow_mut()
                     .is_ok_and(|mut input| match wp as u32 {
-                        WM_MOUSEMOVE if input.guides || input.preview_tracking || input.drag.is_some() => {
+                        WM_MOUSEMOVE if input.guides || input.preview_tracking || input.drag.is_some()
+                            || (input.cast_mouse && (input.cast_buttons!=0 || input.cast_wheel_time.is_some_and(|when|data.time.wrapping_sub(when)<600))) => {
                             input.point = data.pt;
                             if let Some(mut drag) = input.drag
                                 && drag.draggable && !drag.canceled && !drag.active && ((data.pt.x as i64 - drag.start.x as i64).abs() >= GetSystemMetrics(SM_CXDRAG) as i64 || (data.pt.y as i64 - drag.start.y as i64).abs() >= GetSystemMetrics(SM_CYDRAG) as i64) {
@@ -551,6 +633,15 @@ unsafe extern "system" fn mouse(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
         CallNextHookEx(null_mut(), code, wp, lp)
     }
 }
+fn hook_stopped() -> bool {
+    EVENTS.with(|cell| {
+        cell.try_borrow().map_or(true, |events| {
+            events
+                .as_ref()
+                .is_some_and(|events| events.stopped.load(Ordering::Acquire))
+        })
+    })
+}
 pub fn drag_origin() -> POINT {
     CURRENT
         .with(Cell::get)
@@ -583,11 +674,34 @@ pub fn cast_point() -> POINT {
 pub fn set_casting(mouse: bool, keys: bool) -> Result<(), String> {
     on_hook(move || {
         INPUT.with_borrow_mut(|input| {
+            let previous = (input.cast_mouse, input.cast_keys);
             input.cast_mouse = mouse;
+            if !mouse {
+                input.cast_buttons = 0;
+                input.cast_wheel_time = None;
+            }
             input.cast_keys = keys;
-            input.update_mouse()
+            if let Err(error) = input.update_mouse() {
+                (input.cast_mouse, input.cast_keys) = previous;
+                return Err(error);
+            }
+            Ok(())
         })
     })?
+}
+pub fn annotation_preview(active: bool) -> Result<(), String> {
+    on_hook(move || INPUT.with_borrow_mut(|input| input.annotation_preview = active))
+}
+fn cast_mouse_action(message: u32, data: u32) -> Option<(u32, u32)> {
+    let delta = (data >> 16) as i16;
+    // Use the OS-delivered wheel delta, after device/driver inversion. Reading a
+    // physical wheel direction or applying FlipFlopWheel again would invert it twice.
+    match message {
+        WM_MOUSEWHEEL if delta != 0 => Some((if delta > 0 { 8 } else { 9 }, 0)),
+        WM_MOUSEHWHEEL if delta != 0 => Some((if delta > 0 { 11 } else { 10 }, 0)),
+        _ => mouse_button(message, data)
+            .map(|(button, down)| (button, if down { 0 } else { crate::mouse_cast::RELEASE })),
+    }
 }
 fn mouse_button(message: u32, data: u32) -> Option<(u32, bool)> {
     Some(match message {
@@ -722,8 +836,9 @@ pub fn configure(cfg: &Config) -> Result<(), String> {
 pub struct Hooks {
     worker: Option<JoinHandle<()>>,
     // Raw handles also prevent moving this UI-thread guard to another thread.
-    wake: HANDLE,
+    wake: Arc<WakeEvent>,
     window: HWND,
+    stopped: Arc<AtomicBool>,
 }
 impl Hooks {
     pub fn escape_only() -> Result<Self, String> {
@@ -758,16 +873,34 @@ impl Hooks {
             }
             return Err(err());
         }
+        let wake = Arc::new(WakeEvent(wake as usize));
+        let stopped = Arc::new(AtomicBool::new(false));
         let (send_events, receive_events) = mpsc::channel();
         let destination = window as usize;
-        EVENTS.with_borrow_mut(|events| *events = Some((send_events.clone(), destination)));
-        let event = wake as usize;
+        let scroll = Arc::new(Mutex::new(PendingScroll::default()));
+        EVENTS.with_borrow_mut(|events| {
+            *events = Some(EventSender {
+                send: send_events.clone(),
+                window: destination,
+                scroll: scroll.clone(),
+                stopped: stopped.clone(),
+            })
+        });
+        let event = wake.clone();
+        let worker_stop = stopped.clone();
         let (commands, receive) = mpsc::channel();
         let (ready, started) = mpsc::sync_channel(1);
         let worker = std::thread::Builder::new()
             .name("winsizep-input".into())
             .spawn(move || {
-                EVENTS.with_borrow_mut(|events| *events = Some((send_events, destination)));
+                EVENTS.with_borrow_mut(|events| {
+                    *events = Some(EventSender {
+                        send: send_events,
+                        window: destination,
+                        scroll,
+                        stopped: worker_stop.clone(),
+                    })
+                });
                 // SAFETY: both hooks are installed, pumped and removed on this worker.
                 unsafe {
                     let hook = SetWindowsHookExW(
@@ -782,15 +915,21 @@ impl Hooks {
                     }
                     let _ = ready.send(Ok(()));
                     'pump: loop {
+                        if worker_stop.load(Ordering::Acquire) {
+                            break;
+                        }
                         match MsgWaitForMultipleObjectsEx(
                             1,
-                            &(event as HANDLE),
+                            &(event.0 as HANDLE),
                             INFINITE,
                             QS_ALLINPUT,
                             MWMO_INPUTAVAILABLE,
                         ) {
                             WAIT_OBJECT_0 => {
                                 while let Ok(command) = receive.try_recv() {
+                                    if worker_stop.load(Ordering::Acquire) {
+                                        break 'pump;
+                                    }
                                     match command {
                                         Control::Run(action) => action(),
                                         Control::Stop => break 'pump,
@@ -825,7 +964,6 @@ impl Hooks {
             Ok(worker) => worker,
             Err(error) => {
                 unsafe {
-                    CloseHandle(wake);
                     DestroyWindow(window);
                 }
                 return Err(error.to_string());
@@ -834,7 +972,7 @@ impl Hooks {
         DRIVER.with_borrow_mut(|driver| {
             *driver = Some(Driver {
                 commands,
-                wake,
+                wake: wake.clone(),
                 window,
             })
         });
@@ -843,9 +981,10 @@ impl Hooks {
             worker: Some(worker),
             wake,
             window,
+            stopped,
         };
         started
-            .recv()
+            .recv_timeout(Duration::from_secs(2))
             .map_err(|_| "Input thread failed to start".to_owned())??;
         Ok(hooks)
     }
@@ -857,19 +996,27 @@ impl Hooks {
 }
 impl Drop for Hooks {
     fn drop(&mut self) {
+        self.stopped.store(true, Ordering::Release);
         DRIVER.with_borrow_mut(|driver| {
             if let Some(driver) = driver.take() {
                 let _ = driver.commands.send(Control::Stop);
-                unsafe {
-                    SetEvent(driver.wake);
-                }
             }
         });
+        unsafe {
+            SetEvent(self.wake.0 as HANDLE);
+        }
         if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+            let until = std::time::Instant::now() + Duration::from_millis(500);
+            while !worker.is_finished() && std::time::Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if worker.is_finished() {
+                let _ = worker.join();
+            }
+            // A stuck foreign hook must not deadlock our UI shutdown. The stopped worker
+            // passes future input through, owns its wake event, and cleans up on return.
         }
         unsafe {
-            CloseHandle(self.wake);
             DestroyWindow(self.window);
         }
         INBOX.with_borrow_mut(|inbox| {
@@ -884,6 +1031,166 @@ impl Drop for Hooks {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn blocked_worker_does_not_hold_shutdown_or_lose_event_ownership() {
+        use super::*;
+        let hooks = Hooks::escape_only().unwrap();
+        let wake = Arc::downgrade(&hooks.wake);
+        let (ready, started) = mpsc::channel();
+        let (done, finished) = mpsc::channel();
+        DRIVER.with_borrow(|slot| {
+            let driver = slot.as_ref().unwrap();
+            driver
+                .commands
+                .send(Control::Run(Box::new(move || {
+                    ready.send(()).unwrap();
+                    std::thread::sleep(Duration::from_millis(900));
+                    done.send(()).unwrap();
+                })))
+                .unwrap();
+            unsafe {
+                SetEvent(driver.wake.0 as HANDLE);
+            }
+        });
+        started.recv_timeout(Duration::from_secs(1)).unwrap();
+        let start = std::time::Instant::now();
+        drop(hooks);
+        assert!(start.elapsed() < Duration::from_millis(750));
+        assert!(
+            wake.upgrade().is_some(),
+            "A running worker lost its event handle"
+        );
+        let second = Hooks::escape_only().unwrap();
+        finished.recv_timeout(Duration::from_secs(2)).unwrap();
+        let until = std::time::Instant::now() + Duration::from_secs(1);
+        while wake.upgrade().is_some() && std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            wake.upgrade().is_none(),
+            "Exited worker leaked the event handle"
+        );
+        drop(second);
+    }
+    #[test]
+    fn reentrant_hook_callbacks_do_not_panic_or_consume_input() {
+        let _hooks = super::Hooks::escape_only().unwrap();
+        super::on_hook(|| {
+            super::INPUT.with(|cell| {
+                let mut input = cell.borrow_mut();
+                input.cast_keys = true;
+                input.cast_mouse = true;
+                unsafe {
+                    let key = super::KBDLLHOOKSTRUCT {
+                        vkCode: 0x41,
+                        ..Default::default()
+                    };
+                    let mouse = super::MSLLHOOKSTRUCT::default();
+                    assert_eq!(
+                        super::keyboard(
+                            super::HC_ACTION as i32,
+                            super::WM_KEYDOWN as usize,
+                            (&key as *const _) as isize
+                        ),
+                        0
+                    );
+                    assert_eq!(
+                        super::mouse(
+                            super::HC_ACTION as i32,
+                            super::WM_LBUTTONDOWN as usize,
+                            (&mouse as *const _) as isize
+                        ),
+                        0
+                    );
+                }
+            });
+        })
+        .unwrap();
+        assert!(super::next_event().is_none());
+    }
+    #[test]
+    fn scroll_bursts_keep_latest_axes_without_starving_button_release() {
+        let _hooks = super::Hooks::escape_only().unwrap();
+        super::on_hook(|| {
+            for n in 0..10000 {
+                super::post_event(
+                    super::CAST_MOUSE,
+                    if n % 2 == 0 { 8 } else { 9 },
+                    0,
+                    Some(super::POINT { x: n, y: -n }),
+                );
+                super::post_event(super::CAST_MOUSE, 11, 0, Some(super::POINT { x: n, y: 1 }));
+            }
+            super::post_event(
+                super::CAST_MOUSE,
+                1,
+                crate::mouse_cast::RELEASE as isize,
+                Some(super::POINT { x: 10000, y: 2 }),
+            );
+        })
+        .unwrap();
+        let first = super::next_event().unwrap();
+        assert_eq!((first.message, first.wParam), (super::CAST_MOUSE, 9));
+        assert_eq!(super::cast_point().x, 9999);
+        let release = super::next_event().unwrap();
+        assert_eq!(
+            (release.wParam, release.lParam),
+            (1, crate::mouse_cast::RELEASE as isize)
+        );
+        let horizontal = super::next_event().unwrap();
+        assert_eq!(horizontal.wParam, 11);
+        assert!(super::next_event().is_none());
+    }
+    #[test]
+    fn annotation_preview_keeps_clicks_and_escape_independent() {
+        let _hooks = super::Hooks::escape_only().unwrap();
+        super::annotation_preview(true).unwrap();
+        super::on_hook(|| unsafe {
+            let mouse = super::MSLLHOOKSTRUCT::default();
+            assert_eq!(
+                super::mouse(
+                    super::HC_ACTION as i32,
+                    super::WM_LBUTTONDOWN as usize,
+                    (&mouse as *const _) as isize
+                ),
+                0
+            );
+        })
+        .unwrap();
+        assert!(
+            super::next_event().is_none(),
+            "A normal click canceled annotation preview"
+        );
+        assert!(
+            super::on_hook(|| super::INPUT.with_borrow_mut(|input| input.keyboard(27, true, 1)))
+                .unwrap()
+        );
+        assert_eq!(super::next_event().unwrap().message, super::CANCEL);
+    }
+    #[test]
+    fn mouse_annotations_preserve_release_and_os_scroll_direction() {
+        use super::*;
+        assert_eq!(cast_mouse_action(WM_LBUTTONDOWN, 0), Some((1, 0)));
+        assert_eq!(
+            cast_mouse_action(WM_LBUTTONUP, 0),
+            Some((1, crate::mouse_cast::RELEASE))
+        );
+        assert_eq!(
+            cast_mouse_action(WM_RBUTTONUP, 0),
+            Some((2, crate::mouse_cast::RELEASE))
+        );
+        assert_eq!(
+            cast_mouse_action(WM_MBUTTONUP, 0),
+            Some((4, crate::mouse_cast::RELEASE))
+        );
+        let positive = 120u32 << 16;
+        let negative = (-120i16 as u16 as u32) << 16;
+        assert_eq!(cast_mouse_action(WM_MOUSEWHEEL, positive), Some((8, 0)));
+        assert_eq!(cast_mouse_action(WM_MOUSEWHEEL, negative), Some((9, 0)));
+        assert_eq!(cast_mouse_action(WM_MOUSEHWHEEL, positive), Some((11, 0)));
+        assert_eq!(cast_mouse_action(WM_MOUSEHWHEEL, negative), Some((10, 0)));
+        assert_eq!(cast_mouse_action(WM_MOUSEWHEEL, 0), None);
+    }
     #[test]
     fn annotation_hotkeys_work_without_a_target_and_consume_only_their_keys() {
         let hooks = super::Hooks::escape_only().unwrap();

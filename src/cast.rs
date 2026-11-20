@@ -10,11 +10,7 @@ use std::{
     collections::VecDeque,
     time::{Duration, Instant},
 };
-use windows_sys::Win32::{
-    Foundation::*,
-    Graphics::Gdi::*,
-    UI::{Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
-};
+use windows_sys::Win32::{Foundation::*, UI::Input::KeyboardAndMouse::*};
 
 pub const CTRL: u32 = 1;
 pub const ALT: u32 = 2;
@@ -152,108 +148,48 @@ struct Entry {
     started: Instant,
     badge: Badge,
 }
-struct Ripple {
-    point: POINT,
-    started: Instant,
-    panel: Panel,
-    badge: Badge,
-    display: Display,
-}
-impl Ripple {
-    fn draw(&self, now: Instant, style: &CastStyle) -> Result<(), String> {
-        let age = now.saturating_duration_since(self.started);
-        let alpha = opacity(age, style);
-        let progress =
-            (age.as_secs_f64() * 1000.0 / f64::from(style.duration + style.fade)).min(1.0);
-        let radius =
-            ((style.radius * self.display.dpi / 96) as f64 * (0.65 + 0.35 * progress)) as i32;
-        let width = (style.ring_width * self.display.dpi / 96)
-            .max(1)
-            .min(radius);
-        let size = radius * 2;
-        // SAFETY: all regions are owned locally; SetWindowRgn takes ownership of the
-        // successful result. Clipping keeps a click at a screen edge on that screen.
-        unsafe {
-            let outer = CreateEllipticRgn(0, 0, size, size);
-            let inner = CreateEllipticRgn(width, width, size - width, size - width);
-            let area = self.display.full;
-            let clip = CreateRectRgn(
-                area.x - self.point.x + radius,
-                area.y - self.point.y + radius,
-                area.x + area.width - self.point.x + radius,
-                area.y + area.height - self.point.y + radius,
-            );
-            if outer.is_null() || inner.is_null() || clip.is_null() {
-                let error = desktop::err();
-                for region in [outer, inner, clip] {
-                    if !region.is_null() {
-                        DeleteObject(region);
-                    }
-                }
-                return Err(error);
-            }
-            let combined = CombineRgn(outer, outer, inner, RGN_DIFF) != 0
-                && CombineRgn(outer, outer, clip, RGN_AND) != 0;
-            DeleteObject(inner);
-            DeleteObject(clip);
-            if !combined || SetWindowRgn(self.panel.0, outer, 1) == 0 {
-                let error = desktop::err();
-                DeleteObject(outer);
-                return Err(error);
-            }
-        }
-        self.panel.style(style.color, alpha);
-        self.panel.show(Rect {
-            x: self.point.x - radius,
-            y: self.point.y - radius,
-            width: size,
-            height: size,
-        });
-        self.badge.draw(
-            self.point.x + radius,
-            self.point.y + radius,
-            &self.display,
-            style,
-            alpha,
-        )
-    }
-}
-
 pub struct Visuals {
     keys: VecDeque<Entry>,
-    clicks: VecDeque<Ripple>,
+    mouse: crate::mouse_cast::MouseVisuals,
+    preview_step: usize,
     display: Option<Display>,
     next: Option<Instant>,
     epoch: u64,
-    last_click: Option<(u32, POINT, Instant, u32)>,
 }
 impl Visuals {
     pub fn new() -> Self {
         Self {
             keys: VecDeque::new(),
-            clicks: VecDeque::new(),
+            mouse: crate::mouse_cast::MouseVisuals::new(),
+            preview_step: 0,
             display: None,
             next: None,
             epoch: desktop::display_epoch(),
-            last_click: None,
         }
     }
     pub fn clear(&mut self) {
         self.keys.clear();
-        self.clicks.clear();
+        self.mouse.clear();
         self.display = None;
         self.next = None;
-        self.last_click = None;
     }
     pub fn clear_keys(&mut self) {
         self.keys.clear();
     }
     pub fn clear_mouse(&mut self) {
-        self.clicks.clear();
-        self.last_click = None;
+        self.mouse.clear();
     }
     pub fn deadline(&self) -> Option<Instant> {
-        self.next
+        [self.next, self.mouse.deadline()]
+            .into_iter()
+            .flatten()
+            .min()
+    }
+    pub fn prepare_mouse(&mut self, point: POINT, cfg: &Config) -> Result<(), String> {
+        self.mouse.prepare(point, &cfg.mousecast)
+    }
+    pub fn follow_mouse(&mut self, point: POINT, cfg: &Config) -> Result<(), String> {
+        self.mouse.follow(point, &cfg.mousecast)
     }
     pub fn key(&mut self, text: String, point: POINT, cfg: &Config) -> Result<(), String> {
         let now = Instant::now();
@@ -297,50 +233,11 @@ impl Visuals {
         point: POINT,
         cfg: &Config,
     ) -> Result<(), String> {
-        let now = Instant::now();
-        let label = match button {
-            1 => cfg.tr("Left click", "左键"),
-            2 => cfg.tr("Right click", "右键"),
-            4 => cfg.tr("Middle click", "中键"),
-            5 => "X1",
-            6 => "X2",
-            8 => cfg.tr("Wheel up", "向上滚动"),
-            9 => cfg.tr("Wheel down", "向下滚动"),
-            10 => cfg.tr("Wheel left", "向左滚动"),
-            11 => cfg.tr("Wheel right", "向右滚动"),
-            _ => return Ok(()),
-        };
-        let count = self
-            .last_click
-            .filter(|(old, p, when, _)| {
-                *old == button
-                    && now.duration_since(*when).as_millis()
-                        <= u128::from(unsafe { GetDoubleClickTime() })
-                    && (i64::from(p.x) - i64::from(point.x)).abs()
-                        <= i64::from(unsafe { GetSystemMetrics(SM_CXDOUBLECLK) })
-                    && (i64::from(p.y) - i64::from(point.y)).abs()
-                        <= i64::from(unsafe { GetSystemMetrics(SM_CYDOUBLECLK) })
-            })
-            .map_or(1, |(_, _, _, count)| count.saturating_add(1));
-        self.last_click = Some((button, point, now, count));
-        let text = modifiers(label, flags);
-        let text = if count > 1 {
-            format!("{text} ×{count}")
-        } else {
-            text
-        };
-        let display = desktop::screen(point, 0)?;
-        self.clicks.push_back(Ripple {
-            point,
-            started: now,
-            panel: Panel::new()?,
-            badge: Badge::new(&text, &display, &cfg.mousecast)?,
-            display,
-        });
-        while self.clicks.len() > 5 {
-            self.clicks.pop_front();
+        let result = self.mouse.event(button, flags, point, &cfg.mousecast);
+        if result.is_err() {
+            self.mouse.clear();
         }
-        self.tick(cfg)
+        result
     }
     pub fn tick(&mut self, cfg: &Config) -> Result<(), String> {
         let result = self.draw(cfg);
@@ -369,16 +266,10 @@ impl Visuals {
                     self.keys.clear();
                 }
             }
-            self.clicks.retain(|r| {
-                desktop::screen(r.point, r.display.number)
-                    .is_ok_and(|d| d.full == r.display.full && d.dpi == r.display.dpi)
-            });
         }
         let now = Instant::now();
         self.keys
             .retain(|e| opacity(now.saturating_duration_since(e.started), &cfg.keycast) > 0);
-        self.clicks
-            .retain(|e| opacity(now.saturating_duration_since(e.started), &cfg.mousecast) > 0);
         if let Some(display) = &self.display {
             let margin = 16 * display.dpi / 96;
             let bottom = cfg.keycast.position.starts_with("bottom");
@@ -414,17 +305,16 @@ impl Visuals {
                 edge += if bottom { -margin / 2 } else { h + margin / 2 };
             }
         }
-        for ripple in &self.clicks {
-            ripple.draw(now, &cfg.mousecast)?;
-        }
-        self.next = (!self.keys.is_empty() || !self.clicks.is_empty())
-            .then(|| now + Duration::from_millis(16));
+        self.mouse.tick(&cfg.mousecast)?;
+        self.next = (!self.keys.is_empty()).then(|| now + Duration::from_millis(16));
         Ok(())
     }
     pub fn preview(&mut self, mouse: bool, point: POINT, cfg: &Config) -> Result<(), String> {
         self.clear();
         if mouse {
-            self.mouse(1, CTRL, point, cfg)
+            let step = self.preview_step;
+            self.preview_step = self.preview_step.wrapping_add(1);
+            self.mouse.preview(step, point, &cfg.mousecast)
         } else {
             self.key("Ctrl + Shift + K".into(), point, cfg)
         }
@@ -434,6 +324,58 @@ impl Visuals {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+    #[test]
+    #[ignore = "measures real mouse rendering CPU and latency for three seconds"]
+    fn mouse_rendering_cost() {
+        let _dpi = crate::test_support::Dpi::new();
+        let _overlay = crate::overlay::Overlay::new().unwrap();
+        let cfg = crate::test_support::cfg();
+        let p = desktop::cursor().unwrap();
+        let mut visuals = Visuals::new();
+        let cpu = || unsafe {
+            use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+            let mut times = [FILETIME::default(); 4];
+            let [create, exit, kernel, user] = &mut times;
+            assert_ne!(
+                GetProcessTimes(GetCurrentProcess(), create, exit, kernel, user),
+                0
+            );
+            let value = |v: FILETIME| {
+                ((u64::from(v.dwHighDateTime) << 32) | u64::from(v.dwLowDateTime)) as f64 / 10000.0
+            };
+            value(times[2]) + value(times[3])
+        };
+        let start = Instant::now();
+        visuals.mouse(8, 0, p, &cfg).unwrap();
+        let cold = start.elapsed();
+        let cpu_before = cpu();
+        let began = Instant::now();
+        let mut costs = Vec::new();
+        for n in 0..360 {
+            let start = Instant::now();
+            visuals.mouse(8, 0, p, &cfg).unwrap();
+            costs.push(start.elapsed().as_micros());
+            if n % 2 == 0 {
+                visuals.tick(&cfg).unwrap();
+                crate::test_support::pump();
+            }
+            let deadline = began + Duration::from_micros((n + 1) * 8333);
+            if let Some(wait) = deadline.checked_duration_since(Instant::now()) {
+                std::thread::sleep(wait);
+            }
+        }
+        costs.sort();
+        println!(
+            "cold_us={} warm_p50_us={} warm_p95_us={} cpu_ms={:.2} wall_ms={}",
+            cold.as_micros(),
+            costs[180],
+            costs[342],
+            cpu() - cpu_before,
+            began.elapsed().as_millis()
+        );
+        visuals.clear();
+    }
     #[test]
     fn combinations_keep_modifiers_and_special_keys() {
         assert_eq!(
@@ -499,16 +441,14 @@ mod tests {
                     .mouse(if n % 2 == 0 { 1 } else { 8 }, CTRL, p, &cfg)
                     .unwrap();
             }
-            assert_eq!(visuals.clicks.len(), 5);
+            assert!(visuals.mouse.active());
             assert_eq!(unsafe { GetForegroundWindow() }, foreground);
             for entry in &mut visuals.keys {
                 entry.started = Instant::now() - Duration::from_secs(20);
             }
-            for ripple in &mut visuals.clicks {
-                ripple.started = Instant::now() - Duration::from_secs(20);
-            }
+            visuals.clear_mouse();
             visuals.tick(&cfg).unwrap();
-            assert!(visuals.keys.is_empty() && visuals.clicks.is_empty());
+            assert!(visuals.keys.is_empty() && !visuals.mouse.active());
             assert!(visuals.deadline().is_none());
         }
     }

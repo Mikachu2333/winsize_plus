@@ -46,18 +46,22 @@ fill_opacity = 48 # Translucent selection fill.
 [crosshair]
 fps = 30 # Integer, clamped to 24..1000.
 
+[horizontal]
+width = 2
+color = "#C80000"
+opacity = 200
+gap = 12
+
+[vertical]
+width = 2
+color = "#C80000"
+opacity = 200
+gap = 12
+
 [mousecast]
 enabled = false # Initial state; Alt+M toggles the running display.
-duration_ms = 450
-fade_ms = 250
-radius = 28
-ring_width = 3
-color = "#0078D4"
-background = "#292929"
-foreground = "#FFFFFF"
-opacity = 220
-font = "SystemFont"
-font_size = 12
+radius = 14
+opacity = 160 # Filled shapes use theme-derived colors; timing is fixed at about 0.5 s.
 
 [keycast]
 enabled = false # Initial state; Alt+K toggles the running display.
@@ -70,18 +74,6 @@ foreground = "#FFFFFF"
 opacity = 220
 font = "SystemFont"
 font_size = 18
-
-[horizontal]
-width = 2
-color = "#C80000"
-opacity = 200
-gap = 12
-
-[vertical]
-width = 2
-color = "#C80000"
-opacity = 200
-gap = 12
 
 # x|y|width|height[|monitor]; sw/sh = work area %, ww/wh = window %, vw/vh = desktop %.
 [presets]

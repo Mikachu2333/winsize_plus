@@ -124,6 +124,14 @@ fn choices(cfg: &Config, context: ChoiceContext, values: &[&str]) -> Kind {
     )
 }
 fn describe(section: &str, key: &str) -> (&'static str, &'static str, &'static str, &'static str) {
+    if section == "mousecast" && key == "opacity" {
+        return (
+            "Opacity",
+            "不透明度",
+            "96–224. Accent-derived colors adapt to light and dark themes; shapes stay translucent.",
+            "96–224。主题派生色适配明暗模式，图形保持半透明并可辨认。",
+        );
+    }
     if matches!(section, "mousecast" | "keycast") {
         return match key {
             "enabled" => (
@@ -145,22 +153,10 @@ fn describe(section: &str, key: &str) -> (&'static str, &'static str, &'static s
                 "0–3000 毫秒；0 表示显示时长结束后立即隐藏。",
             ),
             "radius" => (
-                "Click radius",
-                "点击半径",
-                "8–128 logical pixels, scaled per monitor.",
-                "8–128 逻辑像素，按屏幕 DPI 缩放。",
-            ),
-            "ring_width" => (
-                "Ring thickness",
-                "圆环粗细",
-                "1–16 logical pixels.",
-                "1–16 逻辑像素。",
-            ),
-            "color" => (
-                "Click ring color",
-                "点击圆环颜色",
-                "Color of the expanding click indicator.",
-                "点击扩散圆环的颜色。",
+                "Shape radius",
+                "图形半径",
+                "4–64 logical pixels, scaled per monitor. All shapes and offsets use this size.",
+                "4–64 逻辑像素，按屏幕 DPI 缩放。所有图形及相对位置按比例调整。",
             ),
             "background" => (
                 "Background",
@@ -453,6 +449,10 @@ pub fn fields(tab: usize, axis: usize, cfg: &Config, doc: &DocumentMut) -> Vec<F
     }
     if tab == 6 {
         fields.push(Field { section: String::new(), key: String::new(), label: cfg.tr("Monitor-specific cells", "设置指定屏幕的区块").into(), hint: cfg.tr("Use monitor number × 10 + cell. For monitor 3, bottom-left: 3*10+7=37. Hover for 2 seconds to preview the mapped region.", "想设置某块屏幕上的区块，只需要将对应的屏幕编号乘10，再加上格子号即可，例如想设置屏幕3的左下角，编号就是 3*10+7=37。悬停2秒预览对应区域。").into(), kind: Kind::Note });
+    }
+    if tab == 7 {
+        fields.push(Field{section:String::new(),key:String::new(),label:cfg.tr("Filled mouse indicators","填色鼠标指示").into(),
+            hint:cfg.tr("Left/right: two halves of a circle; middle: a small wheel rectangle; scrolling: directional triangles. Held buttons and continuous scrolling stay visible. Fade timing is fixed at about 0.5 seconds.","左右键拼成完整圆形，中键为靠上的小长方形，滚动为方向三角形。长按和连续滚动保持显示；淡入淡出固定约 0.5 秒，不可调。").into(),kind:Kind::Note});
     }
     if tab == 4 {
         fields.push(Field { section: String::new(), key: String::new(), label: cfg.tr("Built-in command aliases", "内置命令别名").into(), hint: "Version = Ver; Help = H; Quit = Exit; Restart = Reboot; Top = Pin; Ignore = Exclude; Monitor = Screen".into(), kind: Kind::Note });
