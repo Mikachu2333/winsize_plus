@@ -14,6 +14,67 @@ impl Drop for LocalMemory {
         }
     }
 }
+fn integrity(process: HANDLE) -> Result<u32, String> {
+    // SAFETY: all token buffers are pointer-aligned and live through the synchronous calls.
+    unsafe {
+        let mut token = null_mut();
+        if OpenProcessToken(process, TOKEN_QUERY, &mut token) == 0 {
+            return Err(err());
+        }
+        let mut size = 0;
+        GetTokenInformation(token, TokenIntegrityLevel, null_mut(), 0, &mut size);
+        if size < size_of::<TOKEN_MANDATORY_LABEL>() as u32 {
+            CloseHandle(token);
+            return Err(err());
+        }
+        let mut storage = vec![0usize; (size as usize).div_ceil(size_of::<usize>())];
+        let ok = GetTokenInformation(
+            token,
+            TokenIntegrityLevel,
+            storage.as_mut_ptr().cast(),
+            size,
+            &mut size,
+        );
+        let error = err();
+        CloseHandle(token);
+        if ok == 0 {
+            return Err(error);
+        }
+        let label = &*(storage.as_ptr() as *const TOKEN_MANDATORY_LABEL);
+        if IsValidSid(label.Label.Sid) == 0 {
+            return Err("Invalid integrity SID".into());
+        }
+        let count = *GetSidSubAuthorityCount(label.Label.Sid);
+        if count == 0 {
+            return Err("Empty integrity SID".into());
+        }
+        Ok(*GetSidSubAuthority(label.Label.Sid, u32::from(count - 1)))
+    }
+}
+pub fn can_control_window(hwnd: windows_sys::Win32::Foundation::HWND) -> bool {
+    thread_local! {static CURRENT:std::cell::Cell<Option<u32>>=const {std::cell::Cell::new(None)};}
+    let current = CURRENT.with(|cached| {
+        let level = cached
+            .get()
+            .or_else(|| integrity(unsafe { GetCurrentProcess() }).ok());
+        cached.set(level);
+        level
+    });
+    let Some(current) = current else {
+        return false;
+    };
+    unsafe {
+        let mut pid = 0;
+        windows_sys::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(hwnd, &mut pid);
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() {
+            return false;
+        }
+        let target = integrity(process);
+        CloseHandle(process);
+        target.is_ok_and(|target| target <= current)
+    }
+}
 
 fn user_sid() -> Result<String, String> {
     unsafe {

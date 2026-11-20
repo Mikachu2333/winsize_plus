@@ -2717,6 +2717,12 @@ fn message_loop(hwnd: HWND, timer: HANDLE) -> Result<(), String> {
                     break;
                 };
                 match msg.message {
+                    input::RECOVERED => with_editor(|e| {
+                        e.cast.clear();
+                        e.preview.hide();
+                        e.overlay.hide_tip();
+                        Ok(())
+                    }),
                     input::TIP_SCROLL => with_editor(|e| {
                         e.overlay.scroll_tip(msg.wParam as i32);
                         Ok(())

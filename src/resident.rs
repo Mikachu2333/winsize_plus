@@ -371,6 +371,16 @@ impl App {
     }
     fn handle_event(&mut self, msg: MSG) -> Result<(), String> {
         match msg.message {
+            input::RECOVERED => {
+                self.drag = None;
+                self.cast.clear();
+                self.close_preview()?;
+                self.clear();
+                if msg.wParam == 0 {
+                    return Err("Cannot restore input hooks / 无法恢复输入钩子".into());
+                }
+                Ok(())
+            }
             input::CAST_KEY if self.keycast => {
                 if let Some(text) = crate::cast::key_caption(msg.wParam as u32, msg.lParam as u32) {
                     self.cast.key(text, input::cast_point(), &self.cfg)?;
@@ -397,7 +407,37 @@ impl App {
                 self.preview.tick(&self.cfg)
             }
             crate::tray::MENU => {
-                if let Some(action) = self.tray.menu(&self.cfg, msg.lParam)? {
+                let cast = &mut self.cast;
+                let cfg = &self.cfg;
+                let mouse = self.mousecast;
+                let keys = self.keycast;
+                if let Some(action) = self.tray.menu(cfg, msg.lParam, || {
+                    for _ in 0..64 {
+                        let Some(event) = input::next_annotation_event() else {
+                            break;
+                        };
+                        let result = match event.message {
+                            input::CAST_MOUSE if mouse => cast.mouse(
+                                event.wParam as u32,
+                                event.lParam as u32,
+                                input::cast_point(),
+                                cfg,
+                            ),
+                            input::CAST_KEY if keys => {
+                                crate::cast::key_caption(event.wParam as u32, event.lParam as u32)
+                                    .map_or(Ok(()), |text| cast.key(text, input::cast_point(), cfg))
+                            }
+                            _ => Ok(()),
+                        };
+                        if result.is_err() {
+                            cast.clear();
+                        }
+                    }
+                    if let Ok(point) = desktop::cursor() {
+                        let _ = cast.follow_mouse(point, cfg);
+                    }
+                    let _ = cast.tick(cfg);
+                })? {
                     self.act(action)?;
                 }
                 Ok(())
@@ -466,12 +506,20 @@ impl App {
                 input::track_preview(true)
             }
             input::DRAG_START => {
-                self.drag = Some(desktop::Drag::start(
+                let drag = desktop::Drag::start(
                     msg.wParam as HWND,
                     input::drag_origin(),
                     msg.lParam != 0,
                     &self.cfg,
-                )?);
+                );
+                self.drag = match drag {
+                    Ok(drag) => Some(drag),
+                    Err(error) => {
+                        input::cancel();
+                        self.drag = None;
+                        return Err(error);
+                    }
+                };
                 self.close_preview()?;
                 self.clear();
                 self.frames.reset(self.cfg.fps);

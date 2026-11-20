@@ -15,6 +15,42 @@ use windows_sys::{
 pub const APP_ICON: *const u16 = std::ptr::without_provenance(1);
 const CALLBACK: u32 = WM_APP + 41;
 pub const MENU: u32 = WM_APP + 42;
+struct MenuTick<'a> {
+    tick: &'a mut dyn FnMut(),
+    busy: bool,
+}
+unsafe extern "system" fn menu_tick(
+    hwnd: HWND,
+    message: u32,
+    wp: WPARAM,
+    lp: LPARAM,
+    id: usize,
+    data: usize,
+) -> LRESULT {
+    // SAFETY: the stack context is owned by menu until its synchronous
+    // TrackPopupMenu loop exits. Reentrant timer messages never alias its closure.
+    if message == WM_TIMER && wp == id {
+        let state = data as *mut MenuTick<'_>;
+        unsafe {
+            if !(*state).busy {
+                (*state).busy = true;
+                ((*state).tick)();
+                (*state).busy = false;
+            }
+        }
+        return 0;
+    }
+    unsafe { DefSubclassProc(hwnd, message, wp, lp) }
+}
+struct MenuPump(HWND, usize);
+impl Drop for MenuPump {
+    fn drop(&mut self) {
+        unsafe {
+            KillTimer(self.0, self.1);
+            RemoveWindowSubclass(self.0, Some(menu_tick), self.1);
+        }
+    }
+}
 
 fn icon() -> Result<HICON, String> {
     let handle = unsafe {
@@ -140,7 +176,30 @@ impl Tray {
         }
     }
 
-    pub fn menu(&self, cfg: &Config, anchor: isize) -> Result<Option<&'static str>, String> {
+    pub fn menu(
+        &self,
+        cfg: &Config,
+        anchor: isize,
+        mut tick: impl FnMut(),
+    ) -> Result<Option<&'static str>, String> {
+        let mut context = MenuTick {
+            tick: &mut tick,
+            busy: false,
+        };
+        let timer = 0x5743usize;
+        unsafe {
+            desktop::check(SetWindowSubclass(
+                self.hwnd,
+                Some(menu_tick),
+                timer,
+                (&mut context as *mut MenuTick<'_>) as usize,
+            ))?;
+            if SetTimer(self.hwnd, timer, 16, None) == 0 {
+                RemoveWindowSubclass(self.hwnd, Some(menu_tick), timer);
+                return Err(err());
+            }
+        }
+        let _pump = MenuPump(self.hwnd, timer);
         let entries = [
             ("settings", cfg.tr("Settings…", "设置…")),
             ("help", cfg.tr("Help", "帮助")),
@@ -218,5 +277,46 @@ impl Drop for Tray {
             DestroyIcon(self.icon);
             DestroyWindow(self.hwnd);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    #[ignore = "opens a temporary tray menu and verifies animation while the menu remains open"]
+    fn mouse_release_fades_while_tray_menu_is_open() {
+        let _dpi = crate::test_support::Dpi::new();
+        let _overlay = crate::overlay::Overlay::new().unwrap();
+        let cfg = crate::test_support::cfg();
+        let tray = Tray::new().unwrap();
+        let mut cast = crate::cast::Visuals::new();
+        let point = desktop::cursor().unwrap();
+        cast.mouse(2, 0, point, &cfg).unwrap();
+        let start = std::time::Instant::now();
+        let mut released = false;
+        let mut faded = false;
+        let result = tray
+            .menu(&cfg, -1, || {
+                if !released {
+                    cast.mouse(2, crate::mouse_cast::RELEASE, point, &cfg)
+                        .unwrap();
+                    released = true;
+                }
+                cast.tick(&cfg).unwrap();
+                faded |= !cast.mouse_active();
+                if faded || start.elapsed() > std::time::Duration::from_secs(3) {
+                    unsafe {
+                        EndMenu();
+                    }
+                }
+            })
+            .unwrap();
+        assert!(result.is_none());
+        assert!(
+            released && faded,
+            "The modal menu froze the released mouse indicator"
+        );
+        assert!(start.elapsed() < std::time::Duration::from_millis(1000));
     }
 }

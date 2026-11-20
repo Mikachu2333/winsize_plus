@@ -339,7 +339,9 @@ fn eligible(hwnd: HWND) -> bool {
     }
 }
 pub fn allowed(hwnd: HWND, exclusions: &[Identity]) -> bool {
-    eligible(hwnd) && (exclusions.is_empty() || !excluded_or_unknown(&identity(hwnd), exclusions))
+    eligible(hwnd)
+        && crate::security::can_control_window(hwnd)
+        && (exclusions.is_empty() || !excluded_or_unknown(&identity(hwnd), exclusions))
 }
 fn excluded_or_unknown(id: &Identity, exclusions: &[Identity]) -> bool {
     exclusions
@@ -643,6 +645,14 @@ pub fn apply(
 ) -> Result<(), String> {
     if !eligible(hwnd) {
         return Err(cfg.tr("No window", "无可操作的窗口").into());
+    }
+    if (req.geometry() || req.top.is_some()) && !crate::security::can_control_window(hwnd) {
+        return Err(cfg
+            .tr(
+                "Window permissions are higher or unavailable",
+                "目标窗口权限较高或无法查询权限",
+            )
+            .into());
     }
     let id = (req.ignore.is_some() || !cfg.exclusions.is_empty()).then(|| identity(hwnd));
     let excluded = id

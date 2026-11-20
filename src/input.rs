@@ -4,10 +4,11 @@ use crate::{
 };
 use std::{
     cell::{Cell, RefCell},
+    collections::VecDeque,
     ptr::{null, null_mut},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
     thread::JoinHandle,
@@ -15,7 +16,7 @@ use std::{
 };
 use windows_sys::Win32::{
     Foundation::*,
-    System::{LibraryLoader::GetModuleHandleW, Threading::*},
+    System::{LibraryLoader::GetModuleHandleW, SystemInformation::GetTickCount, Threading::*},
     UI::{Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
 };
 
@@ -34,6 +35,7 @@ pub const DISPLAY_CHANGED: u32 = WM_APP + 12;
 pub const TIP_SCROLL: u32 = WM_APP + 13;
 pub const CAST_KEY: u32 = WM_APP + 14;
 pub const CAST_MOUSE: u32 = WM_APP + 15;
+pub const RECOVERED: u32 = WM_APP + 16;
 pub fn display_changed() {
     desktop::invalidate_displays();
     post(DISPLAY_CHANGED, 0, 0);
@@ -66,6 +68,7 @@ struct Input {
     preview_enabled: bool,
     preview_tracking: bool,
     annotation_preview: bool,
+    last_event: u32,
     mouse: HHOOK,
     point: POINT,
     queued: bool,
@@ -98,6 +101,7 @@ thread_local! {
     static INBOX: RefCell<Option<mpsc::Receiver<QueuedEvent>>> = const { RefCell::new(None) };
     static CURRENT: Cell<Option<(u32, POINT)>> = const { Cell::new(None) };
     static DRIVER: RefCell<Option<Driver>> = const { RefCell::new(None) };
+    static DEFERRED: RefCell<VecDeque<QueuedEvent>> = const {RefCell::new(VecDeque::new())};
 }
 const WAKE: u32 = WM_APP + 90;
 const SCROLL_READY: u32 = WM_APP + 91;
@@ -118,10 +122,16 @@ struct EventSender {
     window: usize,
     scroll: Arc<Mutex<PendingScroll>>,
     stopped: Arc<AtomicBool>,
+    movement: Arc<Movement>,
+}
+#[derive(Default)]
+struct Movement {
+    point: AtomicU64,
+    queued: AtomicBool,
 }
 /// Consume owned event data only in the outer application loop. A native modal
 /// loop may dispatch the HWND wakeup, but cannot discard the channel's contents.
-pub fn next_event() -> Option<MSG> {
+fn receive_event() -> Option<QueuedEvent> {
     let mut event = INBOX.with_borrow(|inbox| inbox.as_ref()?.try_recv().ok())?;
     if event.message == SCROLL_READY {
         event = EVENTS.with_borrow(|events| {
@@ -155,13 +165,42 @@ pub fn next_event() -> Option<MSG> {
             }
         }
     });
+    Some(event)
+}
+fn event_message(event: QueuedEvent) -> MSG {
     CURRENT.with(|current| current.set(event.point.map(|point| (event.message, point))));
-    Some(MSG {
+    MSG {
         message: event.message,
         wParam: event.wp,
         lParam: event.lp,
         ..Default::default()
-    })
+    }
+}
+pub fn next_event() -> Option<MSG> {
+    let (deferred, more) =
+        DEFERRED.with_borrow_mut(|events| (events.pop_front(), !events.is_empty()));
+    if more {
+        DRIVER.with_borrow(|driver| {
+            if let Some(driver) = driver {
+                unsafe {
+                    PostMessageW(driver.window, WAKE, 0, 0);
+                }
+            }
+        });
+    }
+    deferred.or_else(receive_event).map(event_message)
+}
+/// Native menus pump HWND messages but cannot run ordinary application actions.
+/// Drain only annotation data and preserve every other event for the outer loop.
+pub fn next_annotation_event() -> Option<MSG> {
+    for _ in 0..64 {
+        let event = receive_event()?;
+        if matches!(event.message, CAST_KEY | CAST_MOUSE) {
+            return Some(event_message(event));
+        }
+        DEFERRED.with_borrow_mut(|deferred| deferred.push_back(event));
+    }
+    None
 }
 type Job = Box<dyn FnOnce() + Send>;
 enum Control {
@@ -172,6 +211,7 @@ struct Driver {
     commands: mpsc::Sender<Control>,
     wake: Arc<WakeEvent>,
     window: HWND,
+    movement: Arc<Movement>,
 }
 struct WakeEvent(usize);
 impl Drop for WakeEvent {
@@ -205,6 +245,19 @@ fn on_hook<R: Send + 'static>(action: impl FnOnce() -> R + Send + 'static) -> Re
             canceled.store(true, Ordering::Release);
             "Input thread did not respond".into()
         })
+    })
+}
+fn queue_hook(action: impl FnOnce() + Send + 'static) -> Result<(), String> {
+    DRIVER.with_borrow(|driver| {
+        let Some(driver) = driver else {
+            action();
+            return Ok(());
+        };
+        driver
+            .commands
+            .send(Control::Run(Box::new(action)))
+            .map_err(|_| "Input thread stopped".to_owned())?;
+        desktop::check(unsafe { SetEvent(driver.wake.0 as HANDLE) })
     })
 }
 fn mask(text: &str) -> u8 {
@@ -260,6 +313,70 @@ fn post_event(message: u32, wp: usize, lp: isize, point: Option<POINT>) -> bool 
     })
 }
 impl Input {
+    fn select_target(&mut self, hwnd: HWND) {
+        self.gesture_target = hwnd;
+        self.target_allowed = desktop::allowed(hwnd, &self.exclusions);
+    }
+    fn reset_gesture(&mut self) {
+        self.mode = Mode::Idle;
+        self.pressed = 0;
+        self.tap = None;
+        self.last_tap = None;
+        self.second = false;
+        self.eaten = [0; 4];
+        self.target_allowed = false;
+        self.gesture_target = null_mut();
+        self.drag = None;
+        self.queued = false;
+        self.cast_buttons = 0;
+        self.cast_wheel_time = None;
+    }
+    fn reconcile_keys(&mut self, down: impl Fn(u32) -> bool) -> bool {
+        let physical = u8::from(down(LEFT)) | (u8::from(down(RIGHT)) << 1);
+        // A consumed second Alt-down is intentionally absent from async state.
+        // Reconcile only ordinary Alt holds; intercepted sequences end on their hook up-event.
+        let missing_alt = if self.second {
+            0
+        } else {
+            self.pressed & !physical
+        };
+        if missing_alt != 0 {
+            self.pressed &= physical;
+            self.tap = None;
+            self.last_tap = None;
+            self.second = false;
+            if self.pressed == 0 {
+                self.target_allowed = false;
+                self.mode = Mode::Idle;
+                self.drag = None;
+            }
+        }
+        // Consumed key-downs do not update GetAsyncKeyState. Their release masks
+        // must survive polling or held shortcut keys would repeat their actions.
+        // Releases can be lost at an integrity/desktop boundary. Only reconcile
+        // outside callbacks after an idle interval, when async state is current.
+        for (button, key) in [
+            (1, VK_LBUTTON),
+            (2, VK_RBUTTON),
+            (4, VK_MBUTTON),
+            (5, VK_XBUTTON1),
+            (6, VK_XBUTTON2),
+        ] {
+            if self.cast_buttons & (1 << button) != 0
+                && !self.drag.is_some_and(|drag| drag.button == button)
+                && !down(u32::from(key))
+            {
+                self.cast_buttons &= !(1 << button);
+                post_event(
+                    CAST_MOUSE,
+                    button as usize,
+                    crate::mouse_cast::RELEASE as isize,
+                    Some(self.point),
+                );
+            }
+        }
+        missing_alt != 0
+    }
     fn update_mouse(&mut self) -> Result<(), String> {
         unsafe {
             let needed = self.guides
@@ -286,6 +403,7 @@ impl Input {
         if key >= 256 {
             return false;
         }
+        self.last_event = time;
         let (index, flag) = bit(key);
         if self.eaten[index] & flag != 0 {
             if !down {
@@ -338,8 +456,7 @@ impl Input {
                     return self.second;
                 }
                 if self.pressed == 0 {
-                    self.gesture_target = unsafe { GetForegroundWindow() };
-                    self.target_allowed = desktop::allowed(self.gesture_target, &self.exclusions);
+                    self.select_target(unsafe { GetForegroundWindow() });
                 }
                 if self.pressed & (self.gesture_mask | self.alt_mask) == 0
                     && side & (self.gesture_mask | self.alt_mask) != 0
@@ -532,6 +649,12 @@ unsafe extern "system" fn mouse(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
         }
         if code == HC_ACTION as i32 {
             let data = &*(lp as *const MSLLHOOKSTRUCT);
+            INPUT.with(|cell| {
+                if let Ok(mut input) = cell.try_borrow_mut() {
+                    input.last_event = data.time;
+                    input.point = data.pt;
+                }
+            });
             if INPUT.with(|cell| cell.try_borrow().is_ok_and(|input| input.cast_mouse))
                 && let Some((action, flags)) = cast_mouse_action(wp as u32, data.mouseData)
             {
@@ -590,9 +713,7 @@ unsafe extern "system" fn mouse(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
                                     post_event(DRAG_START, input.gesture_target as usize, isize::from(drag.resize), Some(drag.start));
                                     input.drag = Some(drag);
                                 }
-                            if !input.queued {
-                                input.queued = post_event(MOVE, 0, 0, None);
-                            }
+                            post_move(data.pt);
                             false
                         }
                         message if mouse_button(message, data.mouseData).is_some() => {
@@ -719,7 +840,7 @@ fn mouse_button(message: u32, data: u32) -> Option<(u32, bool)> {
     })
 }
 pub fn tip_visible(visible: bool) {
-    let _ = on_hook(move || {
+    let _ = queue_hook(move || {
         INPUT.with_borrow_mut(|input| {
             input.tip_visible = visible;
             if !visible {
@@ -731,7 +852,7 @@ pub fn tip_visible(visible: bool) {
     });
 }
 pub fn tip_scrollable(scrollable: bool, window: usize) {
-    let _ = on_hook(move || {
+    let _ = queue_hook(move || {
         INPUT.with_borrow_mut(|input| {
             input.tip_scrollable = scrollable;
             input.tip_window = window;
@@ -750,13 +871,37 @@ pub fn moved() -> POINT {
     if let Some((DRAG_END, point)) = CURRENT.with(Cell::get) {
         return point;
     }
-    on_hook(|| {
-        INPUT.with_borrow_mut(|input| {
-            input.queued = false;
-            input.point
+    if let Some(point) = DRIVER.with_borrow(|driver| {
+        driver.as_ref().map(|driver| {
+            driver.movement.queued.store(false, Ordering::Release);
+            let value = driver.movement.point.load(Ordering::Acquire);
+            POINT {
+                x: value as u32 as i32,
+                y: (value >> 32) as u32 as i32,
+            }
         })
+    }) {
+        return point;
+    }
+    INPUT.with_borrow_mut(|input| {
+        input.queued = false;
+        input.point
     })
-    .unwrap_or_else(|_| desktop::cursor().unwrap_or_default())
+}
+fn post_move(point: POINT) {
+    let needed = EVENTS.with_borrow(|events| {
+        let Some(events) = events else {
+            return false;
+        };
+        events.movement.point.store(
+            u64::from(point.x as u32) | (u64::from(point.y as u32) << 32),
+            Ordering::Release,
+        );
+        !events.movement.queued.swap(true, Ordering::AcqRel)
+    });
+    if needed {
+        post(MOVE, 0, 0);
+    }
 }
 pub fn cancel() {
     let _ = on_hook(|| {
@@ -878,16 +1023,19 @@ impl Hooks {
         let (send_events, receive_events) = mpsc::channel();
         let destination = window as usize;
         let scroll = Arc::new(Mutex::new(PendingScroll::default()));
+        let movement = Arc::new(Movement::default());
         EVENTS.with_borrow_mut(|events| {
             *events = Some(EventSender {
                 send: send_events.clone(),
                 window: destination,
                 scroll: scroll.clone(),
                 stopped: stopped.clone(),
+                movement: movement.clone(),
             })
         });
         let event = wake.clone();
         let worker_stop = stopped.clone();
+        let worker_movement = movement.clone();
         let (commands, receive) = mpsc::channel();
         let (ready, started) = mpsc::sync_channel(1);
         let worker = std::thread::Builder::new()
@@ -899,11 +1047,12 @@ impl Hooks {
                         window: destination,
                         scroll,
                         stopped: worker_stop.clone(),
+                        movement: worker_movement.clone(),
                     })
                 });
                 // SAFETY: both hooks are installed, pumped and removed on this worker.
                 unsafe {
-                    let hook = SetWindowsHookExW(
+                    let mut hook = SetWindowsHookExW(
                         WH_KEYBOARD_LL,
                         Some(keyboard),
                         GetModuleHandleW(null()),
@@ -914,14 +1063,38 @@ impl Hooks {
                         return;
                     }
                     let _ = ready.send(Ok(()));
+                    let mut heartbeat = std::time::Instant::now();
                     'pump: loop {
                         if worker_stop.load(Ordering::Acquire) {
                             break;
                         }
+                        if heartbeat.elapsed() > Duration::from_millis(750) {
+                            // Windows may silently remove low-level hooks after a long stall.
+                            // Re-arm on this owning thread and abandon incomplete gestures.
+                            UnhookWindowsHookEx(hook);
+                            hook = SetWindowsHookExW(
+                                WH_KEYBOARD_LL,
+                                Some(keyboard),
+                                GetModuleHandleW(null()),
+                                0,
+                            );
+                            let mut recovered = !hook.is_null();
+                            INPUT.with_borrow_mut(|input| {
+                                if !input.mouse.is_null() {
+                                    UnhookWindowsHookEx(input.mouse);
+                                    input.mouse = null_mut();
+                                }
+                                input.reset_gesture();
+                                recovered &= input.update_mouse().is_ok();
+                            });
+                            worker_movement.queued.store(false, Ordering::Release);
+                            post(RECOVERED, usize::from(recovered), 0);
+                        }
+                        heartbeat = std::time::Instant::now();
                         match MsgWaitForMultipleObjectsEx(
                             1,
                             &(event.0 as HANDLE),
-                            INFINITE,
+                            100,
                             QS_ALLINPUT,
                             MWMO_INPUTAVAILABLE,
                         ) {
@@ -947,6 +1120,17 @@ impl Hooks {
                                     }
                                     DispatchMessageW(&msg);
                                 }
+                            }
+                            WAIT_TIMEOUT => {
+                                INPUT.with_borrow_mut(|input| {
+                                    if GetTickCount().wrapping_sub(input.last_event) >= 150
+                                        && input
+                                            .reconcile_keys(|key| GetAsyncKeyState(key as i32) < 0)
+                                    {
+                                        post(CANCEL, 0, 0);
+                                        let _ = input.update_mouse();
+                                    }
+                                });
                             }
                             _ => break,
                         }
@@ -974,6 +1158,7 @@ impl Hooks {
                 commands,
                 wake: wake.clone(),
                 window,
+                movement,
             })
         });
         INBOX.with_borrow_mut(|inbox| *inbox = Some(receive_events));
@@ -1023,6 +1208,7 @@ impl Drop for Hooks {
             inbox.take();
         });
         CURRENT.with(|current| current.set(None));
+        DEFERRED.with_borrow_mut(VecDeque::clear);
         EVENTS.with_borrow_mut(|events| {
             events.take();
         });
@@ -1031,6 +1217,321 @@ impl Drop for Hooks {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn missing_mouse_release_after_permission_boundary_is_reconciled() {
+        use super::*;
+        let _hooks = Hooks::escape_only().unwrap();
+        on_hook(|| {
+            INPUT.with_borrow_mut(|input| {
+                input.cast_buttons = 1 << 2;
+                input.point = POINT { x: 45, y: 67 };
+                input.reconcile_keys(|_| false);
+                assert_eq!(input.cast_buttons, 0);
+            })
+        })
+        .unwrap();
+        let event = next_event().unwrap();
+        assert_eq!(
+            (event.message, event.wParam, event.lParam),
+            (CAST_MOUSE, 2, crate::mouse_cast::RELEASE as isize)
+        );
+        assert_eq!((cast_point().x, cast_point().y), (45, 67));
+    }
+    #[test]
+    fn timeout_cancels_pending_command_and_worker_recovers() {
+        use super::*;
+        let _hooks = Hooks::escape_only().unwrap();
+        let (send, ready) = mpsc::channel();
+        DRIVER.with_borrow(|driver| {
+            let driver = driver.as_ref().unwrap();
+            driver
+                .commands
+                .send(Control::Run(Box::new(move || {
+                    send.send(()).unwrap();
+                    std::thread::sleep(Duration::from_millis(2200));
+                })))
+                .unwrap();
+            unsafe {
+                SetEvent(driver.wake.0 as HANDLE);
+            }
+        });
+        ready.recv_timeout(Duration::from_secs(1)).unwrap();
+        let called = Arc::new(AtomicBool::new(false));
+        let queued = called.clone();
+        let error = on_hook(move || queued.store(true, Ordering::Release)).unwrap_err();
+        assert_eq!(error, "Input thread did not respond");
+        let end = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(msg) = next_event()
+                && msg.message == RECOVERED
+            {
+                assert_eq!(msg.wParam, 1);
+                break;
+            }
+            assert!(std::time::Instant::now() < end);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            !called.load(Ordering::Acquire),
+            "Timed-out state changes executed later"
+        );
+        assert_eq!(on_hook(|| 42).unwrap(), 42);
+    }
+    #[test]
+    #[ignore = "read-only integrity check against an explicitly supplied elevated window; uses a temporary normal child window"]
+    fn elevated_target_rejection_does_not_poison_the_next_normal_gesture() {
+        use super::*;
+        let Some(text) = std::env::var_os("WINSIZEP_ELEVATED_TEST_HWND") else {
+            eprintln!("SKIPPED: no elevated window handle supplied");
+            return;
+        };
+        let elevated =
+            usize::from_str_radix(text.to_string_lossy().trim_start_matches("0x"), 16).unwrap();
+        assert!(!crate::security::can_control_window(elevated as HWND));
+        assert!(!desktop::allowed(elevated as HWND, &[]));
+        let cfg = crate::test_support::cfg();
+        assert!(desktop::Drag::start(elevated as HWND, POINT::default(), false, &cfg).is_err());
+        let request = crate::cli::Request {
+            x: Some(0),
+            ..Default::default()
+        };
+        assert!(
+            desktop::apply(
+                elevated as HWND,
+                &request,
+                &cfg,
+                std::path::Path::new(""),
+                POINT::default()
+            )
+            .is_err()
+        );
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", "resident::tests::target_window"])
+            .env("WINSIZEP_PREVIEW_TARGET", "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let result = (|| -> Result<(), String> {
+            let until = std::time::Instant::now() + Duration::from_secs(5);
+            let normal = loop {
+                let hwnd = unsafe {
+                    FindWindowW(
+                        windows_sys::core::w!("STATIC"),
+                        windows_sys::core::w!("WinSizeP preview test target"),
+                    )
+                };
+                if !hwnd.is_null() {
+                    break hwnd as usize;
+                }
+                if std::time::Instant::now() > until {
+                    return Err("No temporary normal window".into());
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            assert!(desktop::allowed(normal as HWND, &[]));
+            let _hooks = Hooks::start(&cfg)?;
+            on_hook(move || unsafe {
+                INPUT.with_borrow_mut(|input| {
+                    input.select_target(elevated as HWND);
+                    input.pressed = 1;
+                    assert!(!input.target_allowed);
+                });
+                let mouse_event = MSLLHOOKSTRUCT::default();
+                assert_eq!(
+                    mouse(
+                        HC_ACTION as i32,
+                        WM_RBUTTONDOWN as usize,
+                        (&mouse_event as *const _) as isize
+                    ),
+                    0
+                );
+                INPUT.with_borrow_mut(|input| {
+                    assert!(input.drag.is_none());
+                    input.keyboard(LEFT, false, 1);
+                    assert_eq!(input.pressed, 0);
+                    input.select_target(normal as HWND);
+                    input.pressed = 1;
+                    assert!(input.target_allowed);
+                    assert!(input.keyboard(0x51, true, 2));
+                    assert!(input.keyboard(0x51, false, 3));
+                    input.keyboard(LEFT, false, 4);
+                });
+            })?;
+            let mut saw_action = false;
+            while let Some(event) = next_event() {
+                saw_action |= event.message == ACTION && event.wParam == 0x51;
+            }
+            assert!(
+                saw_action,
+                "Normal window shortcut did not recover after access denial"
+            );
+            unsafe {
+                PostMessageW(normal as HWND, WM_CLOSE, 0, 0);
+            }
+            Ok(())
+        })();
+        if child.try_wait().unwrap().is_none() {
+            let _ = child.kill();
+        }
+        let _ = child.wait();
+        result.unwrap();
+    }
+    #[test]
+    fn missing_alt_release_recovers_without_changing_bindings() {
+        let mut input = super::Input {
+            pressed: 1,
+            alt_mask: 1,
+            gesture_mask: 1,
+            target_allowed: true,
+            ..Default::default()
+        };
+        input.tap = Some((super::LEFT, 100));
+        input.eaten[1] = 1 << 13;
+        input.bound[1] = 1 << 13;
+        assert!(input.reconcile_keys(|_| false));
+        assert_eq!(input.pressed, 0);
+        assert!(!input.second && !input.target_allowed);
+        assert!(input.tap.is_none());
+        assert_eq!(input.eaten[1], 1 << 13);
+        assert_eq!(input.bound[1], 1 << 13);
+        assert!(!input.keyboard(super::LEFT, true, 200));
+        assert_eq!(
+            input.pressed, 1,
+            "A fresh Alt press remained stuck as a repeat"
+        );
+        input.keyboard(super::LEFT, false, 201);
+    }
+    #[test]
+    fn reconciliation_does_not_cancel_intercepted_buttons_or_repeat_shortcuts() {
+        use super::*;
+        let mut input = Input {
+            pressed: 1,
+            second: true,
+            cast_buttons: 1 << 2,
+            drag: Some(PointerAction {
+                start: POINT::default(),
+                button: 2,
+                resize: false,
+                draggable: false,
+                active: false,
+                canceled: false,
+            }),
+            ..Default::default()
+        };
+        input.eaten[1] = 1 << 13;
+        assert!(!input.reconcile_keys(|_| false));
+        assert!(input.second && input.drag.is_some());
+        assert_eq!(input.cast_buttons, 1 << 2);
+        assert_eq!(input.eaten[1], 1 << 13);
+        assert!(input.keyboard(77, true, 10));
+        assert!(input.keyboard(77, false, 11));
+        assert_eq!(input.eaten[1], 0);
+    }
+    #[test]
+    fn stalled_worker_rearms_hooks_and_clears_incomplete_gestures() {
+        use super::*;
+        let _hooks = Hooks::escape_only().unwrap();
+        on_hook(|| {
+            INPUT.with_borrow_mut(|input| {
+                input.cast_keys = true;
+                input.alt_mask = 1;
+                input.pressed = 1;
+                input.second = true;
+            })
+        })
+        .unwrap();
+        let (send, receive) = mpsc::channel();
+        DRIVER.with_borrow(|driver| {
+            let driver = driver.as_ref().unwrap();
+            driver
+                .commands
+                .send(Control::Run(Box::new(move || {
+                    std::thread::sleep(Duration::from_millis(950));
+                    let _ = send.send(());
+                })))
+                .unwrap();
+            unsafe {
+                SetEvent(driver.wake.0 as HANDLE);
+            }
+        });
+        receive.recv_timeout(Duration::from_secs(2)).unwrap();
+        let end = std::time::Instant::now() + Duration::from_secs(2);
+        let recovered = loop {
+            if let Some(event) = next_event()
+                && event.message == RECOVERED
+            {
+                break event.wParam;
+            }
+            assert!(
+                std::time::Instant::now() < end,
+                "No recovery after worker stall"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(recovered, 1);
+        on_hook(|| {
+            INPUT.with_borrow(|input| {
+                assert_eq!(input.pressed, 0);
+                assert!(!input.second);
+                assert!(input.cast_keys);
+                assert_eq!(input.alt_mask, 1);
+            })
+        })
+        .unwrap();
+    }
+    #[test]
+    fn modal_annotation_drain_preserves_actions_and_release_order() {
+        use super::*;
+        let _hooks = Hooks::escape_only().unwrap();
+        on_hook(|| {
+            post(ACTION, 0x4d, 0);
+            post_event(
+                CAST_MOUSE,
+                2,
+                crate::mouse_cast::RELEASE as isize,
+                Some(POINT { x: 30, y: 40 }),
+            );
+            post(ALT_RELEASE, 0, 0);
+        })
+        .unwrap();
+        let event = next_annotation_event().unwrap();
+        assert_eq!(
+            (event.message, event.wParam, event.lParam),
+            (CAST_MOUSE, 2, crate::mouse_cast::RELEASE as isize)
+        );
+        assert_eq!(cast_point().x, 30);
+        assert!(next_annotation_event().is_none());
+        assert_eq!(next_event().unwrap().message, ACTION);
+        assert_eq!(next_event().unwrap().message, ALT_RELEASE);
+    }
+    #[test]
+    fn moved_position_does_not_wait_for_stalled_hook_worker() {
+        use super::*;
+        let _hooks = Hooks::escape_only().unwrap();
+        on_hook(|| post_move(POINT { x: -500, y: 250 })).unwrap();
+        let event = next_event().unwrap();
+        assert_eq!(event.message, MOVE);
+        let (send, receive) = mpsc::channel();
+        DRIVER.with_borrow(|driver| {
+            let driver = driver.as_ref().unwrap();
+            driver
+                .commands
+                .send(Control::Run(Box::new(move || {
+                    send.send(()).unwrap();
+                    std::thread::sleep(Duration::from_millis(300));
+                })))
+                .unwrap();
+            unsafe {
+                SetEvent(driver.wake.0 as HANDLE);
+            }
+        });
+        receive.recv_timeout(Duration::from_secs(1)).unwrap();
+        let start = std::time::Instant::now();
+        let p = moved();
+        assert_eq!((p.x, p.y), (-500, 250));
+        assert!(start.elapsed() < Duration::from_millis(100));
+    }
     #[test]
     fn blocked_worker_does_not_hold_shutdown_or_lose_event_ownership() {
         use super::*;

@@ -179,6 +179,10 @@ impl Visuals {
     pub fn clear_mouse(&mut self) {
         self.mouse.clear();
     }
+    #[cfg(test)]
+    pub(crate) fn mouse_active(&self) -> bool {
+        self.mouse.active()
+    }
     pub fn deadline(&self) -> Option<Instant> {
         [self.next, self.mouse.deadline()]
             .into_iter()
