@@ -10,6 +10,15 @@ fn main() -> std::io::Result<()> {
     winresource::WindowsResource::new()
         .set_icon(icon)
         .set_manifest(&manifest)
+        .set("CompanyName", "None")
+        .set("Author", "Mikachu2333")
+        .set("License", "MIT")
+        .set(
+            "LegalCopyright",
+            "Copyright (c) 2026 Mikachu2333. MIT License",
+        )
+        .set("FileDescription", "Fluent Windows Adjust Modulator")
+        .set("ProductName", "WinSizeP")
         .add_toolkit_include(true)
         .compile_for("winsizep")
 }
