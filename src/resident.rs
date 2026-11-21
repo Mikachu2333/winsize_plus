@@ -1235,7 +1235,14 @@ mod tests {
         let focused = Arc::new(AtomicBool::new(false));
         let observed_focus = focused.clone();
         let finished = done.clone();
+        let physical_alt = input::tests::physical_alt_sender();
         let controller = std::thread::spawn(move || {
+            let key = |vk, down| {
+                key(vk, down);
+                if matches!(vk, VK_LMENU | VK_RMENU) {
+                    physical_alt(vk, down);
+                }
+            };
             let result = (|| {
                 let until = Instant::now() + Duration::from_secs(5);
                 let target = loop {
@@ -1310,6 +1317,17 @@ mod tests {
                         ));
                     }
                 }
+                for vk in [VK_LMENU, VK_RMENU] {
+                    for down in [true, false, true, false] {
+                        self::key(vk, down);
+                        std::thread::sleep(Duration::from_millis(30));
+                    }
+                    std::thread::sleep(Duration::from_millis(150));
+                    if observed.load(Ordering::SeqCst) || observed_tips.load(Ordering::SeqCst) {
+                        return Err("Injected Alt opened a preview or tip".into());
+                    }
+                }
+                println!("injected Alt did not open a preview or tip");
                 let started = Instant::now();
                 key(VK_LMENU, true);
                 visible(&observed, true)?;

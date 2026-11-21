@@ -608,6 +608,13 @@ unsafe extern "system" fn keyboard(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT
             } else {
                 data.vkCode
             };
+            // Only physical Alt events may change preview and gesture state. Forward
+            // injected presses and releases without consuming them or casting them.
+            if matches!(key, LEFT | RIGHT)
+                && data.flags & (LLKHF_INJECTED | LLKHF_LOWER_IL_INJECTED) != 0
+            {
+                return CallNextHookEx(null_mut(), code, wp, lp);
+            }
             let casting = INPUT.with(|cell| {
                 cell.try_borrow().is_ok_and(|input| {
                     input.cast_keys
@@ -1216,7 +1223,120 @@ impl Drop for Hooks {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
+    fn alt_event(key: u32, down: bool, flags: u32) -> isize {
+        use super::*;
+        let event = KBDLLHOOKSTRUCT {
+            vkCode: key,
+            flags: flags | if down { 0 } else { LLKHF_UP },
+            // SAFETY: GetTickCount takes no pointers or handles.
+            time: unsafe { GetTickCount() },
+            ..Default::default()
+        };
+        // SAFETY: event stays valid for the synchronous hook callback.
+        unsafe {
+            keyboard(
+                HC_ACTION as i32,
+                if down { WM_SYSKEYDOWN } else { WM_SYSKEYUP } as usize,
+                (&event as *const _) as isize,
+            )
+        }
+    }
+    /// Replay physical Alt events on the hook thread for interactive UI tests.
+    /// Those tests also use SendInput to maintain the async key state for polling.
+    pub fn physical_alt_sender() -> impl Fn(u16, bool) + Send {
+        use super::*;
+        let (commands, wake) = DRIVER.with_borrow(|driver| {
+            let driver = driver.as_ref().unwrap();
+            (driver.commands.clone(), driver.wake.clone())
+        });
+        move |key, down| {
+            assert!(matches!(u32::from(key), LEFT | RIGHT));
+            let (sent, received) = mpsc::sync_channel(1);
+            commands
+                .send(Control::Run(Box::new(move || {
+                    alt_event(u32::from(key), down, 0);
+                    sent.send(()).unwrap();
+                })))
+                .unwrap();
+            // SAFETY: this closure retains the Arc owning the worker's wake event.
+            assert_ne!(unsafe { SetEvent(wake.0 as HANDLE) }, 0);
+            received.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
+    }
+    #[test]
+    fn injected_alt_does_not_start_shortcuts_or_preview() {
+        use super::*;
+        let _hooks = Hooks::escape_only().unwrap();
+        configure(&crate::test_support::cfg()).unwrap();
+        on_hook(|| {
+            INPUT.with_borrow_mut(|input| input.cast_keys = true);
+            for key in [LEFT, RIGHT] {
+                for flags in [
+                    LLKHF_INJECTED,
+                    LLKHF_LOWER_IL_INJECTED,
+                    LLKHF_INJECTED | LLKHF_LOWER_IL_INJECTED,
+                ] {
+                    for down in [true, false, true, false] {
+                        assert_eq!(alt_event(key, down, flags), 0);
+                        INPUT.with_borrow(|input| {
+                            assert_eq!(input.pressed, 0);
+                            assert!(input.mode == Mode::Idle);
+                            assert!(input.tap.is_none() && input.last_tap.is_none());
+                            assert!(!input.second && input.mouse.is_null());
+                        });
+                    }
+                }
+            }
+        })
+        .unwrap();
+        assert!(next_event().is_none());
+    }
+    #[test]
+    fn injected_alt_preserves_physical_hold_and_does_not_enable_mouse_gestures() {
+        use super::*;
+        let _hooks = Hooks::escape_only().unwrap();
+        on_hook(|| {
+            assert_eq!(alt_event(RIGHT, true, LLKHF_EXTENDED), 0);
+            INPUT.with_borrow_mut(|input| {
+                assert_eq!(input.pressed, 2);
+                input.alt_mask = 1;
+                input.gesture_mask = 1;
+                input.preview_enabled = true;
+                input.target_allowed = true;
+            });
+            assert_eq!(alt_event(RIGHT, false, LLKHF_INJECTED), 0);
+            assert_eq!(alt_event(LEFT, true, LLKHF_INJECTED), 0);
+            INPUT.with_borrow(|input| assert_eq!(input.pressed, 2));
+            let click = || {
+                let event = MSLLHOOKSTRUCT::default();
+                // SAFETY: event stays valid for the synchronous hook callback.
+                unsafe {
+                    mouse(
+                        HC_ACTION as i32,
+                        WM_RBUTTONDOWN as usize,
+                        (&event as *const _) as isize,
+                    )
+                }
+            };
+            assert_eq!(click(), 0);
+            INPUT.with_borrow(|input| assert!(input.drag.is_none()));
+            // The same physical Alt event still opens the preview and enables gestures.
+            assert_eq!(alt_event(LEFT, true, LLKHF_ALTDOWN), 0);
+            assert_eq!(click(), 1);
+            INPUT.with_borrow(|input| {
+                assert_eq!(input.pressed, 3);
+                assert!(input.drag.is_some());
+            });
+            alt_event(LEFT, false, LLKHF_ALTDOWN);
+            alt_event(RIGHT, false, LLKHF_EXTENDED);
+        })
+        .unwrap();
+        assert_eq!(next_event().unwrap().message, ALT_HOLD);
+        assert_eq!(next_event().unwrap().message, GRID_SHOW);
+        assert_eq!(next_event().unwrap().message, ALT_RELEASE);
+        assert!(next_event().is_none());
+    }
     #[test]
     fn missing_mouse_release_after_permission_boundary_is_reconciled() {
         use super::*;
