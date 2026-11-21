@@ -409,11 +409,23 @@ impl App {
                 self.preview.tick(&self.cfg)
             }
             crate::tray::MENU => {
+                // Opening the menu changes focus and ends transient Alt previews.
+                if self.preview_until.is_some() || self.preview_check.is_some() {
+                    self.clear();
+                    self.close_preview()?;
+                }
                 let cast = &mut self.cast;
+                let hide = &mut self.hide;
+                let overlay = &self.overlay;
                 let cfg = &self.cfg;
                 let mouse = self.mousecast;
                 let keys = self.keycast;
                 if let Some(action) = self.tray.menu(cfg, msg.lParam, || {
+                    // TrackPopupMenu owns the message loop until the menu closes.
+                    if hide.is_some_and(|when| Instant::now() >= when) {
+                        *hide = None;
+                        overlay.hide_tip();
+                    }
                     for _ in 0..64 {
                         let Some(event) = input::next_annotation_event() else {
                             break;
@@ -802,6 +814,35 @@ mod tests {
             snapshot: None,
             exit: None,
         }
+    }
+
+    #[test]
+    #[ignore = "shows a temporary tip and closes its test tray menu automatically"]
+    fn tip_expires_while_tray_menu_is_open() {
+        unsafe extern "system" fn close_menu(_: HWND, _: u32, _: usize, _: u32) {
+            // SAFETY: this callback runs on the thread that opened the test menu.
+            unsafe {
+                EndMenu();
+            }
+        }
+        let _hooks = input::Hooks::escape_only().unwrap();
+        let mut app = test_app();
+        app.cfg.duration = 100;
+        app.notice("Temporary expiry test").unwrap();
+        // SAFETY: the timer stays on this thread and is removed after the menu returns.
+        let timer = unsafe { SetTimer(null_mut(), 0, 350, Some(close_menu)) };
+        assert_ne!(timer, 0);
+        let result = app.handle_event(MSG {
+            message: crate::tray::MENU,
+            lParam: -1,
+            ..Default::default()
+        });
+        unsafe {
+            KillTimer(null_mut(), timer);
+        }
+        result.unwrap();
+        assert!(app.hide.is_none());
+        assert!(!app.overlay.tip_visible());
     }
 
     #[test]
