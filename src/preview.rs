@@ -349,8 +349,8 @@ impl Preview {
             for cell in 1..=9 {
                 let name = cfg
                     .cell(display.number, cell)
-                    .map(|name| cfg.display_name(name))
-                    .unwrap_or("—");
+                    .map(|name| cfg.region_caption(name))
+                    .unwrap_or_else(|| "—".into());
                 self.grid_labels[cell as usize - 1].show(
                     &format!("{cell}\n{name}"),
                     grid_rect(display.full, cell),
@@ -375,7 +375,7 @@ impl Preview {
             // Selection uses a translucent interior fill; the ordinary outline stays unchanged.
             self.highlight.show(region.rect);
             self.label.show(
-                cfg.display_name(&region.name),
+                &cfg.region_caption(&region.name),
                 region.rect,
                 Self::color(cfg),
                 dpi,

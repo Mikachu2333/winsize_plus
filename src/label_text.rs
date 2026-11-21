@@ -401,6 +401,34 @@ pub fn annotation(
 mod tests {
     use super::*;
     #[test]
+    fn region_name_and_shortcut_lines_are_centered_together() {
+        let mut cfg = crate::test_support::cfg();
+        cfg.region_font = "Arial".into();
+        for dpi in [96, 144, 192] {
+            let image = render(&cfg.region_caption("FullTop"), 600, dpi, 0xffffff, &cfg).unwrap();
+            let mut bands = Vec::new();
+            let mut bounds: Option<(usize, usize)> = None;
+            for row in pixels(&image).chunks_exact(image.width as usize) {
+                let first = row.iter().position(|p| p >> 24 != 0);
+                let last = row.iter().rposition(|p| p >> 24 != 0);
+                if let (Some(first), Some(last)) = (first, last) {
+                    bounds = Some(bounds.map_or((first, last), |(left, right)| {
+                        (left.min(first), right.max(last))
+                    }));
+                } else if let Some(bounds) = bounds.take() {
+                    bands.push(bounds);
+                }
+            }
+            if let Some(bounds) = bounds {
+                bands.push(bounds);
+            }
+            assert_eq!(bands.len(), 2, "Expected a region line and a shortcut line");
+            for (left, right) in bands {
+                assert!((left as i32 + right as i32 - image.width).abs() <= 4 * dpi / 96);
+            }
+        }
+    }
+    #[test]
     #[ignore = "child process for the graphics shutdown regression"]
     fn graphics_shutdown_child() {
         if std::env::var_os("WINSIZEP_GRAPHICS_EXIT_TEST").is_none() {

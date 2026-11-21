@@ -108,7 +108,7 @@ pub struct Config {
     pub exclusions: Vec<Identity>,
 }
 pub fn vk(text: &str) -> Option<u32> {
-    let text = text.to_ascii_lowercase();
+    let text = text.trim().to_ascii_lowercase();
     if text.len() == 1 && text.as_bytes()[0].is_ascii_alphanumeric() {
         return Some(text.as_bytes()[0].to_ascii_uppercase() as u32);
     }
@@ -262,6 +262,9 @@ fn key_name(key: u32) -> String {
 fn is_builtin_action(name: &str) -> bool {
     ACTIONS.contains(&name)
 }
+pub fn shortcut_name(text: &str) -> String {
+    vk(text).map(key_name).unwrap_or_else(|| text.to_owned())
+}
 fn reserved_preset_name(name: &str) -> bool {
     let name = command_name(name);
     is_builtin_action(&name) || ALIASES.iter().any(|(alias, _)| *alias == name)
@@ -371,6 +374,25 @@ impl Config {
                 .map(|(_, action)| (*action).to_owned())
                 .unwrap_or(name)
         })
+    }
+    pub fn region_caption(&self, name: &str) -> String {
+        let normalized = command_name(name);
+        let mut keys: Vec<_> = self
+            .keys
+            .iter()
+            .filter_map(|(key, action)| (action == &normalized).then_some(*key))
+            .collect();
+        keys.sort_unstable();
+        let title = self.display_name(name);
+        if keys.is_empty() {
+            return title.to_owned();
+        }
+        let shortcuts = keys
+            .into_iter()
+            .map(|key| format!("[ {} ]", key_name(key)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("{title}\n{shortcuts}")
     }
     pub fn help_text(&self) -> String {
         let button = |button| match button {
@@ -601,11 +623,11 @@ impl Config {
         };
         let choice = |section: &str, key: &str, options: &[&str]| {
             let val = text(section, key)?;
-            if options.contains(&val) {
-                Ok(val.to_string())
-            } else {
-                Err(format!("{section}.{key}: {val}"))
-            }
+            options
+                .iter()
+                .find(|option| option.eq_ignore_ascii_case(val.trim()))
+                .map(|option| (*option).to_owned())
+                .ok_or_else(|| format!("{section}.{key}: {val}"))
         };
         let number = |section: &str, key: &str, min: i64, max: i64| {
             field(section, key)?
@@ -1463,6 +1485,40 @@ pub fn load_snapshot(path: &Path, edit: Option<(&Identity, Switch)>) -> Result<L
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn region_captions_follow_case_insensitive_user_bindings() {
+        let mut doc = help().parse::<DocumentMut>().unwrap();
+        doc["keys"] = Item::Table(Table::new());
+        doc["keys"]["w"] = value("fUlLtOp");
+        doc["shortcuts"]["alt"] = value("LEFT");
+        doc["shortcuts"]["gesture"] = value("Both");
+        doc["shortcuts"]["move_button"] = value("Left");
+        let cfg = Config::parse(&doc).unwrap();
+        assert_eq!(cfg.alt, "left");
+        assert_eq!(cfg.gesture, "both");
+        assert_eq!(cfg.move_button, Some(1));
+        let fields = crate::settings_schema::fields(4, 0, &cfg, &doc);
+        assert_eq!(
+            fields
+                .iter()
+                .find(|field| field.section == "keys" && field.key == "w")
+                .unwrap()
+                .label,
+            "W"
+        );
+        assert_eq!(cfg.region_caption("FULLTOP"), "FullTop\n[ W ]");
+        assert_eq!(cfg.region_caption("center"), "Center");
+        assert_eq!(shortcut_name("iNsErT"), "Insert");
+        assert_eq!(shortcut_name("f12"), "F12");
+        assert_eq!(shortcut_name("vk:57"), "W");
+        doc["keys"].as_table_mut().unwrap().remove("w");
+        doc["keys"]["f12"] = value("FULLTOP");
+        doc["keys"]["insert"] = value("fulltop");
+        let cfg = Config::parse(&doc).unwrap();
+        assert_eq!(cfg.region_caption("fulltop"), "FullTop\n[ Insert ] [ F12 ]");
+        doc["keys"]["F12"] = value("Center");
+        assert!(Config::parse(&doc).is_err());
+    }
     #[test]
     fn side_button_setting_defaults_to_swapped_and_migrates_size_only_once() {
         let mut doc = help().parse::<DocumentMut>().unwrap();

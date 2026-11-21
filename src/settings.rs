@@ -668,7 +668,11 @@ impl Editor {
                     );
                 }
                 Kind::Mapping => {
-                    let key = row.field.key.clone();
+                    let key = if row.field.section == "keys" {
+                        config::shortcut_name(&row.field.key)
+                    } else {
+                        row.field.key.clone()
+                    };
                     self.control(&mut row, index, 3, "EDIT", &key, WS_BORDER | WS_TABSTOP)?;
                     self.control(
                         &mut row,
@@ -1267,6 +1271,11 @@ impl Editor {
                 }
                 Kind::Mapping => {
                     let name = caption(row.c(3)).trim().to_owned();
+                    let name = if section == "keys" {
+                        config::shortcut_name(&name)
+                    } else {
+                        name
+                    };
                     if name.is_empty()
                         || name.eq_ignore_ascii_case("esc")
                         || name.eq_ignore_ascii_case("escape")
@@ -1356,6 +1365,11 @@ impl Editor {
         for row in &mut self.rows {
             if matches!(row.field.kind, Kind::Mapping) {
                 let name = caption(row.c(3)).trim().to_owned();
+                let name = if row.field.section == "keys" {
+                    config::shortcut_name(&name)
+                } else {
+                    name
+                };
                 if self.doc[&row.field.section].get(&name).is_some() && name != row.field.key {
                     row.field.key = name.clone();
                     row.field.label = name.clone();
@@ -1405,7 +1419,12 @@ impl Editor {
                     }
                 }
                 Kind::Mapping => {
-                    set_text(row.c(3), &row.field.key);
+                    let key = if row.field.section == "keys" {
+                        config::shortcut_name(&row.field.key)
+                    } else {
+                        row.field.key.clone()
+                    };
+                    set_text(row.c(3), &key);
                     if row.field.section == "presets" {
                         send(
                             row.c(5),
