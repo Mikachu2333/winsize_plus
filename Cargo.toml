@@ -18,7 +18,7 @@ windows = { version = "0.62.2", default-features = false, features = [
 ] }
 # windows 0.62.2 depends on windows-numerics 0.3.1.
 windows-numerics = { version = "=0.3.1", default-features = false }
-toml_edit = { version = "0.25.20+spec-1.1.0", default-features = false, features = [
+toml_edit = { version = "0.25.19", default-features = false, features = [
     "parse",
     "display",
 ] }
