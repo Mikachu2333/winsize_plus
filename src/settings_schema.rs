@@ -149,14 +149,8 @@ fn describe(section: &str, key: &str) -> (&'static str, &'static str, &'static s
             "duration_ms" => (
                 "Display duration (ms)",
                 "显示时长（毫秒）",
-                "Keep each annotation visible for 100–10000 ms before fading.",
-                "每次标注保持 100–10000 毫秒后开始淡出。",
-            ),
-            "fade_ms" => (
-                "Fade duration (ms)",
-                "淡出时长（毫秒）",
-                "0–3000 ms; zero hides immediately after the display duration.",
-                "0–3000 毫秒；0 表示显示时长结束后立即隐藏。",
+                "Keep each annotation visible for 100–10000 ms before the shared 400 ms fade.",
+                "每次标注保持 100–10000 毫秒，再统一用 400 毫秒淡出。",
             ),
             "radius" => (
                 "Shape radius",

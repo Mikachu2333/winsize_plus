@@ -16,6 +16,8 @@ pub const CTRL: u32 = 1;
 pub const ALT: u32 = 2;
 pub const SHIFT: u32 = 4;
 pub const WIN: u32 = 8;
+// All input annotations, including settings samples, use the same fade duration.
+pub const FADE_OUT: Duration = Duration::from_millis(400);
 
 fn modifiers(text: &str, flags: u32) -> String {
     let mut parts = Vec::new();
@@ -86,10 +88,10 @@ pub fn key_caption(key: u32, detail: u32) -> Option<String> {
 fn opacity(age: Duration, style: &CastStyle) -> u8 {
     let age = age.as_millis();
     let linger = u128::from(style.duration);
-    let fade = u128::from(style.fade);
+    let fade = FADE_OUT.as_millis();
     if age <= linger {
         style.opacity
-    } else if fade == 0 || age >= linger + fade {
+    } else if age >= linger + fade {
         0
     } else {
         (u128::from(style.opacity) * (linger + fade - age) / fade) as u8
@@ -323,6 +325,15 @@ impl Visuals {
             self.key("Ctrl + Shift + K".into(), point, cfg)
         }
     }
+    pub fn preview_interval(mouse: bool, cfg: &Config) -> Duration {
+        if mouse {
+            crate::mouse_cast::PREVIEW_INTERVAL
+        } else {
+            Duration::from_millis(cfg.keycast.duration.into())
+                + FADE_OUT
+                + Duration::from_millis(300)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -399,14 +410,14 @@ mod tests {
         );
         assert_eq!(
             opacity(
-                Duration::from_millis((style.duration + style.fade).into()),
+                Duration::from_millis(style.duration.into()) + FADE_OUT,
                 style
             ),
             0
         );
         assert!(
             opacity(
-                Duration::from_millis((style.duration + style.fade / 2).into()),
+                Duration::from_millis(style.duration.into()) + FADE_OUT / 2,
                 style
             ) < style.opacity
         );

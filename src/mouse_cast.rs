@@ -1,5 +1,6 @@
 //! Fixed-size input shapes. State is merged per button/axis; pixels and HWNDs are reused.
 use crate::{
+    cast::FADE_OUT,
     config::MouseStyle,
     desktop::{self, Display},
     label_text::Image,
@@ -14,7 +15,6 @@ use windows_sys::Win32::{
 pub const RELEASE: u32 = 1 << 24;
 pub const FRAME: Duration = Duration::from_millis(16);
 const FADE_IN: Duration = Duration::from_millis(60);
-const FADE_OUT: Duration = Duration::from_millis(400);
 const SCROLL_GAP: Duration = Duration::from_millis(180);
 const CLICK_HOLD: Duration = Duration::from_millis(100);
 pub const PREVIEW_INTERVAL: Duration = Duration::from_millis(2200);

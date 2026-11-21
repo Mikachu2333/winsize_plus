@@ -67,7 +67,6 @@ opacity = 160 # Filled shapes use theme-derived colors; timing is fixed at about
 [keycast]
 enabled = false # Initial state; Alt+K toggles the running display.
 duration_ms = 1500
-fade_ms = 350
 history = 4
 position = "bottom-left"
 background = "#292929"

@@ -1537,12 +1537,10 @@ impl Editor {
                 7 | 8 => {
                     self.cast
                         .preview(self.tab == 7, desktop::cursor()?, &self.cfg)?;
-                    let duration = if self.tab == 7 {
-                        crate::mouse_cast::PREVIEW_INTERVAL.as_millis() as u64
-                    } else {
-                        u64::from(self.cfg.keycast.duration + self.cfg.keycast.fade) + 300
-                    };
-                    self.cast_next = Some(Instant::now() + Duration::from_millis(duration));
+                    self.cast_next = Some(
+                        Instant::now()
+                            + crate::cast::Visuals::preview_interval(self.tab == 7, &self.cfg),
+                    );
                     unsafe {
                         SetTimer(self.window.0, 1, 16, None);
                     }
@@ -1835,12 +1833,8 @@ impl Editor {
         if self.cast_next.is_some_and(|when| now >= when) {
             self.cast
                 .preview(self.tab == 7, desktop::cursor()?, &self.cfg)?;
-            let duration = if self.tab == 7 {
-                crate::mouse_cast::PREVIEW_INTERVAL.as_millis() as u64
-            } else {
-                u64::from(self.cfg.keycast.duration + self.cfg.keycast.fade) + 300
-            };
-            self.cast_next = Some(now + Duration::from_millis(duration));
+            self.cast_next =
+                Some(now + crate::cast::Visuals::preview_interval(self.tab == 7, &self.cfg));
         }
         // Native combo popups capture the pointer and do not reliably deliver list mouse-move
         // messages to subclasses. Hit-test the open list on the existing UI timer as well.

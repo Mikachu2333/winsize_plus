@@ -47,7 +47,6 @@ pub struct Line {
 pub struct CastStyle {
     pub enabled: bool,
     pub duration: u32,
-    pub fade: u32,
     pub font: String,
     pub font_size: i32,
     pub foreground: u32,
@@ -804,7 +803,6 @@ impl Config {
             Ok(CastStyle {
                 enabled: boolean(section, "enabled")?,
                 duration: number(section, "duration_ms", 100, 10000)? as u32,
-                fade: number(section, "fade_ms", 0, 3000)? as u32,
                 font: font(section)?,
                 font_size: number(section, "font_size", 6, 72)? as i32,
                 foreground: color(section, "foreground")?,
@@ -1025,6 +1023,10 @@ fn document(text: &str) -> Result<(DocumentMut, bool), String> {
 }
 
 fn migrate(doc: &mut DocumentMut) -> Result<(), String> {
+    if let Some(keys) = doc.get_mut("keycast").and_then(Item::as_table_mut) {
+        // Fade timing is shared with mouse annotations rather than saved per profile.
+        keys.remove("fade_ms");
+    }
     if let Some(mouse) = doc.get_mut("mousecast").and_then(Item::as_table_mut) {
         if (mouse.contains_key("ring_width") || mouse.contains_key("duration_ms"))
             && let Some(radius) = mouse.get("radius").and_then(Item::as_integer)
@@ -1485,6 +1487,24 @@ pub fn load_snapshot(path: &Path, edit: Option<(&Identity, Switch)>) -> Result<L
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn obsolete_fade_settings_do_not_override_shared_timing() {
+        let mut doc = help().parse::<DocumentMut>().unwrap();
+        doc["keycast"]["fade_ms"] = value(1500);
+        doc["mousecast"]["fade_ms"] = value(50);
+        migrate(&mut doc).unwrap();
+        let cfg = recover(&mut doc).unwrap();
+        assert!(cfg.warnings.is_empty());
+        for section in ["keycast", "mousecast"] {
+            assert!(doc[section].get("fade_ms").is_none());
+        }
+        assert!(
+            !crate::settings_schema::fields(8, 0, &cfg, &doc)
+                .iter()
+                .any(|field| field.key == "fade_ms")
+        );
+        assert_eq!(crate::cast::FADE_OUT, std::time::Duration::from_millis(400));
+    }
     #[test]
     fn region_captions_follow_case_insensitive_user_bindings() {
         let mut doc = help().parse::<DocumentMut>().unwrap();
