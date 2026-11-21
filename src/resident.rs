@@ -578,18 +578,18 @@ impl App {
             self.cast.tick(&self.cfg)?;
         }
         if self.preview_until.is_some_and(|when| now >= when) {
+            self.clear();
             input::cancel();
             self.close_preview()?;
-            self.clear();
         }
         if self.preview_check.is_some_and(|when| now >= when) {
             if unsafe { IsWindow(self.window) } == 0
                 || (!self.preview_latched && !input::alt_held())
                 || unsafe { GetForegroundWindow() } != self.window
             {
+                self.clear();
                 input::cancel();
                 self.close_preview()?;
-                self.clear();
             } else {
                 self.preview.tick(&self.cfg)?;
                 self.preview_check = Some(later(100));
@@ -777,6 +777,55 @@ mod tests {
         },
     };
     const TARGET: &str = "WinSizeP preview test target";
+
+    fn test_app() -> App {
+        let cfg = crate::test_support::cfg();
+        App {
+            cast: crate::cast::Visuals::new(),
+            mousecast: false,
+            keycast: false,
+            frames: FrameClock::new(cfg.fps).unwrap(),
+            cfg,
+            path: PathBuf::new(),
+            overlay: Overlay::new().unwrap(),
+            tray: crate::tray::Tray::new().unwrap(),
+            preview: Preview::new().unwrap(),
+            held_window: None,
+            preview_latched: false,
+            preview_until: None,
+            preview_check: None,
+            window: null_mut(),
+            drag: None,
+            command: String::new(),
+            hide: None,
+            reload: None,
+            snapshot: None,
+            exit: None,
+        }
+    }
+
+    #[test]
+    #[ignore = "shows temporary previews and a tray icon; pauses only the test's input worker"]
+    fn preview_deadlines_hide_immediately_with_a_paused_worker() {
+        let _hooks = input::Hooks::escape_only().unwrap();
+        let mut app = test_app();
+        for expiry in [true, false] {
+            app.cfg.show = "time".into();
+            app.begin_alt_preview(unsafe { GetForegroundWindow() }, false)
+                .unwrap();
+            app.preview_until = expiry.then(Instant::now);
+            app.preview_check = Some(Instant::now());
+            let resume = input::tests::pause_worker();
+            let started = Instant::now();
+            let result = app.deadlines();
+            let elapsed = started.elapsed();
+            drop(resume);
+            result.unwrap();
+            assert!(elapsed < Duration::from_millis(250), "{elapsed:?}");
+            assert!(!app.overlay.tip_visible() && !app.preview.visible());
+            assert!(app.preview_until.is_none() && app.preview_check.is_none());
+        }
+    }
 
     #[test]
     #[ignore = "opens temporary outlines, tips and a tray icon; no config is changed"]

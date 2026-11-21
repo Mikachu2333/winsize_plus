@@ -123,6 +123,7 @@ struct EventSender {
     scroll: Arc<Mutex<PendingScroll>>,
     stopped: Arc<AtomicBool>,
     movement: Arc<Movement>,
+    alt_held: Arc<AtomicBool>,
 }
 #[derive(Default)]
 struct Movement {
@@ -378,6 +379,16 @@ impl Input {
         missing_alt != 0
     }
     fn update_mouse(&mut self) -> Result<(), String> {
+        // Alt transitions, configuration and recovery all refresh this subscription.
+        // Publish their state so UI expiry never waits for the hook worker.
+        EVENTS.with_borrow(|events| {
+            if let Some(events) = events {
+                events.alt_held.store(
+                    self.pressed & (self.alt_mask | self.gesture_mask) != 0,
+                    Ordering::Release,
+                );
+            }
+        });
         unsafe {
             let needed = self.guides
                 || self.cast_mouse
@@ -911,7 +922,7 @@ fn post_move(point: POINT) {
     }
 }
 pub fn cancel() {
-    let _ = on_hook(|| {
+    let _ = queue_hook(|| {
         INPUT.with_borrow_mut(|input| {
             input.mode = Mode::Idle;
             if let Some(drag) = &mut input.drag {
@@ -921,10 +932,17 @@ pub fn cancel() {
     });
 }
 pub fn alt_held() -> bool {
-    on_hook(|| {
-        INPUT.with_borrow(|input| input.pressed & (input.alt_mask | input.gesture_mask) != 0)
+    EVENTS.with_borrow(|events| {
+        events.as_ref().map_or_else(
+            || {
+                INPUT
+                    .with_borrow(|input| input.pressed & (input.alt_mask | input.gesture_mask) != 0)
+            },
+            |events| {
+                !events.stopped.load(Ordering::Acquire) && events.alt_held.load(Ordering::Acquire)
+            },
+        )
     })
-    .unwrap_or(false)
 }
 pub fn command_mode() {
     let _ = on_hook(|| INPUT.with_borrow_mut(|input| input.mode = Mode::Command));
@@ -938,6 +956,15 @@ pub fn set_guides(on: bool) -> Result<(), String> {
     })?
 }
 pub fn track_preview(on: bool) -> Result<(), String> {
+    if !on {
+        // FIFO ordering preserves a subsequent start without blocking UI cleanup.
+        return queue_hook(|| {
+            INPUT.with_borrow_mut(|input| {
+                input.preview_tracking = false;
+                let _ = input.update_mouse();
+            })
+        });
+    }
     on_hook(move || {
         INPUT.with_borrow_mut(|input| {
             input.preview_tracking = on;
@@ -1031,6 +1058,7 @@ impl Hooks {
         let destination = window as usize;
         let scroll = Arc::new(Mutex::new(PendingScroll::default()));
         let movement = Arc::new(Movement::default());
+        let alt_held = Arc::new(AtomicBool::new(false));
         EVENTS.with_borrow_mut(|events| {
             *events = Some(EventSender {
                 send: send_events.clone(),
@@ -1038,6 +1066,7 @@ impl Hooks {
                 scroll: scroll.clone(),
                 stopped: stopped.clone(),
                 movement: movement.clone(),
+                alt_held: alt_held.clone(),
             })
         });
         let event = wake.clone();
@@ -1055,6 +1084,7 @@ impl Hooks {
                         scroll,
                         stopped: worker_stop.clone(),
                         movement: worker_movement.clone(),
+                        alt_held,
                     })
                 });
                 // SAFETY: both hooks are installed, pumped and removed on this worker.
@@ -1224,6 +1254,49 @@ impl Drop for Hooks {
 
 #[cfg(test)]
 pub(super) mod tests {
+    pub fn pause_worker() -> super::mpsc::Sender<()> {
+        use super::*;
+        let (resume, wait) = mpsc::channel();
+        let (started, ready) = mpsc::channel();
+        queue_hook(move || {
+            started.send(()).unwrap();
+            let _ = wait.recv_timeout(Duration::from_secs(10));
+        })
+        .unwrap();
+        ready.recv_timeout(Duration::from_secs(2)).unwrap();
+        resume
+    }
+    #[test]
+    fn preview_cleanup_and_alt_query_do_not_wait_for_a_paused_worker() {
+        use super::*;
+        let _hooks = Hooks::start(&crate::test_support::cfg()).unwrap();
+        on_hook(|| {
+            INPUT.with_borrow_mut(|input| {
+                input.pressed = 1;
+                input.second = true;
+                input.update_mouse().unwrap();
+            });
+        })
+        .unwrap();
+        track_preview(true).unwrap();
+        let resume = pause_worker();
+        let started = std::time::Instant::now();
+        assert!(alt_held());
+        cancel();
+        track_preview(false).unwrap();
+        assert!(started.elapsed() < Duration::from_millis(250));
+        drop(resume);
+        on_hook(|| {
+            INPUT.with_borrow(|input| {
+                assert!(input.mode == Mode::Idle);
+                assert!(!input.preview_tracking);
+            });
+        })
+        .unwrap();
+        // A queued stop must not overtake a later start.
+        track_preview(true).unwrap();
+        on_hook(|| INPUT.with_borrow(|input| assert!(input.preview_tracking))).unwrap();
+    }
     fn alt_event(key: u32, down: bool, flags: u32) -> isize {
         use super::*;
         let event = KBDLLHOOKSTRUCT {
