@@ -36,14 +36,14 @@ impl Identity {
             && (self.title.is_empty() || self.title == window.title)
     }
 }
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub struct Line {
     pub width: i32,
     pub gap: i32,
     pub color: u32,
     pub opacity: u8,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CastStyle {
     pub enabled: bool,
     pub duration: u32,
@@ -56,7 +56,7 @@ pub struct CastStyle {
     pub history: usize,
     pub position: String,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct MouseStyle {
     pub enabled: bool,
     pub swap_side_buttons: bool,
@@ -65,6 +65,7 @@ pub struct MouseStyle {
     pub color: u32,
     pub dark: bool,
 }
+#[derive(PartialEq)]
 pub struct Config {
     pub mousecast: MouseStyle,
     pub keycast: CastStyle,

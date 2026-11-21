@@ -1348,7 +1348,11 @@ impl Editor {
         let saved = config::save_settings(&self.path, &self.original, &draft)?;
         self.doc = saved.parse::<DocumentMut>().map_err(|e| e.to_string())?;
         self.original = saved;
-        self.apply_config(Config::parse(&self.doc)?);
+        let cfg = Config::parse(&self.doc)?;
+        // The edit already updated the live preview. Saving only restarts it
+        // when merging concurrent file changes alters the effective settings.
+        let preview_changed = cfg != self.cfg;
+        self.apply_config(cfg);
         for row in &mut self.rows {
             if matches!(row.field.kind, Kind::Mapping) {
                 let name = caption(row.c(3)).trim().to_owned();
@@ -1366,7 +1370,7 @@ impl Editor {
             self.rebuild()?;
         } else {
             self.update_values();
-            if self.tab != 0 && self.tab != 4 {
+            if preview_changed && self.tab != 0 && self.tab != 4 {
                 self.render()?;
             }
         }
@@ -2774,6 +2778,107 @@ fn message_loop(hwnd: HWND, timer: HANDLE) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "shows a keyboard sample and writes only target/settings-preview-test/config.toml"]
+    fn saving_preserves_preview_unless_merged_settings_change() {
+        let _hooks = input::Hooks::escape_only().unwrap();
+        let cfg = crate::test_support::cfg();
+        let original = config::help().to_owned();
+        let doc = original.parse::<DocumentMut>().unwrap();
+        let folder = std::env::current_dir()
+            .unwrap()
+            .join("target/settings-preview-test");
+        std::fs::create_dir_all(&folder).unwrap();
+        let path = folder.join("config.toml");
+        std::fs::write(&path, &original).unwrap();
+        // SAFETY: the owned hidden parent keeps these isolated test controls alive.
+        let hwnd = unsafe {
+            CreateWindowExW(
+                0,
+                w!("STATIC"),
+                w!("Preview timing test"),
+                WS_OVERLAPPEDWINDOW,
+                0,
+                0,
+                900,
+                700,
+                null_mut(),
+                null_mut(),
+                GetModuleHandleW(null()),
+                null(),
+            )
+        };
+        assert!(!hwnd.is_null());
+        let mut editor = Editor {
+            cast: crate::cast::Visuals::new(),
+            cast_next: None,
+            window: Window(hwnd),
+            panes: [hwnd; 2],
+            tabs: Vec::new(),
+            status: null_mut(),
+            status_until: Cell::new(None),
+            axis_controls: [null_mut(); 3],
+            path,
+            original,
+            doc,
+            clock: FrameClock::new(cfg.fps).unwrap(),
+            cfg,
+            tab: 8,
+            axis: 0,
+            rows: Vec::new(),
+            pages: HashMap::new(),
+            scroll: [0; 2],
+            extent: [0; 2],
+            dpi: 96,
+            font: Font::new("SystemFont", 12, 96, false, false).unwrap(),
+            hint_font: Font::new("SystemFont", 9, 96, false, false).unwrap(),
+            families: Vec::new(),
+            live: true,
+            selected: None,
+            pending: None,
+            dirty: HashSet::new(),
+            disk_check: Instant::now(),
+            overlay: Overlay::new().unwrap(),
+            preview: Preview::new().unwrap(),
+            tooltip: HoverTip::new(hwnd).unwrap(),
+            active_combo: None,
+        };
+        editor.status = editor.create(hwnd, "STATIC", "", 0, 600).unwrap();
+        let field = schema::fields(8, 0, &editor.cfg, &editor.doc)
+            .into_iter()
+            .find(|field| field.section == "keycast" && field.key == "duration_ms")
+            .unwrap();
+        let edit = editor
+            .create(hwnd, "EDIT", "1600", ES_AUTOHSCROLL as u32, BASE)
+            .unwrap();
+        let mut controls = [null_mut(); 16];
+        controls[0] = edit;
+        editor.rows.push(Row {
+            field,
+            controls,
+            options: Vec::new(),
+        });
+        editor.command(BASE, EN_CHANGE, edit).unwrap();
+        let first = editor.cast_next.unwrap();
+        editor.save().unwrap();
+        assert_eq!(editor.cfg.keycast.duration, 1600);
+        assert_eq!(editor.cast_next, Some(first));
+        assert!(editor.pending.is_none());
+
+        set_text(edit, "1700");
+        editor.command(BASE, EN_CHANGE, edit).unwrap();
+        let before_merge = editor.cast_next.unwrap();
+        let mut disk = editor.doc.clone();
+        disk["keycast"]["duration_ms"] = value(1800);
+        std::fs::write(&editor.path, disk.to_string()).unwrap();
+        editor.save().unwrap();
+        assert_eq!(editor.cfg.keycast.duration, 1800);
+        assert!(editor.cast_next.unwrap() > before_merge);
+        editor.cast.clear();
+        unsafe {
+            KillTimer(hwnd, 1);
+        }
+    }
     #[test]
     fn minimum_window_fits_small_high_dpi_work_areas() {
         for (dpi, work) in [

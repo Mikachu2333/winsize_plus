@@ -18,7 +18,7 @@ impl Rect {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct Expr(Vec<(f64, usize)>);
 
 impl FromStr for Expr {
@@ -68,7 +68,7 @@ impl FromStr for Expr {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Layout {
     fields: [Expr; 4],
     pub monitor: u32,
