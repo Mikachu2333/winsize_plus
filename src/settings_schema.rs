@@ -23,6 +23,7 @@ pub enum Kind {
     Color(ColorChannels),
     Mapping,
     Add,
+    OpenConfig,
     Preview,
     Note,
 }
@@ -230,14 +231,20 @@ fn describe(section: &str, key: &str) -> (&'static str, &'static str, &'static s
         ("general", "preview") => (
             "Show region outlines after Alt",
             "Alt 触发后显示分区框线",
-            "Show immediately with the tip and hide together. Releasing held Alt closes both.",
-            "与提示框立即同步显示、隐藏；长按时松开 Alt 即关闭。",
+            "Show with the tip after Alt activation and hide together. Releasing held Alt closes both.",
+            "Alt 触发后与提示框同步显示、隐藏；长按时松开 Alt 即关闭。",
+        ),
+        ("general", "alt_hold_ms") => (
+            "Alt hold delay (milliseconds)",
+            "Alt 长按延迟（毫秒）",
+            "0–60000; default 2000. Keyboard and mouse actions activate after this delay. Earlier combinations go to the application and cancel activation until Alt is released. Double-tap Alt activates directly.",
+            "0–60000，默认 2000。延迟结束后启用键盘和鼠标操作；提前输入组合键会交给应用，并取消本次长按触发。双击 Alt 可直接触发。",
         ),
         ("shortcuts", "alt") => (
             "Alt key for shortcuts",
             "快捷操作使用的 Alt",
-            "Hold Alt with a key, or double-tap Alt then press a key. Timing follows Windows.",
-            "按住 Alt 配合按键，或双击 Alt 后按键；双击时间跟随 Windows。",
+            "Hold Alt until activation, then press a key; or double-tap Alt then press a key. Double-tap timing follows Windows.",
+            "长按 Alt 触发后配合按键，或双击 Alt 后按键；双击时间跟随 Windows。",
         ),
         ("shortcuts", "gesture") => (
             "Alt key for mouse actions",
@@ -278,8 +285,8 @@ fn describe(section: &str, key: &str) -> (&'static str, &'static str, &'static s
         ("tip", "duration_ms") => (
             "Display time (milliseconds)",
             "停留时间（毫秒）",
-            "Also controls how long Alt region previews stay visible. Help stays until Esc.",
-            "同时决定 Alt 分区预览的停留时间。帮助保持显示，直到按 Esc。",
+            "Starts when the tip appears, and also controls Alt region previews. Help stays until Esc.",
+            "从提示框显示时开始计时，同时决定 Alt 分区预览的停留时间。帮助保持显示，直到按 Esc。",
         ),
         ("tip", "window_format") => (
             "Window information format",
@@ -443,6 +450,7 @@ pub fn fields(tab: usize, axis: usize, cfg: &Config, doc: &DocumentMut) -> Vec<F
     }
     if tab == 0 {
         fields.push(Field { section: String::new(), key: String::new(), label: cfg.tr("Changes are saved and applied automatically", "更改后自动保存并应用").into(), hint: cfg.tr("Manual file edits take precedence over conflicting GUI edits. To allow an excluded window again, remove its exclusion from the configuration file.", "文件中的手动修改优先于 GUI 的冲突修改。若要重新允许已排除的窗口，请从配置文件中移除对应排除项。").into(), kind: Kind::Note });
+        fields.push(Field { section: String::new(), key: String::new(), label: cfg.tr("Open configuration file", "打开配置文件").into(), hint: cfg.tr("Open winsizep_config.toml in Notepad. Windows 10 and 11 system tray overflow menus are excluded by default.", "使用记事本打开 winsizep_config.toml。默认排除 Windows 10 和 11 的系统托盘弹出菜单。").into(), kind: Kind::OpenConfig });
     }
     if tab == 2 {
         fields.push(Field { section: String::new(), key: String::new(), label: cfg.tr("Region expressions", "分区表达式").into(), hint: cfg.tr("x | y | width | height [| monitor]. sw/sh: work-area width/height; ww/wh: current window; vw/vh: virtual desktop. Units are percentages: 50sw-8 = half the work-area width minus 8 px. Monitor 0 follows the pointer; vw/vh use the virtual-desktop origin.", "x | y | 宽 | 高 [| 屏号]。sw/sh：工作区宽高；ww/wh：当前窗口宽高；vw/vh：虚拟桌面宽高。单位均为百分比，例如 50sw-8 为半屏宽减 8 像素。屏号 0 跟随鼠标；含 vw/vh 时从虚拟桌面原点计算。").into(), kind: Kind::Note });

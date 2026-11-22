@@ -4,6 +4,7 @@ language = "auto"
 elevate = false
 autostart = false
 preview = true
+alt_hold_ms = 2000 # Hold Alt before capturing input; 0 activates immediately.
 
 [shortcuts]
 alt = "left"
@@ -15,7 +16,7 @@ resize_button = "right"
 
 [tip]
 show = "window"
-duration_ms = 3000 # Shared display duration for the tip and Alt region preview.
+duration_ms = 3000 # Starts when the tip and Alt region preview appear.
 window_format = "{title}" # {hwnd}, {title}, {pid}, {process}, {display_name}, {class}
 time_format = "hh:mm" # YYYY, MM, DD, hh, mm, ss
 theme = "system"
@@ -87,7 +88,8 @@ LeftBottom = "0|50sh|50sw|50sh"
 FullBottom = "0|50sh|100sw|50sh"
 RightBottom = "50sw|50sh|50sw|50sh"
 
-# Alt + key, or double-tap Alt then key. Empty values disable bindings.
+# Hold Alt for general.alt_hold_ms then press a key, or double-tap Alt then key.
+# Empty values disable bindings.
 # Reserved: Tab, F4, Space, Enter, PrintScreen, arrows, PgUp/PgDn, Home/End,
 # Esc and modifier keys. VK:xx cannot bypass these restrictions.
 [keys]
@@ -131,7 +133,17 @@ G = "Guide"
 8 = "FullBottom"
 9 = "RightBottom"
 
-# All nonempty fields must match. Remove exclusions here to allow a window again.
+# Windows 11 and Windows 10 system tray overflow menus.
+[[exclusions]]
+name = "explorer.exe"
+class = "TopLevelWindowForOverflowXamlIsland"
+
+[[exclusions]]
+name = "explorer.exe"
+class = "NotifyIconOverflowWindow"
+
+# All nonempty fields must match within a rule; any matching rule excludes a window.
+# Remove exclusions here to allow a window again.
 # [[exclusions]]
 # name = "notepad.exe"
 # class = "Notepad"

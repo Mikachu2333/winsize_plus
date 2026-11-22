@@ -57,6 +57,9 @@ struct Input {
     gesture_mask: u8,
     gesture_target: HWND,
     double_ms: u32,
+    hold_ms: u32,
+    hold_started: Option<u32>,
+    hold_active: bool,
     last_tap: Option<(u32, u32)>,
     pressed: u8,
     tap: Option<(u32, u32)>,
@@ -65,7 +68,6 @@ struct Input {
     command: [u64; 4],
     eaten: [u64; 4],
     guides: bool,
-    preview_enabled: bool,
     preview_tracking: bool,
     annotation_preview: bool,
     last_event: u32,
@@ -314,11 +316,45 @@ fn post_event(message: u32, wp: usize, lp: isize, point: Option<POINT>) -> bool 
     })
 }
 impl Input {
+    fn cancel_hold(&mut self) {
+        self.hold_started = None;
+        self.hold_active = false;
+    }
+    fn advance_hold(&mut self, time: u32) {
+        if self
+            .hold_started
+            .is_some_and(|when| time.wrapping_sub(when) >= self.hold_ms)
+            && self.pressed & (self.alt_mask | self.gesture_mask) != 0
+        {
+            self.hold_started = None;
+            self.hold_active = true;
+            // A long hold cannot also be the first tap of a double-tap sequence.
+            if self
+                .tap
+                .is_some_and(|(_, when)| time.wrapping_sub(when) > self.double_ms)
+            {
+                self.tap = None;
+                self.last_tap = None;
+            }
+            if self.target_allowed {
+                post(ALT_HOLD, self.gesture_target as usize, 0);
+            }
+            let _ = self.update_mouse();
+        }
+    }
+    fn hold_wait(&self, time: u32) -> u32 {
+        self.hold_started.map_or(100, |when| {
+            self.hold_ms
+                .saturating_sub(time.wrapping_sub(when))
+                .clamp(1, 100)
+        })
+    }
     fn select_target(&mut self, hwnd: HWND) {
         self.gesture_target = hwnd;
         self.target_allowed = desktop::allowed(hwnd, &self.exclusions);
     }
     fn reset_gesture(&mut self) {
+        self.cancel_hold();
         self.mode = Mode::Idle;
         self.pressed = 0;
         self.tap = None;
@@ -343,6 +379,9 @@ impl Input {
         };
         if missing_alt != 0 {
             self.pressed &= physical;
+            if self.pressed & (self.alt_mask | self.gesture_mask) == 0 {
+                self.cancel_hold();
+            }
             self.tap = None;
             self.last_tap = None;
             self.second = false;
@@ -415,6 +454,7 @@ impl Input {
             return false;
         }
         self.last_event = time;
+        self.advance_hold(time);
         let (index, flag) = bit(key);
         if self.eaten[index] & flag != 0 {
             if !down {
@@ -422,7 +462,11 @@ impl Input {
             }
             return true;
         }
-        if down && self.pressed & self.alt_mask != 0 && self.cast_toggles[index] & flag != 0 {
+        if down
+            && self.hold_active
+            && self.pressed & self.alt_mask != 0
+            && self.cast_toggles[index] & flag != 0
+        {
             post(ACTION, key as usize, 0);
             self.eaten[index] |= flag;
             self.tap = None;
@@ -451,6 +495,7 @@ impl Input {
                 || self.drag.is_some())
         {
             self.mode = Mode::Idle;
+            self.cancel_hold();
             self.tap = None;
             self.last_tap = None;
             if let Some(drag) = &mut self.drag {
@@ -469,20 +514,16 @@ impl Input {
                 if self.pressed == 0 {
                     self.select_target(unsafe { GetForegroundWindow() });
                 }
-                if self.pressed & (self.gesture_mask | self.alt_mask) == 0
-                    && side & (self.gesture_mask | self.alt_mask) != 0
-                    && self.preview_enabled
-                    && self.target_allowed
-                {
-                    post(ALT_HOLD, self.gesture_target as usize, 0);
-                }
+                let start_hold = self.pressed & (self.gesture_mask | self.alt_mask) == 0
+                    && side & (self.gesture_mask | self.alt_mask) != 0;
                 self.pressed |= side;
-                let clean = self.pressed == side
-                    && unsafe {
-                        [VK_CONTROL, VK_SHIFT, VK_LWIN, VK_RWIN]
-                            .iter()
-                            .all(|code| GetAsyncKeyState(*code as i32) >= 0)
-                    };
+                // SAFETY: querying modifier state uses only valid virtual-key codes.
+                let unmodified = unsafe {
+                    [VK_CONTROL, VK_SHIFT, VK_LWIN, VK_RWIN]
+                        .iter()
+                        .all(|code| GetAsyncKeyState(*code as i32) >= 0)
+                };
+                let clean = self.pressed == side && unmodified;
                 self.tap = (clean && self.target_allowed && self.alt_mask & side != 0)
                     .then_some((key, time));
                 self.second = self.tap.is_some()
@@ -490,15 +531,22 @@ impl Input {
                         last == key && time.wrapping_sub(when) <= self.double_ms
                     });
                 self.last_tap = None;
+                if self.second {
+                    self.hold_started = None;
+                    self.hold_active = true;
+                } else if start_hold && unmodified {
+                    self.hold_started = Some(time);
+                    self.advance_hold(time);
+                }
                 let _ = self.update_mouse();
                 return self.second;
             }
             self.pressed &= !side;
-            if self.preview_enabled
-                && side & (self.gesture_mask | self.alt_mask) != 0
-                && self.pressed & (self.gesture_mask | self.alt_mask) == 0
-            {
-                post(ALT_RELEASE, 0, 0);
+            if self.pressed & (self.gesture_mask | self.alt_mask) == 0 {
+                if self.hold_active {
+                    post(ALT_RELEASE, 0, 0);
+                }
+                self.cancel_hold();
             }
             let _ = self.update_mouse();
             let consumed = self.second;
@@ -524,10 +572,14 @@ impl Input {
         }
         self.tap = None;
         self.last_tap = None;
+        if !self.hold_active {
+            self.hold_started = None;
+        }
         if matches!(key, 0x10 | 0xa0 | 0xa1) {
             return false;
         }
         if self.mode == Mode::Idle
+            && self.hold_active
             && self.target_allowed
             && self.pressed & self.alt_mask != 0
             && self.bound[index] & flag != 0
@@ -543,6 +595,7 @@ impl Input {
         if self.mode == Mode::Idle {
             // Ordinary Alt shortcuts (for example Alt+Tab) abandon the pending preview.
             if self.pressed != 0 {
+                self.cancel_hold();
                 post(CANCEL, 0, 0);
             }
             return false;
@@ -631,7 +684,8 @@ unsafe extern "system" fn keyboard(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT
                     input.cast_keys
                         && (key >= 256 || {
                             let (index, flag) = bit(key);
-                            input.pressed & input.alt_mask == 0
+                            !input.hold_active
+                                || input.pressed & input.alt_mask == 0
                                 || input.cast_toggles[index] & flag == 0
                         })
                 })
@@ -671,6 +725,15 @@ unsafe extern "system" fn mouse(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
                 if let Ok(mut input) = cell.try_borrow_mut() {
                     input.last_event = data.time;
                     input.point = data.pt;
+                    input.advance_hold(data.time);
+                    if !input.hold_active
+                        && (mouse_button(wp as u32, data.mouseData).is_some_and(|(_, down)| down)
+                            || matches!(wp as u32, WM_MOUSEWHEEL | WM_MOUSEHWHEEL))
+                    {
+                        input.hold_started = None;
+                        input.tap = None;
+                        input.last_tap = None;
+                    }
                 }
             });
             if INPUT.with(|cell| cell.try_borrow().is_ok_and(|input| input.cast_mouse))
@@ -751,7 +814,7 @@ unsafe extern "system" fn mouse(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
                             if input.preview_tracking && input.pressed==0 {post(CANCEL,0,0);input.mode=Mode::Idle;}
                             input.tap = None;
                             input.last_tap = None;
-                            if input.target_allowed && input.pressed & input.gesture_mask != 0 && input.drag.is_none() {
+                            if input.hold_active && input.target_allowed && input.pressed & input.gesture_mask != 0 && input.drag.is_none() {
                                 let resize = input.resize_button == Some(button);
                                 let draggable = resize || input.move_button == Some(button);
                                 if draggable || button == 2 {
@@ -973,10 +1036,10 @@ pub fn track_preview(on: bool) -> Result<(), String> {
     })?
 }
 pub fn configure(cfg: &Config) -> Result<(), String> {
-    let (alt, gesture, preview, exclusions, move_button, resize_button, double_ms) = (
+    let (alt, gesture, hold_ms, exclusions, move_button, resize_button, double_ms) = (
         mask(&cfg.alt),
         mask(&cfg.gesture),
-        cfg.preview,
+        cfg.alt_hold_ms,
         cfg.exclusions.clone(),
         cfg.move_button,
         cfg.resize_button,
@@ -986,11 +1049,12 @@ pub fn configure(cfg: &Config) -> Result<(), String> {
     on_hook(move || {
         INPUT.with_borrow_mut(|input| {
             input.mode = Mode::Idle;
+            input.cancel_hold();
             input.tap = None;
             input.last_tap = None;
             input.alt_mask = alt;
             input.gesture_mask = gesture;
-            input.preview_enabled = preview;
+            input.hold_ms = hold_ms;
             input.exclusions = exclusions;
             input.move_button = move_button;
             input.resize_button = resize_button;
@@ -1131,7 +1195,7 @@ impl Hooks {
                         match MsgWaitForMultipleObjectsEx(
                             1,
                             &(event.0 as HANDLE),
-                            100,
+                            INPUT.with_borrow(|input| input.hold_wait(GetTickCount())),
                             QS_ALLINPUT,
                             MWMO_INPUTAVAILABLE,
                         ) {
@@ -1171,6 +1235,9 @@ impl Hooks {
                             }
                             _ => break,
                         }
+                        // Also advance during continuous mouse movement or key repeats;
+                        // those messages can keep the wait from timing out indefinitely.
+                        INPUT.with_borrow_mut(|input| input.advance_hold(GetTickCount()));
                     }
                     UnhookWindowsHookEx(hook);
                     INPUT.with_borrow_mut(|input| {
@@ -1254,6 +1321,158 @@ impl Drop for Hooks {
 
 #[cfg(test)]
 pub(super) mod tests {
+    fn pending_hold(when: u32) -> super::Input {
+        let mut input = super::Input {
+            alt_mask: 1,
+            hold_ms: 2000,
+            hold_started: Some(when),
+            pressed: 1,
+            target_allowed: true,
+            double_ms: 500,
+            tap: Some((super::LEFT, when)),
+            ..Default::default()
+        };
+        let (index, flag) = super::bit(0x51);
+        input.bound[index] = flag;
+        input
+    }
+    #[test]
+    fn alt_hold_activates_at_the_deadline_once_and_consumes_matching_release() {
+        use super::*;
+        let _hooks = Hooks::escape_only().unwrap();
+        let mut input = pending_hold(100);
+        input.advance_hold(2099);
+        assert!(!input.hold_active);
+        assert!(next_event().is_none());
+        input.advance_hold(2100);
+        assert!(input.hold_active);
+        assert_eq!(next_event().unwrap().message, ALT_HOLD);
+        input.advance_hold(2300);
+        assert!(next_event().is_none());
+        assert!(input.tap.is_none());
+        assert!(input.keyboard(0x51, true, 2301));
+        assert_eq!(next_event().unwrap().message, ARMED);
+        assert_eq!(next_event().unwrap().message, ACTION);
+        assert!(!input.keyboard(LEFT, false, 2302));
+        assert_eq!(next_event().unwrap().message, ALT_RELEASE);
+        assert!(input.keyboard(0x51, false, 2303));
+        assert!(!input.hold_active);
+        assert!(next_event().is_none());
+    }
+    #[test]
+    fn early_application_shortcuts_and_repeats_cancel_the_whole_hold() {
+        use super::*;
+        let _hooks = Hooks::escape_only().unwrap();
+        for key in [
+            0x51,
+            0x4d,
+            u32::from(VK_TAB),
+            u32::from(VK_CONTROL),
+            u32::from(VK_SHIFT),
+        ] {
+            let mut input = pending_hold(100);
+            let (index, flag) = bit(0x4d);
+            input.cast_toggles[index] = flag;
+            assert!(!input.keyboard(key, true, 500), "{key}");
+            assert!(input.hold_started.is_none());
+            input.advance_hold(2500);
+            assert!(!input.hold_active);
+            assert!(!input.keyboard(key, true, 2501), "repeat {key}");
+            assert!(!input.keyboard(key, false, 2502), "release {key}");
+            assert!(!input.keyboard(0x51, true, 2503));
+            assert!(!input.keyboard(LEFT, false, 2504));
+            assert!(input.eaten.iter().all(|mask| *mask == 0));
+            while let Some(event) = next_event() {
+                assert_eq!(event.message, CANCEL);
+            }
+        }
+    }
+    #[test]
+    fn release_or_escape_cannot_leave_a_pending_hold_to_reactivate() {
+        use super::*;
+        let _hooks = Hooks::escape_only().unwrap();
+        let mut input = pending_hold(100);
+        assert!(!input.keyboard(LEFT, false, 300));
+        input.advance_hold(2500);
+        assert!(!input.hold_active);
+        assert!(next_event().is_none());
+        let mut input = pending_hold(100);
+        input.advance_hold(2100);
+        assert_eq!(next_event().unwrap().message, ALT_HOLD);
+        input.preview_tracking = true;
+        assert!(input.keyboard(u32::from(VK_ESCAPE), true, 2101));
+        assert_eq!(next_event().unwrap().message, CANCEL);
+        input.advance_hold(5000);
+        assert!(!input.hold_active);
+        assert!(!input.keyboard(0x51, true, 5001));
+    }
+    #[test]
+    fn zero_delay_and_tick_wraparound_activate_correctly() {
+        use super::*;
+        let _hooks = Hooks::escape_only().unwrap();
+        let mut input = pending_hold(100);
+        input.hold_ms = 0;
+        assert!(input.keyboard(0x51, true, 100));
+        assert_eq!(next_event().unwrap().message, ALT_HOLD);
+        assert_eq!(next_event().unwrap().message, ARMED);
+        assert_eq!(next_event().unwrap().message, ACTION);
+        let mut input = pending_hold(u32::MAX - 999);
+        input.advance_hold(999);
+        assert!(!input.hold_active);
+        input.advance_hold(1000);
+        assert!(input.hold_active);
+        assert_eq!(next_event().unwrap().message, ALT_HOLD);
+    }
+    #[test]
+    fn double_tap_still_arms_without_waiting_for_the_hold_delay() {
+        use super::*;
+        let _hooks = Hooks::escape_only().unwrap();
+        let mut input = pending_hold(100);
+        input.second = true;
+        input.hold_active = true;
+        assert!(input.keyboard(LEFT, false, 130));
+        assert_eq!(next_event().unwrap().message, ALT_RELEASE);
+        assert_eq!(next_event().unwrap().message, ARMED);
+        assert!(input.keyboard(0x51, true, 200));
+        assert_eq!(next_event().unwrap().message, ACTION);
+    }
+    #[test]
+    fn mouse_buttons_pass_through_before_activation_and_enable_after_the_delay() {
+        use super::*;
+        let _hooks = Hooks::escape_only().unwrap();
+        on_hook(|| {
+            let button = |message, time| {
+                let data = MSLLHOOKSTRUCT {
+                    time,
+                    ..Default::default()
+                };
+                // SAFETY: the event lives through the synchronous callback.
+                unsafe {
+                    mouse(
+                        HC_ACTION as i32,
+                        message as usize,
+                        (&data as *const _) as isize,
+                    )
+                }
+            };
+            INPUT.with_borrow_mut(|input| {
+                *input = pending_hold(100);
+                input.gesture_mask = 1;
+            });
+            assert_eq!(button(WM_RBUTTONDOWN, 500), 0);
+            assert_eq!(button(WM_RBUTTONUP, 501), 0);
+            assert_eq!(button(WM_RBUTTONDOWN, 2500), 0);
+            INPUT.with_borrow(|input| assert!(input.drag.is_none() && !input.hold_active));
+            INPUT.with_borrow_mut(|input| input.hold_started = Some(3000));
+            assert_eq!(button(WM_RBUTTONDOWN, 5000), 1);
+            assert_eq!(button(WM_RBUTTONUP, 5001), 1);
+        })
+        .unwrap();
+        assert_eq!(next_event().unwrap().message, ALT_HOLD);
+        assert_eq!(next_event().unwrap().message, GRID_SHOW);
+        assert_eq!(next_event().unwrap().message, CLICK);
+        assert!(next_event().is_none());
+    }
     pub fn pause_worker() -> super::mpsc::Sender<()> {
         use super::*;
         let (resume, wait) = mpsc::channel();
@@ -1375,7 +1594,7 @@ pub(super) mod tests {
                 assert_eq!(input.pressed, 2);
                 input.alt_mask = 1;
                 input.gesture_mask = 1;
-                input.preview_enabled = true;
+                input.hold_ms = 0;
                 input.target_allowed = true;
             });
             assert_eq!(alt_event(RIGHT, false, LLKHF_INJECTED), 0);
@@ -1545,6 +1764,7 @@ pub(super) mod tests {
                     assert_eq!(input.pressed, 0);
                     input.select_target(normal as HWND);
                     input.pressed = 1;
+                    input.hold_active = true;
                     assert!(input.target_allowed);
                     assert!(input.keyboard(0x51, true, 2));
                     assert!(input.keyboard(0x51, false, 3));
@@ -1893,6 +2113,7 @@ pub(super) mod tests {
             super::INPUT.with_borrow_mut(|input| {
                 input.pressed = 1;
                 input.target_allowed = false;
+                input.hold_active = true;
                 assert!(input.keyboard(0x4d, true, 1));
                 assert!(input.keyboard(0x4d, true, 2));
                 assert!(input.keyboard(0x4d, false, 3));

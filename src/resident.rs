@@ -100,11 +100,8 @@ impl App {
         Ok(())
     }
     fn notice(&mut self, text: &str) -> Result<(), String> {
-        self.hide = Some(later(self.cfg.duration));
         self.overlay.tip(text, &self.cfg)?;
-        if self.overlay.tip_scrollable() {
-            self.hide = None;
-        }
+        self.hide = (!self.overlay.tip_scrollable()).then(|| later(self.cfg.duration));
         Ok(())
     }
     fn status(&mut self, kind: &str) -> Result<(), String> {
@@ -1291,6 +1288,7 @@ mod tests {
             .unwrap();
         let mut doc = config::help().parse::<toml_edit::DocumentMut>().unwrap();
         doc["tip"]["duration_ms"] = toml_edit::value(900);
+        doc["general"]["alt_hold_ms"] = toml_edit::value(200);
         doc["shortcuts"]["resize_enabled"] = toml_edit::value(false);
         let cfg = Config::parse(&doc).unwrap();
         let overlay = Overlay::new().unwrap();
@@ -1426,8 +1424,9 @@ mod tests {
                     started.elapsed().as_millis()
                 );
                 assert!(
-                    started.elapsed() < Duration::from_millis(450),
-                    "Alt preview was delayed"
+                    (Duration::from_millis(180)..Duration::from_millis(450))
+                        .contains(&started.elapsed()),
+                    "Alt preview did not respect the configured hold delay"
                 );
                 key(VK_LMENU, false);
                 visible(&observed, false)?;

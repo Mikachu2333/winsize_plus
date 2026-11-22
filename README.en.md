@@ -8,7 +8,7 @@ A Windows window positioning and resizing tool with Alt shortcuts, mouse gesture
 
 Run `winsizep.exe` and open Settings from the tray menu. Changes are saved and applied automatically. You can also edit `winsizep_config.toml` beside the executable. Keep the program in a directory you can write to.
 
-Left Alt is the default: hold Alt with a key, or double-tap Alt, release it, then press a key. Region previews and tips stay visible for 3 seconds by default; releasing held Alt closes them earlier.
+Left Alt is the default: hold it for 2 seconds to show the tip and activate keyboard and mouse actions, then press a key. You can also double-tap Alt, release it, then press a key. Set the delay on the General page (`general.alt_hold_ms`, 0–60000 ms; 0 activates immediately). Combinations entered before activation go to the application and cancel that hold's activation. Region previews and tips stay visible for 3 seconds from when they appear; releasing held Alt closes them earlier. General → Open configuration file opens `winsizep_config.toml` in `notepad.exe`.
 
 | Default input | Action |
 | --- | --- |
@@ -35,6 +35,7 @@ Mouse actions target the foreground window selected when Alt was pressed. Settin
 - Help and scrollable long tips remain visible until dismissed with Esc.
 - Configure automatic startup and administrator privileges in Settings. Controlling an elevated window requires matching privileges.
 - To include an excluded window again, remove its `[[exclusions]]` entry from the configuration.
+- Windows 10 and 11 system tray overflow menus are excluded by default. All nonempty fields within a rule must match; any matching rule excludes a window, so multiple classes in the same process can be excluded together.
 
 ## Regions and configuration
 

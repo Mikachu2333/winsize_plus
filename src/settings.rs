@@ -596,7 +596,10 @@ impl Editor {
             let kind = row.field.kind.clone();
             let label = row.field.label.clone();
             let hint = row.field.hint.clone();
-            if !matches!(kind, Kind::Bool | Kind::Preview | Kind::Add) {
+            if !matches!(
+                kind,
+                Kind::Bool | Kind::Preview | Kind::Add | Kind::OpenConfig
+            ) {
                 self.control(&mut row, index, 1, "STATIC", &label, SS_LEFT)?;
             }
             self.control(&mut row, index, 2, "STATIC", &hint, SS_LEFT)?;
@@ -838,7 +841,7 @@ impl Editor {
                         (self.font.height() + self.s(8)) as isize,
                     );
                 }
-                Kind::Add => self.control(
+                Kind::Add | Kind::OpenConfig => self.control(
                     &mut row,
                     index,
                     0,
@@ -1048,7 +1051,7 @@ impl Editor {
                         row.c(0),
                         padding,
                         y - self.scroll[1],
-                        if row.field.key == "duration_ms" {
+                        if row.field.key.ends_with("_ms") {
                             (number_width + self.s(20)).min(width)
                         } else {
                             number_width
@@ -1057,7 +1060,7 @@ impl Editor {
                     );
                     y += h;
                 }
-                Kind::Add => {
+                Kind::Add | Kind::OpenConfig => {
                     place(row.c(0), padding, y - self.scroll[1], combo_width, h);
                     y += h;
                 }
@@ -1768,6 +1771,24 @@ impl Editor {
         }
         let kind = row.field.kind.clone();
         match kind {
+            Kind::OpenConfig if event == BN_CLICKED => {
+                self.save()?;
+                return Command::new("notepad.exe")
+                    .arg(&self.path)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .map(|_| ())
+                    .map_err(|error| {
+                        format!(
+                            "{}: {error}",
+                            self.cfg
+                                .tr("Could not open configuration file", "无法打开配置文件")
+                        )
+                    });
+            }
+            Kind::OpenConfig => return Ok(()),
             Kind::Preview if event == BN_CLICKED => {
                 self.live = send(row.c(0), BM_GETCHECK, 0, 0) == 1;
                 return self.render();

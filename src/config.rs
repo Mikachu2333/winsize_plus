@@ -72,6 +72,7 @@ pub struct Config {
     pub alt: String,
     pub gesture: String,
     pub double_ms: u32,
+    pub alt_hold_ms: u32,
     pub elevate: bool,
     pub autostart: bool,
     pub preview: bool,
@@ -160,6 +161,11 @@ fn merge(table: &mut Table, defaults: &Table, named: bool) -> bool {
     }
     let mut changed = false;
     for (key, item) in defaults {
+        // Exclusions are user-managed lists. Defaults belong in newly created
+        // files; restoring a deleted list would prevent users from allowing windows.
+        if item.is_array_of_tables() {
+            continue;
+        }
         if let Some(existing) = table.get_mut(key) {
             if let (Some(child), Some(default)) = (existing.as_table_mut(), item.as_table()) {
                 changed |= merge(
@@ -843,6 +849,7 @@ impl Config {
             elevate: boolean("general", "elevate")?,
             autostart: boolean("general", "autostart")?,
             preview: boolean("general", "preview")?,
+            alt_hold_ms: number("general", "alt_hold_ms", 0, 60000)? as u32,
             show: choice("tip", "show", &["off", "time", "monitor", "window"])?,
             duration: number("tip", "duration_ms", 100, 120000)? as u32,
             theme: choice("tip", "theme", &["system", "dark", "light"])?,
@@ -1169,7 +1176,7 @@ fn recover(doc: &mut DocumentMut) -> Result<Config, String> {
     let mut warnings = Vec::new();
     // Fixed sections have schemas; user maps are preserved, including intentional deletions.
     for (key, default) in defaults.as_table() {
-        if doc.get(key).is_some_and(|v| !v.is_table()) {
+        if default.is_table() && doc.get(key).is_some_and(|v| !v.is_table()) {
             doc[key] = default.clone();
             warnings.push(key.to_owned());
         }
@@ -1487,6 +1494,66 @@ pub fn load_snapshot(path: &Path, edit: Option<(&Identity, Switch)>) -> Result<L
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn alt_hold_delay_defaults_migrates_and_validates() {
+        let mut doc = help().parse::<DocumentMut>().unwrap();
+        assert_eq!(Config::parse(&doc).unwrap().alt_hold_ms, 2000);
+        doc["general"].as_table_mut().unwrap().remove("alt_hold_ms");
+        let cfg = recover(&mut doc).unwrap();
+        assert_eq!(cfg.alt_hold_ms, 2000);
+        assert!(cfg.warnings.is_empty());
+        for delay in [0, 750, 60000] {
+            doc["general"]["alt_hold_ms"] = value(delay);
+            assert_eq!(Config::parse(&doc).unwrap().alt_hold_ms, delay as u32);
+        }
+        for delay in [-1, 60001] {
+            doc["general"]["alt_hold_ms"] = value(delay);
+            assert!(Config::parse(&doc).is_err());
+            assert_eq!(recover(&mut doc).unwrap().alt_hold_ms, 2000);
+        }
+    }
+    #[test]
+    fn both_system_tray_classes_are_excluded_without_excluding_explorer_windows() {
+        let cfg = Config::parse(&help().parse().unwrap()).unwrap();
+        for class in [
+            "TopLevelWindowForOverflowXamlIsland",
+            "NotifyIconOverflowWindow",
+        ] {
+            let window = Identity {
+                name: "EXPLORER.EXE".into(),
+                class: class.into(),
+                title: "Any tray menu title".into(),
+            };
+            assert!(
+                cfg.exclusions.iter().any(|rule| rule.matches(&window)),
+                "{class}"
+            );
+            let other_process = Identity {
+                name: "other.exe".into(),
+                ..window
+            };
+            assert!(
+                !cfg.exclusions
+                    .iter()
+                    .any(|rule| rule.matches(&other_process))
+            );
+        }
+        let file_explorer = Identity {
+            name: "explorer.exe".into(),
+            class: "CabinetWClass".into(),
+            title: String::new(),
+        };
+        assert!(
+            !cfg.exclusions
+                .iter()
+                .any(|rule| rule.matches(&file_explorer))
+        );
+        let mut doc = help().parse::<DocumentMut>().unwrap();
+        doc.as_table_mut().remove("exclusions");
+        assert!(recover(&mut doc).unwrap().exclusions.is_empty());
+        doc["exclusions"] = Item::ArrayOfTables(ArrayOfTables::new());
+        assert!(recover(&mut doc).unwrap().exclusions.is_empty());
+    }
     #[test]
     fn obsolete_fade_settings_do_not_override_shared_timing() {
         let mut doc = help().parse::<DocumentMut>().unwrap();
@@ -2087,7 +2154,7 @@ mod tests {
         assert!(saved.contains("# 保留用户说明"));
         assert!(saved.contains("'before\tafter'"));
         assert_eq!(
-            load(&path, None).unwrap().exclusions[0].title,
+            load(&path, None).unwrap().exclusions.last().unwrap().title,
             "before\tafter"
         );
         fs::remove_file(path).unwrap();
