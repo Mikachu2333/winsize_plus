@@ -1401,6 +1401,58 @@ impl Drop for Hooks {
 #[cfg(test)]
 pub(super) mod tests {
     #[test]
+    fn center_click_runs_once_and_consumes_release_after_alt_is_released() {
+        use super::*;
+        let _hooks = Hooks::escape_only().unwrap();
+        on_hook(|| {
+            INPUT.with_borrow_mut(|input| {
+                input.hold_active = true;
+                input.pressed = 1;
+                input.target_allowed = true;
+                input.gesture_mask = 1;
+                input.alt_mask = 1;
+                input.center_button = Some(4);
+            });
+            let data = MSLLHOOKSTRUCT {
+                pt: POINT { x: -900, y: 250 },
+                time: 1000,
+                ..Default::default()
+            };
+            assert_eq!(
+                unsafe {
+                    mouse(
+                        HC_ACTION as i32,
+                        WM_MBUTTONDOWN as usize,
+                        (&data as *const MSLLHOOKSTRUCT) as isize,
+                    )
+                },
+                1
+            );
+            INPUT.with_borrow_mut(|input| {
+                input.keyboard(LEFT, false, 1001);
+            });
+            assert_eq!(
+                unsafe {
+                    mouse(
+                        HC_ACTION as i32,
+                        WM_MBUTTONUP as usize,
+                        (&data as *const MSLLHOOKSTRUCT) as isize,
+                    )
+                },
+                1
+            );
+            INPUT.with_borrow(|input| {
+                assert!(input.centered_button.is_none() && input.drag.is_none())
+            });
+        })
+        .unwrap();
+        assert_eq!(next_event().unwrap().message, CENTER);
+        assert_eq!((click_point().x, click_point().y), (-900, 250));
+        assert_eq!(next_event().unwrap().message, ALT_RELEASE);
+        assert!(next_event().is_none());
+    }
+
+    #[test]
     fn pause_removes_hooks_and_pending_gestures_then_restores_capture() {
         use super::*;
         let cfg = crate::test_support::cfg();

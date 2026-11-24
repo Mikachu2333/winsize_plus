@@ -33,7 +33,6 @@ fn edges(rect: Rect) -> [Rect; 4] {
             y: rect.y + width,
             width: right,
             height: middle,
-            ..rect
         },
     ]
 }

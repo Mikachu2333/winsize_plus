@@ -1314,6 +1314,34 @@ mod multi_monitor_regressions {
     }
 
     #[test]
+    #[ignore = "requires two monitors with different DPI and temporary target windows"]
+    fn center_scales_on_real_mixed_dpi_monitors() {
+        let _dpi = Dpi::new();
+        let Some(displays) = crate::test_support::require_displays(true) else {
+            return;
+        };
+        let low = &displays.first().unwrap().1;
+        let high = &displays.last().unwrap().1;
+        for (source, destination) in [(low, high), (high, low)] {
+            let (handle, worker, _) = target(source, 0);
+            let hwnd = handle as HWND;
+            let wanted = centered_rect(bounds(hwnd).unwrap().1, source.dpi, destination);
+            let result = center_window(hwnd, &crate::test_support::cfg(), point(destination));
+            let actual = bounds(hwnd).unwrap().1;
+            unsafe {
+                PostMessageW(hwnd, WM_CLOSE, 0, 0);
+            }
+            worker.join().unwrap();
+            println!(
+                "center dpi {} -> {}, expected={wanted:?}, actual={actual:?}, result={result:?}",
+                source.dpi, destination.dpi
+            );
+            result.unwrap();
+            assert_eq!(actual, wanted);
+        }
+    }
+
+    #[test]
     #[ignore = "requires an interactive desktop; some cases need mixed DPI monitors"]
     fn position_corrects_immediate_cross_dpi_target() {
         let Some((result, wanted, actual, _)) = probe(0, false) else {
