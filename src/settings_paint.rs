@@ -46,6 +46,10 @@ pub fn draw(root: HWND, draw: &DRAWITEMSTRUCT) {
                     COLOR_WINDOWTEXT
                 }),
             );
+            if !selected {
+                FillRect(dc, &rect, crate::settings_theme::control());
+                SetTextColor(dc, crate::settings_theme::text());
+            }
             if draw.itemID != u32::MAX {
                 let (get_length, get_text) = if draw.CtlType == ODT_LISTBOX {
                     (LB_GETTEXTLEN, LB_GETTEXT)
@@ -93,7 +97,7 @@ pub fn draw(root: HWND, draw: &DRAWITEMSTRUCT) {
             }
         } else if (100..100 + crate::settings_schema::TABS.len() as u32).contains(&draw.CtlID) {
             let selected = GetPropW(draw.hwndItem, w!("SelectedTab")) as usize != 0;
-            FillRect(dc, &rect, GetSysColorBrush(COLOR_WINDOW));
+            FillRect(dc, &rect, crate::settings_theme::surface());
             SelectObject(dc, GetStockObject(DC_BRUSH));
             SelectObject(dc, GetStockObject(NULL_PEN));
             SetDCBrushColor(
@@ -104,6 +108,16 @@ pub fn draw(root: HWND, draw: &DRAWITEMSTRUCT) {
                     COLOR_BTNFACE
                 }),
             );
+            if !selected {
+                SetDCBrushColor(
+                    dc,
+                    if crate::settings_theme::dark() {
+                        0x303030
+                    } else {
+                        0xf5f5f5
+                    },
+                );
+            }
             RoundRect(
                 dc,
                 rect.left,
@@ -121,6 +135,9 @@ pub fn draw(root: HWND, draw: &DRAWITEMSTRUCT) {
                     COLOR_BTNTEXT
                 }),
             );
+            if !selected {
+                SetTextColor(dc, crate::settings_theme::text());
+            }
             let label = text(draw.hwndItem);
             rect.left += scale(16);
             rect.right -= scale(16);
@@ -198,6 +215,7 @@ pub fn draw(root: HWND, draw: &DRAWITEMSTRUCT) {
                 &mut rect,
                 DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
             );
+            FrameRect(dc, &draw.rcItem, crate::settings_theme::edge());
         }
         RestoreDC(dc, saved);
         SelectObject(dc, old);

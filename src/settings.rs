@@ -448,6 +448,15 @@ impl Editor {
             height,
         );
         unsafe {
+            SetWindowPos(
+                self.status,
+                HWND_TOP,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
             ShowWindow(self.status, SW_SHOWNOACTIVATE);
             InvalidateRect(self.status, null(), 1);
         }
@@ -490,6 +499,7 @@ impl Editor {
             return Err(err());
         }
         let control = Window(hwnd);
+        crate::settings_theme::apply(hwnd);
         send(hwnd, WM_SETFONT, self.font.0 as usize, 0);
         unsafe {
             desktop::check(SetWindowSubclass(
@@ -2310,24 +2320,19 @@ unsafe extern "system" fn pane_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: LP
                 );
                 0
             }
-            WM_CTLCOLORSTATIC => {
+            WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORBTN => {
                 let id = GetDlgCtrlID(lp as HWND);
                 let hint = id >= BASE && (id - BASE) % STRIDE == 2;
-                SetTextColor(
+                crate::settings_theme::color(
                     wp as HDC,
-                    if hint {
-                        crate::colors::secondary_text()
-                    } else {
-                        GetSysColor(COLOR_WINDOWTEXT)
-                    },
-                );
-                SetBkMode(wp as HDC, TRANSPARENT as i32);
-                GetSysColorBrush(COLOR_WINDOW) as isize
+                    hint,
+                    matches!(message, WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX),
+                )
             }
             WM_ERASEBKGND => {
                 let mut rect = RECT::default();
                 GetClientRect(hwnd, &mut rect);
-                FillRect(wp as HDC, &rect, GetSysColorBrush(COLOR_WINDOW));
+                FillRect(wp as HDC, &rect, crate::settings_theme::surface());
                 1
             }
             WM_PAINT if GetDlgCtrlID(hwnd) == 1 => {
@@ -2336,7 +2341,7 @@ unsafe extern "system" fn pane_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: LP
                 let mut rect = RECT::default();
                 GetClientRect(hwnd, &mut rect);
                 rect.left = (rect.right - 1).max(0);
-                FillRect(dc, &rect, GetSysColorBrush(COLOR_3DSHADOW));
+                FillRect(dc, &rect, crate::settings_theme::edge());
                 EndPaint(hwnd, &paint);
                 0
             }
@@ -2403,7 +2408,27 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
             }
             0
         }
-        WM_DPICHANGED | WM_SETTINGCHANGE => {
+        WM_DPICHANGED | WM_SETTINGCHANGE | WM_THEMECHANGED | WM_SYSCOLORCHANGE => {
+            crate::settings_theme::refresh();
+            crate::settings_theme::apply(hwnd);
+            unsafe {
+                let mut child = GetWindow(hwnd, GW_CHILD);
+                while !child.is_null() {
+                    crate::settings_theme::apply(child);
+                    let mut control = GetWindow(child, GW_CHILD);
+                    while !control.is_null() {
+                        crate::settings_theme::apply(control);
+                        control = GetWindow(control, GW_HWNDNEXT);
+                    }
+                    child = GetWindow(child, GW_HWNDNEXT);
+                }
+                RedrawWindow(
+                    hwnd,
+                    null(),
+                    null_mut(),
+                    RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_FRAME,
+                );
+            }
             input::display_changed();
             with_editor(|e| {
                 e.dpi = unsafe { GetDpiForWindow(hwnd) }.max(96) as i32;
@@ -2484,10 +2509,13 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
             0
         }
         WM_CTLCOLORSTATIC => unsafe {
-            SetBkMode(wp as HDC, TRANSPARENT as i32);
-            SetTextColor(wp as HDC, GetSysColor(COLOR_WINDOWTEXT));
-            // The label has no visible background, but its previous glyphs must be cleared.
-            GetSysColorBrush(COLOR_WINDOW) as isize
+            crate::settings_theme::color(wp as HDC, false, GetDlgCtrlID(lp as HWND) == 600)
+        },
+        WM_ERASEBKGND => unsafe {
+            let mut rect = RECT::default();
+            GetClientRect(hwnd, &mut rect);
+            FillRect(wp as HDC, &rect, crate::settings_theme::surface());
+            1
         },
         WM_TIMER => {
             with_editor(|e| e.tick());
@@ -2644,7 +2672,7 @@ pub fn run(path: &Path) -> Result<(), String> {
                 hInstance: GetModuleHandleW(null()),
                 hCursor: LoadCursorW(null_mut(), IDC_ARROW),
                 hIcon: LoadIconW(GetModuleHandleW(null()), crate::tray::APP_ICON),
-                hbrBackground: GetSysColorBrush(COLOR_WINDOW),
+                hbrBackground: null_mut(),
                 lpszClassName: name,
                 ..Default::default()
             };
@@ -2672,6 +2700,8 @@ pub fn run(path: &Path) -> Result<(), String> {
             return Err(err());
         }
         let window = Window(hwnd);
+        crate::settings_theme::refresh();
+        crate::settings_theme::apply(hwnd);
         desktop::check(SetPropW(hwnd, w!("PreviewSuspended"), 1usize as HANDLE))?;
         // Settings may retain an elevated token after the resident is restarted normally.
         // Only this payload-free lifecycle message is allowed across that boundary.
@@ -2711,6 +2741,7 @@ pub fn run(path: &Path) -> Result<(), String> {
             if pane.is_null() {
                 return Err(err());
             }
+            crate::settings_theme::apply(*pane);
         }
         let mut editor = Editor {
             cast: crate::cast::Visuals::new(),
@@ -2755,7 +2786,7 @@ pub fn run(path: &Path) -> Result<(), String> {
                 TAB_BASE + index as i32,
             )?);
         }
-        editor.status = editor.create(hwnd, "STATIC", "", SS_LEFT, 600)?;
+        editor.status = editor.create(hwnd, "STATIC", "", SS_LEFT | WS_BORDER, 600)?;
         editor.axis_controls[0] = editor.create(
             panes[1],
             "BUTTON",

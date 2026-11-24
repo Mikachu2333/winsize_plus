@@ -1,5 +1,5 @@
 //! Default Fluent neutrals and native Windows selection colors.
-use windows_sys::Win32::Graphics::Gdi::{COLOR_WINDOW, COLOR_WINDOWTEXT, GetSysColor};
+use windows_sys::Win32::Graphics::Gdi::GetSysColor;
 
 pub const TEXT_SECONDARY_LIGHT: u32 = 0x616161;
 pub const TEXT_SECONDARY_DARK: u32 = 0xadadad;
@@ -21,20 +21,6 @@ pub fn accent() -> u32 {
         colorref(argb & 0x00ff_ffff)
     } else {
         unsafe { GetSysColor(windows_sys::Win32::Graphics::Gdi::COLOR_HIGHLIGHT) }
-    }
-}
-
-pub fn secondary_text() -> u32 {
-    let background = unsafe { GetSysColor(COLOR_WINDOW) };
-    let candidate = if luminance(background) < 0.5 {
-        TEXT_SECONDARY_DARK
-    } else {
-        TEXT_SECONDARY_LIGHT
-    };
-    if contrast(candidate, background) >= 4.5 {
-        candidate
-    } else {
-        unsafe { GetSysColor(COLOR_WINDOWTEXT) }
     }
 }
 
