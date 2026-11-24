@@ -49,14 +49,14 @@ fps = 30 # Integer, clamped to 24..1000.
 
 [horizontal]
 width = 2
-color = "#C80000"
-opacity = 200
+color = "#FFFF3C"
+opacity = 204
 gap = 12
 
 [vertical]
 width = 2
-color = "#C80000"
-opacity = 200
+color = "#FFFF3C"
+opacity = 204
 gap = 12
 
 [mousecast]
