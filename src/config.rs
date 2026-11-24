@@ -1641,10 +1641,10 @@ mod tests {
     #[test]
     fn alt_hold_delay_defaults_migrates_and_validates() {
         let mut doc = help().parse::<DocumentMut>().unwrap();
-        assert_eq!(Config::parse(&doc).unwrap().alt_hold_ms, 2000);
+        assert_eq!(Config::parse(&doc).unwrap().alt_hold_ms, 1500);
         doc["general"].as_table_mut().unwrap().remove("alt_hold_ms");
         let cfg = recover(&mut doc).unwrap();
-        assert_eq!(cfg.alt_hold_ms, 2000);
+        assert_eq!(cfg.alt_hold_ms, 1500);
         assert!(cfg.warnings.is_empty());
         for delay in [0, 750, 60000] {
             doc["general"]["alt_hold_ms"] = value(delay);
@@ -1653,7 +1653,7 @@ mod tests {
         for delay in [-1, 60001] {
             doc["general"]["alt_hold_ms"] = value(delay);
             assert!(Config::parse(&doc).is_err());
-            assert_eq!(recover(&mut doc).unwrap().alt_hold_ms, 2000);
+            assert_eq!(recover(&mut doc).unwrap().alt_hold_ms, 1500);
         }
     }
     #[test]

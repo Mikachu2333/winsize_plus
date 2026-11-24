@@ -1057,7 +1057,12 @@ pub fn configure(cfg: &Config) -> Result<(), String> {
     let (alt, gesture, hold_ms, exclusions, move_button, resize_button, double_ms) = (
         mask(&cfg.alt),
         mask(&cfg.gesture),
-        cfg.alt_hold_ms,
+        // Compensate activation latency only for configured holds longer than one second.
+        if cfg.alt_hold_ms > 1000 {
+            cfg.alt_hold_ms - 250
+        } else {
+            cfg.alt_hold_ms
+        },
         cfg.exclusions.clone(),
         cfg.move_button,
         cfg.resize_button,
@@ -1400,6 +1405,30 @@ impl Drop for Hooks {
 
 #[cfg(test)]
 pub(super) mod tests {
+    #[test]
+    fn configured_hold_delay_keeps_the_saved_value_and_handles_boundaries() {
+        use super::*;
+        let _hooks = Hooks::escape_only().unwrap();
+        let mut cfg = crate::test_support::cfg();
+        assert_eq!(cfg.alt_hold_ms, 1500);
+        for (saved, expected) in [
+            (0, 0),
+            (750, 750),
+            (1000, 1000),
+            (1001, 751),
+            (1500, 1250),
+            (60000, 59750),
+        ] {
+            cfg.alt_hold_ms = saved;
+            configure(&cfg).unwrap();
+            assert_eq!(
+                on_hook(|| INPUT.with_borrow(|input| input.hold_ms)).unwrap(),
+                expected
+            );
+            assert_eq!(cfg.alt_hold_ms, saved);
+        }
+    }
+
     #[test]
     fn center_click_runs_once_and_consumes_release_after_alt_is_released() {
         use super::*;

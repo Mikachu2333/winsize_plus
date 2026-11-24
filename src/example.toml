@@ -5,7 +5,7 @@ elevate = false
 autostart = false
 preview = true
 target_marker = true # Fixed translucent yellow 4 px frame around the captured target.
-alt_hold_ms = 2000 # Hold Alt before capturing input; 0 activates immediately.
+alt_hold_ms = 1500 # Hold Alt before capturing input; 0 activates immediately.
 
 [shortcuts]
 alt = "left"

@@ -257,8 +257,8 @@ fn describe(section: &str, key: &str) -> (&'static str, &'static str, &'static s
         ("general", "alt_hold_ms") => (
             "Alt hold delay (milliseconds)",
             "Alt 长按延迟（毫秒）",
-            "0–60000; default 2000. Keyboard and mouse actions activate after this delay. Earlier combinations go to the application and cancel activation until Alt is released. Double-tap Alt activates directly.",
-            "0–60000，默认 2000。延迟结束后启用键盘和鼠标操作；提前输入组合键会交给应用，并取消本次长按触发。双击 Alt 可直接触发。",
+            "0–60000; default 1500. Keyboard and mouse actions activate after this delay. Earlier combinations go to the application and cancel activation until Alt is released. Double-tap Alt activates directly.",
+            "0–60000，默认 1500。延迟结束后启用键盘和鼠标操作；提前输入组合键会交给应用，并取消本次长按触发。双击 Alt 可直接触发。",
         ),
         ("shortcuts", "alt") => (
             "Alt key for shortcuts",
