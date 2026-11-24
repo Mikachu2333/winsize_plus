@@ -617,6 +617,38 @@ fn frame_position(wanted: Rect, outer: Rect, frame: Rect) -> Result<Rect, String
         height,
     })
 }
+fn centered_rect(frame: Rect, source_dpi: i32, destination: &Display) -> Rect {
+    let scale = |value: i32, limit: i32| {
+        ((i64::from(value) * i64::from(destination.dpi.max(1)) + i64::from(source_dpi.max(1)) / 2)
+            / i64::from(source_dpi.max(1)))
+        .clamp(1, i64::from(limit.max(1))) as i32
+    };
+    let width = scale(frame.width, destination.work.width);
+    let height = scale(frame.height, destination.work.height);
+    Rect {
+        x: destination.work.x + (destination.work.width - width) / 2,
+        y: destination.work.y + (destination.work.height - height) / 2,
+        width,
+        height,
+    }
+}
+fn center_window(hwnd: HWND, cfg: &Config, point: POINT) -> Result<(), String> {
+    let destination = screen(point, 0)?;
+    let source = display(unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) })?;
+    restore(hwnd)?;
+    let wanted = centered_rect(bounds(hwnd)?.1, source.dpi, &destination);
+    position(
+        hwnd,
+        &Request {
+            x: Some(wanted.x),
+            y: Some(wanted.y),
+            size: Some((wanted.width, wanted.height)),
+            ..Default::default()
+        },
+        cfg,
+        point,
+    )
+}
 fn set_frame(hwnd: HWND, wanted: Rect, outer: Rect, frame: Rect) -> Result<(), String> {
     let Rect {
         x,
@@ -708,7 +740,9 @@ pub fn apply(
     {
         return Err(cfg.tr("Excluded window", "窗口已排除").into());
     }
-    if req.geometry() {
+    if req.center {
+        center_window(hwnd, cfg, point)?;
+    } else if req.geometry() {
         position(hwnd, req, cfg, point)?
     }
     if let Some(mode) = req.top {
@@ -725,6 +759,89 @@ pub fn apply(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn centering_scales_dpi_and_clamps_only_oversized_edges() {
+        use super::*;
+        let destination = Display {
+            number: 2,
+            dpi: 144,
+            full: Rect {
+                x: -1920,
+                y: -1080,
+                width: 1920,
+                height: 1080,
+            },
+            work: Rect {
+                x: -1920,
+                y: -1080,
+                width: 1920,
+                height: 1040,
+            },
+        };
+        let frame = Rect {
+            x: 100,
+            y: 100,
+            width: 800,
+            height: 400,
+        };
+        assert_eq!(
+            centered_rect(frame, 96, &destination),
+            Rect {
+                x: -1560,
+                y: -860,
+                width: 1200,
+                height: 600
+            }
+        );
+        assert_eq!(
+            centered_rect(
+                Rect {
+                    width: 1600,
+                    ..frame
+                },
+                96,
+                &destination
+            ),
+            Rect {
+                x: -1920,
+                y: -860,
+                width: 1920,
+                height: 600
+            }
+        );
+        assert_eq!(
+            centered_rect(
+                Rect {
+                    width: 3000,
+                    height: 2000,
+                    ..frame
+                },
+                96,
+                &destination
+            ),
+            destination.work
+        );
+        assert_eq!(
+            centered_rect(
+                Rect {
+                    width: 1200,
+                    height: 600,
+                    ..frame
+                },
+                144,
+                &Display {
+                    dpi: 96,
+                    ..destination
+                }
+            ),
+            Rect {
+                x: -1360,
+                y: -760,
+                width: 800,
+                height: 400
+            }
+        );
+    }
     struct TopmostWindow {
         hwnd: super::HWND,
         stop: std::sync::mpsc::Sender<()>,

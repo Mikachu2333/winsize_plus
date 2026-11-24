@@ -32,11 +32,16 @@ pub struct Request {
     pub preset: Option<String>,
     pub top: Option<Switch>,
     pub ignore: Option<Switch>,
+    pub center: bool,
 }
 
 impl Request {
     pub fn geometry(&self) -> bool {
-        self.x.is_some() || self.y.is_some() || self.size.is_some() || self.preset.is_some()
+        self.center
+            || self.x.is_some()
+            || self.y.is_some()
+            || self.size.is_some()
+            || self.preset.is_some()
     }
 }
 
@@ -57,6 +62,7 @@ pub fn parse(args: &[String]) -> Result<Request, String> {
         }
         let bad = || format!("Invalid or missing value / 参数错误: {key}");
         match key {
+            "--center" => req.center = true,
             "--top" | "--ignore" => {
                 let switch = match args.front().copied() {
                     None => Switch::Toggle,

@@ -97,6 +97,7 @@ pub struct Config {
     pub highlight_opacity: u8,
     pub move_button: Option<u32>,
     pub resize_button: Option<u32>,
+    pub center_button: Option<u32>,
     pub warnings: Vec<String>,
     pub preset_names: HashMap<String, String>,
     pub lines: [Line; 2],
@@ -202,6 +203,7 @@ pub const ACTIONS: &[&str] = &[
     "borders",
     "mousecast",
     "keycast",
+    "centerwindow",
 ];
 pub const ALIASES: &[(&str, &str)] = &[
     ("ver", "version"),
@@ -436,6 +438,16 @@ impl Config {
             }
         }
         if self.gesture != "off" {
+            if self.center_button.is_some() {
+                mouse.push(format!(
+                    "Alt + {} = {}",
+                    button(self.center_button),
+                    self.tr(
+                        "center on pointer's monitor (DPI scaled, work-area clamped)",
+                        "在鼠标屏幕居中（DPI 换算并限制在工作区内）"
+                    )
+                ));
+            }
             mouse.push(
                 self.tr(
                     "Alt + right click = place by the 3×3 grid",
@@ -833,6 +845,26 @@ impl Config {
         };
         let crosshair_unified = choice("crosshair", "mode", &["unified", "custom"])? == "unified";
         let horizontal = line("horizontal")?;
+        let move_button = button("move")?;
+        let resize_button = button("resize")?;
+        let center_button = button("center")?;
+        let mut used_buttons = HashSet::new();
+        for (name, button) in [
+            ("move", move_button),
+            ("resize", resize_button),
+            ("center", center_button),
+        ] {
+            if let Some(button) = button
+                && !used_buttons.insert(button)
+            {
+                return Err(format!(
+                    "shortcuts.{name}_button: mouse button conflicts with another enabled action / 鼠标按键与另一已启用操作冲突"
+                ));
+            }
+        }
+        if center_button == Some(2) {
+            return Err("shortcuts.center_button: right click is reserved for the grid / 右键点击已用于九宫格".into());
+        }
         Ok(Self {
             mousecast: MouseStyle {
                 enabled: boolean("mousecast", "enabled")?,
@@ -882,8 +914,9 @@ impl Config {
             },
             outline_dark: color("outline", "dark_color")?,
             highlight_opacity: number("outline", "fill_opacity", 0, 255)? as u8,
-            move_button: button("move")?,
-            resize_button: button("resize")?,
+            move_button,
+            resize_button,
+            center_button,
             warnings: Vec::new(),
             preset_names,
             crosshair_unified,
@@ -1041,6 +1074,21 @@ fn document(text: &str) -> Result<(DocumentMut, bool), String> {
 }
 
 fn migrate(doc: &mut DocumentMut) -> Result<(), String> {
+    if let Some(shortcuts) = doc.get_mut("shortcuts").and_then(Item::as_table_mut)
+        && !shortcuts.contains_key("center_enabled")
+        && ["move", "resize"].iter().any(|name| {
+            shortcuts
+                .get(&format!("{name}_enabled"))
+                .and_then(Item::as_bool)
+                != Some(false)
+                && shortcuts
+                    .get(&format!("{name}_button"))
+                    .and_then(Item::as_str)
+                    .is_some_and(|v| v.eq_ignore_ascii_case("middle"))
+        })
+    {
+        shortcuts["center_enabled"] = value(false);
+    }
     if let Some(keys) = doc.get_mut("keycast").and_then(Item::as_table_mut) {
         // Fade timing is shared with mouse annotations rather than saved per profile.
         keys.remove("fade_ms");
@@ -1525,6 +1573,29 @@ mod tests {
         doc["crosshair"]["mode"] = value("unified");
         doc["vertical"]["width"] = value("unused");
         assert!(Config::parse(&doc).is_ok());
+    }
+    #[test]
+    fn enabled_mouse_actions_reject_duplicate_buttons_and_preserve_old_bindings() {
+        let mut doc = help().parse::<DocumentMut>().unwrap();
+        doc["shortcuts"]["move_button"] = value("middle");
+        assert!(Config::parse(&doc).err().unwrap().contains("conflicts"));
+        doc["shortcuts"]["center_enabled"] = value(false);
+        assert!(Config::parse(&doc).is_ok());
+        doc["shortcuts"]["resize_button"] = value("middle");
+        assert!(Config::parse(&doc).err().unwrap().contains("conflicts"));
+        doc["shortcuts"]["resize_button"] = value("right");
+        doc["shortcuts"]
+            .as_table_mut()
+            .unwrap()
+            .remove("center_enabled");
+        doc["shortcuts"]
+            .as_table_mut()
+            .unwrap()
+            .remove("center_button");
+        migrate(&mut doc).unwrap();
+        let cfg = recover(&mut doc).unwrap();
+        assert_eq!(cfg.move_button, Some(4));
+        assert_eq!(cfg.center_button, None);
     }
     #[test]
     fn alt_hold_delay_defaults_migrates_and_validates() {

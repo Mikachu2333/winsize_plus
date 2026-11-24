@@ -287,8 +287,14 @@ impl App {
                     self.notice(self.cfg.tr("Outlines shown", "框线已显示"))
                 }
             }
-            name if self.cfg.presets.contains_key(name) || matches!(name, "top" | "ignore") => {
+            name if self.cfg.presets.contains_key(name)
+                || matches!(name, "top" | "ignore" | "centerwindow") =>
+            {
                 let req = match name {
+                    "centerwindow" => Request {
+                        center: true,
+                        ..Default::default()
+                    },
                     "top" => Request {
                         top: Some(Switch::Toggle),
                         ..Default::default()
@@ -512,6 +518,20 @@ impl App {
                     )?
                 }
                 Ok(())
+            }
+            input::CENTER => {
+                self.close_preview()?;
+                self.clear();
+                desktop::apply(
+                    msg.wParam as HWND,
+                    &Request {
+                        center: true,
+                        ..Default::default()
+                    },
+                    &self.cfg,
+                    &self.path,
+                    input::click_point(),
+                )
             }
             input::GRID_SHOW => {
                 self.close_preview()?;

@@ -92,6 +92,7 @@ pub fn option(cfg: &Config, context: ChoiceContext, value: &str) -> String {
         (TipContent, "off") => ("No default tip", "不显示默认提示"),
         (Font, "systemfont") => ("System UI font", "系统默认 UI 字体"),
         (Action, "top") => ("Toggle always on top", "置顶 / 取消置顶"),
+        (Action, "centerwindow") => ("Center on pointer's monitor", "在鼠标所在屏幕居中"),
         (Action, "ignore") => ("Exclude window", "忽略窗口"),
         (Action, "help") => ("Show help", "显示帮助"),
         (Action, "version") => ("Show version", "显示版本"),
@@ -210,6 +211,18 @@ fn describe(section: &str, key: &str) -> (&'static str, &'static str, &'static s
         };
     }
     match (section, key) {
+        ("shortcuts", "center_enabled") => (
+            "Enable window centering",
+            "启用窗口居中",
+            "Alt + middle click centers on the pointer's monitor, scales for its DPI and clamps to its work area.",
+            "Alt + 中键点击：按目标屏幕 DPI 换算大小，超出工作区的边缩窄后居中。",
+        ),
+        ("shortcuts", "center_button") => (
+            "Center button",
+            "居中按键",
+            "Enabled mouse actions must use distinct buttons. Right click is reserved for the grid.",
+            "已启用的鼠标操作不可使用重复按键；右键点击用于九宫格。",
+        ),
         ("general", "language") => (
             "Interface language",
             "界面语言",
@@ -525,7 +538,7 @@ pub fn fields(tab: usize, axis: usize, cfg: &Config, doc: &DocumentMut) -> Vec<F
                     ("general", "language") => &["auto", "zh-CN", "en"],
                     ("shortcuts", "alt") => &["left", "right", "both"],
                     ("shortcuts", "gesture") => &["left", "right", "both", "off"],
-                    ("shortcuts", "move_button" | "resize_button") => {
+                    ("shortcuts", "move_button" | "resize_button" | "center_button") => {
                         &["left", "right", "middle", "x1", "x2"]
                     }
                     ("tip", "show") => &["window", "time", "monitor", "off"],

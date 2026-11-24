@@ -13,6 +13,8 @@ move_enabled = true
 move_button = "left"
 resize_enabled = true
 resize_button = "right"
+center_enabled = true
+center_button = "middle"
 
 [tip]
 show = "window"

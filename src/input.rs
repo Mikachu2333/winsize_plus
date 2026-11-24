@@ -36,6 +36,7 @@ pub const TIP_SCROLL: u32 = WM_APP + 13;
 pub const CAST_KEY: u32 = WM_APP + 14;
 pub const CAST_MOUSE: u32 = WM_APP + 15;
 pub const RECOVERED: u32 = WM_APP + 16;
+pub const CENTER: u32 = WM_APP + 17;
 pub fn display_changed() {
     desktop::invalidate_displays();
     post(DISPLAY_CHANGED, 0, 0);
@@ -81,6 +82,8 @@ struct Input {
     exclusions: Vec<Identity>,
     move_button: Option<u32>,
     resize_button: Option<u32>,
+    center_button: Option<u32>,
+    centered_button: Option<u32>,
     cast_mouse: bool,
     cast_buttons: u32,
     cast_wheel_time: Option<u32>,
@@ -364,6 +367,7 @@ impl Input {
         self.target_allowed = false;
         self.gesture_target = null_mut();
         self.drag = None;
+        self.centered_button = None;
         self.queued = false;
         self.cast_buttons = 0;
         self.cast_wheel_time = None;
@@ -433,6 +437,7 @@ impl Input {
                 || self.cast_mouse
                 || self.preview_tracking
                 || self.drag.is_some()
+                || self.centered_button.is_some()
                 || (self.tip_scrollable && self.tip_window != 0)
                 || (self.target_allowed && self.pressed & self.gesture_mask != 0);
             if needed && self.mouse.is_null() {
@@ -799,6 +804,7 @@ unsafe extern "system" fn mouse(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
                         }
                         message if mouse_button(message, data.mouseData).is_some() => {
                             let (button, down) = mouse_button(message, data.mouseData).unwrap();
+                            if !down && input.centered_button == Some(button) { input.centered_button = None; let _ = input.update_mouse(); return true; }
                             if !down && input.drag.is_some_and(|drag| drag.button == button) {
                                 let drag = input.drag.take().unwrap();
                                 input.point = data.pt;
@@ -815,6 +821,11 @@ unsafe extern "system" fn mouse(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
                             input.tap = None;
                             input.last_tap = None;
                             if input.hold_active && input.target_allowed && input.pressed & input.gesture_mask != 0 && input.drag.is_none() {
+                                if input.center_button == Some(button) {
+                                    input.centered_button = Some(button);
+                                    post_event(CENTER, input.gesture_target as usize, 0, Some(data.pt));
+                                    return true;
+                                }
                                 let resize = input.resize_button == Some(button);
                                 let draggable = resize || input.move_button == Some(button);
                                 if draggable || button == 2 {
@@ -944,7 +955,7 @@ pub fn tip_scrollable(scrollable: bool, window: usize) {
 pub fn click_point() -> POINT {
     CURRENT
         .with(Cell::get)
-        .filter(|(kind, _)| *kind == CLICK)
+        .filter(|(kind, _)| matches!(*kind, CLICK | CENTER))
         .map(|(_, point)| point)
         .unwrap_or_default()
 }
@@ -1036,6 +1047,7 @@ pub fn track_preview(on: bool) -> Result<(), String> {
     })?
 }
 pub fn configure(cfg: &Config) -> Result<(), String> {
+    let center_button = cfg.center_button;
     let (alt, gesture, hold_ms, exclusions, move_button, resize_button, double_ms) = (
         mask(&cfg.alt),
         mask(&cfg.gesture),
@@ -1058,6 +1070,7 @@ pub fn configure(cfg: &Config) -> Result<(), String> {
             input.exclusions = exclusions;
             input.move_button = move_button;
             input.resize_button = resize_button;
+            input.center_button = center_button;
             input.double_ms = double_ms;
             input.command = [0; 4];
             input.bound = [0; 4];
