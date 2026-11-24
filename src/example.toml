@@ -113,6 +113,7 @@ Equal = "Cross"
 Backslash = "Vertical"
 M = "MouseCast"
 K = "KeyCast"
+F = "Fullscreen"
 Grave = "Command"
 H = "Help"
 

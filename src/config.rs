@@ -204,6 +204,7 @@ pub const ACTIONS: &[&str] = &[
     "mousecast",
     "keycast",
     "centerwindow",
+    "fullscreen",
 ];
 pub const ALIASES: &[(&str, &str)] = &[
     ("ver", "version"),
@@ -1074,6 +1075,21 @@ fn document(text: &str) -> Result<(DocumentMut, bool), String> {
 }
 
 fn migrate(doc: &mut DocumentMut) -> Result<(), String> {
+    if doc
+        .get("shortcuts")
+        .and_then(|v| v.get("center_button"))
+        .is_none()
+        && let Some(keys) = doc.get_mut("keys").and_then(Item::as_table_mut)
+        && !keys.is_empty()
+        && !keys.iter().any(|(key, item)| {
+            vk(key) == Some(0x46)
+                || item
+                    .as_str()
+                    .is_some_and(|v| v.eq_ignore_ascii_case("fullscreen"))
+        })
+    {
+        keys["F"] = value("Fullscreen");
+    }
     if let Some(shortcuts) = doc.get_mut("shortcuts").and_then(Item::as_table_mut)
         && !shortcuts.contains_key("center_enabled")
         && ["move", "resize"].iter().any(|name| {
@@ -1596,6 +1612,28 @@ mod tests {
         let cfg = recover(&mut doc).unwrap();
         assert_eq!(cfg.move_button, Some(4));
         assert_eq!(cfg.center_button, None);
+    }
+    #[test]
+    fn fullscreen_migration_preserves_f_bindings_and_runs_once() {
+        let mut doc = help().parse::<DocumentMut>().unwrap();
+        doc["shortcuts"]
+            .as_table_mut()
+            .unwrap()
+            .remove("center_button");
+        doc["keys"].as_table_mut().unwrap().remove("F");
+        migrate(&mut doc).unwrap();
+        assert_eq!(doc["keys"]["F"].as_str(), Some("Fullscreen"));
+        recover(&mut doc).unwrap();
+        doc["keys"].as_table_mut().unwrap().remove("F");
+        migrate(&mut doc).unwrap();
+        assert!(doc["keys"].get("F").is_none());
+        doc["shortcuts"]
+            .as_table_mut()
+            .unwrap()
+            .remove("center_button");
+        doc["keys"]["VK:46"] = value("");
+        migrate(&mut doc).unwrap();
+        assert!(doc["keys"].get("F").is_none());
     }
     #[test]
     fn alt_hold_delay_defaults_migrates_and_validates() {

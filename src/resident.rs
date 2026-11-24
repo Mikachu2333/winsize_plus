@@ -288,9 +288,13 @@ impl App {
                 }
             }
             name if self.cfg.presets.contains_key(name)
-                || matches!(name, "top" | "ignore" | "centerwindow") =>
+                || matches!(name, "top" | "ignore" | "centerwindow" | "fullscreen") =>
             {
                 let req = match name {
+                    "fullscreen" => Request {
+                        fullscreen: true,
+                        ..Default::default()
+                    },
                     "centerwindow" => Request {
                         center: true,
                         ..Default::default()

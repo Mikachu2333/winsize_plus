@@ -649,6 +649,48 @@ fn center_window(hwnd: HWND, cfg: &Config, point: POINT) -> Result<(), String> {
         point,
     )
 }
+fn fullscreen_window(hwnd: HWND, cfg: &Config, point: POINT) -> Result<(), String> {
+    use std::time::{Duration, Instant};
+    // SAFETY: only a payload-free system command is sent to the validated target.
+    unsafe {
+        if GetWindowLongW(hwnd, GWL_STYLE) as u32 & WS_MAXIMIZEBOX != 0 {
+            if IsZoomed(hwnd) != 0 {
+                return Ok(());
+            }
+            let mut result = 0;
+            if SendMessageTimeoutW(
+                hwnd,
+                WM_SYSCOMMAND,
+                SC_MAXIMIZE as usize,
+                0,
+                SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
+                250,
+                &mut result,
+            ) != 0
+            {
+                let deadline = Instant::now() + Duration::from_millis(250);
+                while Instant::now() < deadline {
+                    if IsZoomed(hwnd) != 0 {
+                        return Ok(());
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+    }
+    let work = screen(point, 0)?.work;
+    position(
+        hwnd,
+        &Request {
+            x: Some(work.x),
+            y: Some(work.y),
+            size: Some((work.width, work.height)),
+            ..Default::default()
+        },
+        cfg,
+        point,
+    )
+}
 fn set_frame(hwnd: HWND, wanted: Rect, outer: Rect, frame: Rect) -> Result<(), String> {
     let Rect {
         x,
@@ -740,7 +782,9 @@ pub fn apply(
     {
         return Err(cfg.tr("Excluded window", "窗口已排除").into());
     }
-    if req.center {
+    if req.fullscreen {
+        fullscreen_window(hwnd, cfg, point)?;
+    } else if req.center {
         center_window(hwnd, cfg, point)?;
     } else if req.geometry() {
         position(hwnd, req, cfg, point)?
@@ -941,6 +985,29 @@ mod tests {
             set_topmost(window.hwnd, Switch::Toggle).unwrap();
             assert!(!topmost(window.hwnd).unwrap());
         }
+    }
+    #[test]
+    #[ignore = "requires access to the interactive desktop and its work area"]
+    fn fullscreen_uses_maximize_or_work_area_fallback() {
+        use super::*;
+        let _dpi = crate::test_support::Dpi::new();
+        let cfg = crate::test_support::cfg();
+        let point = cursor().unwrap();
+        let target = TopmostWindow::new(false, std::time::Duration::ZERO);
+        fullscreen_window(target.hwnd, &cfg, point).unwrap();
+        assert_eq!(
+            bounds(target.hwnd).unwrap().1,
+            screen(point, 0).unwrap().work
+        );
+        unsafe {
+            SetWindowLongW(
+                target.hwnd,
+                GWL_STYLE,
+                (WS_OVERLAPPEDWINDOW | WS_VISIBLE) as i32,
+            );
+        }
+        fullscreen_window(target.hwnd, &cfg, point).unwrap();
+        assert_ne!(unsafe { IsZoomed(target.hwnd) }, 0);
     }
     #[test]
     fn topmost_does_not_report_success_when_the_target_stops_processing() {

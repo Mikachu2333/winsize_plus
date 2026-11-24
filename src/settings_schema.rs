@@ -93,6 +93,7 @@ pub fn option(cfg: &Config, context: ChoiceContext, value: &str) -> String {
         (Font, "systemfont") => ("System UI font", "系统默认 UI 字体"),
         (Action, "top") => ("Toggle always on top", "置顶 / 取消置顶"),
         (Action, "centerwindow") => ("Center on pointer's monitor", "在鼠标所在屏幕居中"),
+        (Action, "fullscreen") => ("Maximize window", "最大化窗口（不可用时填满工作区）"),
         (Action, "ignore") => ("Exclude window", "忽略窗口"),
         (Action, "help") => ("Show help", "显示帮助"),
         (Action, "version") => ("Show version", "显示版本"),
