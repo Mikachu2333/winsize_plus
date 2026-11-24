@@ -1491,48 +1491,71 @@ impl Editor {
         Ok(())
     }
     fn update_enabled_controls(&self) {
-        let field = |key: &str| {
+        let field = |section: &str, key: &str| {
             self.rows
                 .iter()
-                .find(|row| row.field.section == "shortcuts" && row.field.key == key)
+                .find(|row| row.field.section == section && row.field.key == key)
         };
-        let enabled = |key: &str| {
-            field(key).map_or_else(
-                || {
-                    self.doc
-                        .get("shortcuts")
-                        .and_then(|section| section.get(key))
-                        .and_then(Item::as_bool)
-                        .unwrap_or(true)
-                },
+        let saved =
+            |section: &str, key: &str| self.doc.get(section).and_then(|table| table.get(key));
+        // Prefer the visible control so dependants follow an edit before it is saved;
+        // switches on another page are read from the document.
+        let checked = |section: &str, key: &str| {
+            field(section, key).map_or_else(
+                || saved(section, key).and_then(Item::as_bool).unwrap_or(true),
                 |row| send(row.c(0), BM_GETCHECK, 0, 0) == 1,
             )
         };
-        let gestures = field("gesture").map_or_else(
-            || {
-                self.doc
-                    .get("shortcuts")
-                    .and_then(|section| section.get("gesture"))
-                    .and_then(Item::as_str)
-                    .unwrap_or("left")
-                    != "off"
-            },
-            |row| Self::selected_value(row, 0) != "off",
-        );
-        for (key, switch) in [
-            ("move_button", "move_enabled"),
-            ("resize_button", "resize_enabled"),
-            ("center_button", "center_enabled"),
+        let choice = |section: &str, key: &str, default: &str| {
+            field(section, key).map_or_else(
+                || {
+                    saved(section, key)
+                        .and_then(Item::as_str)
+                        .unwrap_or(default)
+                        .to_ascii_lowercase()
+                },
+                |row| Self::selected_value(row, 0),
+            )
+        };
+        let gestures = choice("shortcuts", "gesture", "left") != "off";
+        for (section, key, active) in [
+            (
+                "shortcuts",
+                "move_button",
+                gestures && checked("shortcuts", "move_enabled"),
+            ),
+            (
+                "shortcuts",
+                "resize_button",
+                gestures && checked("shortcuts", "resize_enabled"),
+            ),
+            (
+                "shortcuts",
+                "center_button",
+                gestures && checked("shortcuts", "center_enabled"),
+            ),
+            // The hold delay has nothing to wait for once both modifiers are off.
+            (
+                "general",
+                "alt_hold_ms",
+                gestures || choice("shortcuts", "alt", "left") != "off",
+            ),
+            // Only the window tip expands this format; the time format also serves a command.
+            (
+                "tip",
+                "window_format",
+                choice("tip", "show", "window") == "window",
+            ),
         ] {
-            if let Some(row) = field(key) {
-                let active = gestures && enabled(switch);
+            if let Some(row) = field(section, key) {
                 // SAFETY: these child HWNDs belong to the editor and stay alive for this call.
                 unsafe {
                     if (IsWindowEnabled(row.c(0)) != 0) != active {
-                        if !active {
+                        if !active && matches!(row.field.kind, Kind::Choice(_)) {
                             send(row.c(0), CB_SHOWDROPDOWN, 0, 0);
                         }
                         EnableWindow(row.c(0), i32::from(active));
+                        InvalidateRect(row.c(0), null(), 1);
                     }
                 }
             }
@@ -3561,6 +3584,37 @@ mod tests {
                     control_id("gesture") as usize | ((CBN_SELCHANGE as usize) << 16),
                     gesture as isize,
                 );
+                // The window format is editable only while the window tip is selected.
+                send(hwnd, WM_COMMAND, (TAB_BASE + 1) as usize, 0);
+                wait_tab(hwnd, 1)?;
+                let fields = schema::fields(1, 0, &Config::parse(&doc).unwrap(), &doc);
+                let tip_id = |key: &str| {
+                    BASE + fields
+                        .iter()
+                        .position(|field| field.section == "tip" && field.key == key)
+                        .unwrap() as i32
+                        * STRIDE
+                };
+                let show = unsafe { GetDlgItem(pane, tip_id("show")) };
+                let format = unsafe { GetDlgItem(pane, tip_id("window_format")) };
+                let selection = send(show, CB_GETCURSEL, 0, 0);
+                let text = caption(format);
+                for (index, expected) in [(1, false), (selection as usize, true)] {
+                    send(show, CB_SETCURSEL, index, 0);
+                    send(
+                        hwnd,
+                        WM_COMMAND,
+                        tip_id("show") as usize | ((CBN_SELCHANGE as usize) << 16),
+                        show as isize,
+                    );
+                    if (unsafe { IsWindowEnabled(format) } != 0) != expected
+                        || caption(format) != text
+                    {
+                        return Err(format!(
+                            "window_format enabled state or text is wrong for tip choice {index}"
+                        ));
+                    }
+                }
 
                 // Every preview pauses in the background and resumes with its checkbox intact.
                 let overlay_count = || unsafe {
