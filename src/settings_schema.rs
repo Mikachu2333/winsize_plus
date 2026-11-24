@@ -435,7 +435,7 @@ pub fn fields(tab: usize, axis: usize, cfg: &Config, doc: &DocumentMut) -> Vec<F
         1 => &["tip"],
         2 => &["presets", "regions"],
         3 => &["outline"],
-        4 => &["keys", "commands", "shortcuts"],
+        4 => &["shortcuts", "keys", "commands"],
         5 if axis != 1 => &["crosshair", "horizontal"],
         5 => &["crosshair", "vertical"],
         7 => &["mousecast"],
@@ -462,15 +462,27 @@ pub fn fields(tab: usize, axis: usize, cfg: &Config, doc: &DocumentMut) -> Vec<F
         fields.push(Field{section:String::new(),key:String::new(),label:cfg.tr("Filled mouse indicators","填色鼠标指示").into(),
             hint:cfg.tr("Left/right: two halves of a circle; middle: a small wheel rectangle; scrolling: directional triangles. Held buttons and continuous scrolling stay visible. Fade timing is fixed at about 0.5 seconds.","左右键拼成完整圆形，中键为靠上的小长方形，滚动为方向三角形。长按和连续滚动保持显示；淡入淡出固定约 0.5 秒，不可调。").into(),kind:Kind::Note});
     }
-    if tab == 4 {
-        fields.push(Field { section: String::new(), key: String::new(), label: cfg.tr("Built-in command aliases", "内置命令别名").into(), hint: "Version = Ver; Help = H; Quit = Exit; Restart = Reboot; Top = Pin; Ignore = Exclude; Monitor = Screen".into(), kind: Kind::Note });
-    }
     for section in sections {
         let Some(table) = doc.get(section).and_then(|item| item.as_table()) else {
             continue;
         };
         let mapping = matches!(*section, "presets" | "keys" | "commands" | "grid");
-        for (key, item) in table {
+        let mut entries: Vec<_> = table.iter().collect();
+        if *section == "shortcuts" {
+            let order = [
+                "move_enabled",
+                "move_button",
+                "resize_enabled",
+                "resize_button",
+                "center_enabled",
+                "center_button",
+                "gesture",
+                "alt",
+            ];
+            entries
+                .sort_by_key(|(key, _)| order.iter().position(|v| v == key).unwrap_or(order.len()));
+        }
+        for (key, item) in entries {
             if !mapping
                 && ((key == "opacity" && !matches!(*section, "outline" | "mousecast" | "keycast"))
                     || DEFAULTS
@@ -575,9 +587,22 @@ pub fn fields(tab: usize, axis: usize, cfg: &Config, doc: &DocumentMut) -> Vec<F
             });
         }
     }
+    if tab == 4 {
+        fields.push(Field { section: String::new(), key: String::new(), label: cfg.tr("Built-in command aliases", "内置命令别名").into(), hint: "Version = Ver; Help = H; Quit = Exit; Restart = Reboot; Top = Pin; Ignore = Exclude; Monitor = Screen".into(), kind: Kind::Note });
+    }
     fields
 }
 
+pub fn group(field: &Field) -> (&str, u8) {
+    let part = match field.key.as_str() {
+        "font" | "font_fallbacks" | "font_size" | "font_bold" | "font_italic" => 2,
+        "color" | "dark_color" | "background" | "foreground" | "dark_background"
+        | "dark_foreground" | "opacity" | "fill_opacity" => 1,
+        "alt" => 3,
+        _ => 0,
+    };
+    (&field.section, part)
+}
 pub fn actions(cfg: &Config, presets_only: bool) -> Vec<(String, String)> {
     let mut values: Vec<_> = cfg
         .preset_names

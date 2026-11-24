@@ -27,7 +27,9 @@ pub fn draw(root: HWND, draw: &DRAWITEMSTRUCT) {
         let old = SelectObject(dc, font);
         let saved = SaveDC(dc);
         SetBkMode(dc, TRANSPARENT as i32);
-        if matches!(draw.CtlType, ODT_COMBOBOX | ODT_LISTBOX) {
+        if !GetPropW(draw.hwndItem, w!("Separator")).is_null() {
+            FillRect(dc, &rect, crate::settings_theme::edge());
+        } else if matches!(draw.CtlType, ODT_COMBOBOX | ODT_LISTBOX) {
             let selected = draw.itemState & ODS_SELECTED != 0;
             FillRect(
                 dc,

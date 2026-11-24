@@ -53,6 +53,7 @@ const AXIS_V: i32 = 501;
 const AXIS_BOTH: i32 = 502;
 const SS_LEFT: u32 = 0;
 const SS_CENTER: u32 = 1;
+const SS_OWNERDRAW: u32 = 13;
 thread_local! { static EDITOR: RefCell<Option<Editor>> = const { RefCell::new(None) }; }
 thread_local! { static UPDATING: Cell<bool> = const { Cell::new(false) }; }
 thread_local! { static MEASUREMENTS: RefCell<HashMap<(usize,i32,String),i32>> = RefCell::new(HashMap::new()); }
@@ -610,6 +611,16 @@ impl Editor {
                 controls: [null_mut(); 16],
                 options: Vec::new(),
             };
+            if self
+                .rows
+                .last()
+                .is_some_and(|previous| schema::group(&previous.field) != schema::group(&row.field))
+            {
+                self.control(&mut row, index, 11, "STATIC", "", SS_OWNERDRAW)?;
+                unsafe {
+                    SetPropW(row.c(11), w!("Separator"), 1usize as HANDLE);
+                }
+            }
             let item = self
                 .doc
                 .get(&row.field.section)
@@ -937,6 +948,10 @@ impl Editor {
         let expression_width = (combo_width * 2).min(width);
         let mut y = padding;
         for row in &self.rows {
+            if !row.c(11).is_null() {
+                place(row.c(11), padding, y - self.scroll[1], width, 1);
+                y += self.s(12);
+            }
             let hint = if row.field.hint.is_empty() {
                 0
             } else {
