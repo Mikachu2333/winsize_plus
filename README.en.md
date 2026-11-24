@@ -15,6 +15,8 @@ Left Alt is the default: hold it for 2 seconds to show the tip and activate keyb
 | Alt + left drag | Move the window |
 | Alt + right drag | Resize from the top-left corner |
 | Alt + right click | Place the window using the grid cell under the pointer |
+| Alt + middle click | Center on the pointer's monitor, scaling for DPI and clamping oversized edges to the work area |
+| Alt + F | Maximize; when unavailable, fill the pointer monitor's work area |
 | Alt + Q/W/E, A/S/D, Z/X/C | Apply nine region presets; S centers the window |
 | Alt + P | Toggle always on top |
 | Alt + L | Toggle the crosshair |
@@ -24,13 +26,18 @@ Left Alt is the default: hold it for 2 seconds to show the tip and activate keyb
 | Alt + H | Show help with the current shortcuts |
 | Esc | Close tips, cancel an action, or reset a focused preview |
 
-Mouse actions target the foreground window selected when Alt was pressed. Settings let you choose the Alt side, mouse buttons, and shortcuts. Key names are case-insensitive and displayed consistently as `W`, `F12`, or `Insert`. Reserved system combinations cannot be bound.
+Mouse actions target the foreground window selected when Alt was pressed. Settings let you choose the Alt side, drag and centering buttons, and shortcuts. Enabled mouse actions must use distinct buttons. Centering can be disabled; its DPI scaling and work-area limits always apply. Key names are case-insensitive and displayed consistently as `W`, `F12`, or `Insert`. Reserved system combinations cannot be bound.
+
+The first tray item, Pause / Enable, controls all shortcut and input capture and shows one corresponding notice. Tray commands remain available while paused.
 
 ## Settings and previews
 
 - Add, remove, rename, and rebind regions. Previews center each region name above its current shortcuts, such as `FullTop` followed by `[ W ]` on the next line.
 - Hover over a grid cell for 2 seconds to preview its region. Move outside the region or press Esc to return to the grid.
 - Customize tips, outlines, fonts, crosshairs, and input annotations in Settings. Sample previews pause when Settings loses focus.
+- Settings follow the Windows light/dark theme. The sidebar scrolls with the wheel without a visible scrollbar, and status messages float at the bottom-left.
+- Crosshairs default to RGBA(255,255,60,204). Unified mode applies the horizontal style to both axes; Custom mode edits each axis separately and retains its saved parameters across mode changes.
+- Once Alt enters the waiting state, a fixed translucent pale-yellow 4 px frame marks the target from inside its edges. Clicks pass through, and the frame disappears when an action starts. It is enabled by default and can be disabled on General (`general.target_marker`).
 - Mouse and keyboard annotations start disabled and share a fixed 400 ms fade. Keyboard annotation display duration is adjustable.
 - Help and scrollable long tips remain visible until dismissed with Esc.
 - Configure automatic startup and administrator privileges in Settings. Controlling an elevated window requires matching privileges.
@@ -64,6 +71,8 @@ Region names support Unicode. Region and command names must not conflict with bu
 .\winsizep.exe --name notepad.exe --preset Center
 .\winsizep.exe --pid 123 --location 100,200 --size 900,600
 .\winsizep.exe --hwnd 0x1234 --top on
+.\winsizep.exe --name notepad.exe --center
+.\winsizep.exe --name notepad.exe --fullscreen
 .\winsizep.exe --settings
 .\winsizep.exe --check
 123, 456 | .\winsizep.exe --stdin --preset Center
