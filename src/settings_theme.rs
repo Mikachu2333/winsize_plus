@@ -3,7 +3,10 @@ use std::cell::RefCell;
 use windows_sys::Win32::{
     Foundation::HWND,
     Graphics::{Dwm::*, Gdi::*},
-    UI::Controls::SetWindowTheme,
+    UI::{
+        Controls::SetWindowTheme,
+        WindowsAndMessaging::{GetPropW, SetPropW},
+    },
 };
 use windows_sys::core::w;
 
@@ -72,6 +75,12 @@ pub fn edge() -> HBRUSH {
 pub fn apply(hwnd: HWND) {
     // SAFETY: Windows validates HWND, strings and the stack-owned attribute value.
     unsafe {
+        let state = usize::from(dark()) + 1;
+        if GetPropW(hwnd, w!("SettingsTheme")) as usize == state {
+            return;
+        }
+        // SetWindowTheme sends WM_THEMECHANGED synchronously. Publish before calling it.
+        SetPropW(hwnd, w!("SettingsTheme"), state as _);
         SetWindowTheme(
             hwnd,
             if dark() {

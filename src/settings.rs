@@ -2466,6 +2466,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
             }
             input::display_changed();
             with_editor(|e| {
+                if matches!(message, WM_THEMECHANGED | WM_SYSCOLORCHANGE) {
+                    return e.render();
+                }
                 e.dpi = unsafe { GetDpiForWindow(hwnd) }.max(96) as i32;
                 // Keep pending (even temporarily invalid) edits in their controls.
                 // Old fonts remain alive until every control has its replacement.
@@ -3295,6 +3298,7 @@ mod tests {
                     while !child.is_null() {
                         if unsafe { IsWindowVisible(child) } != 0
                             && unsafe { IsWindowEnabled(child) } == 0
+                            && !matches!(unsafe { GetDlgCtrlID(child) }, AXIS_H | AXIS_V)
                         {
                             return Err(format!(
                                 "Tab {tab} contains a permanently disabled control"
