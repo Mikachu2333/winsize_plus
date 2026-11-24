@@ -138,10 +138,13 @@ impl App {
         let snapshot = loaded.bytes;
         let sync_task =
             !automatic || (cfg.autostart, cfg.elevate) != (self.cfg.autostart, self.cfg.elevate);
-        let mut restart =
-            cfg.elevate != (unsafe { windows_sys::Win32::UI::Shell::IsUserAnAdmin() } != 0);
+        let current_elevation = unsafe { windows_sys::Win32::UI::Shell::IsUserAnAdmin() } != 0;
+        let lowering = current_elevation && !cfg.elevate;
+        let mut restart = cfg.elevate != current_elevation;
         let mut startup_error = None;
-        if sync_task && let Err(error) = crate::logon::sync(cfg.autostart, cfg.elevate) {
+        if (sync_task || lowering)
+            && let Err(error) = crate::logon::prepare(cfg.autostart, cfg.elevate, current_elevation)
+        {
             // Keep independent settings working when consent is canceled; retry startup on
             // the next explicit reload/edit instead of repeatedly prompting for UAC.
             cfg.autostart = self.cfg.autostart;
@@ -702,7 +705,11 @@ pub fn running() -> bool {
         true
     }
 }
-pub fn run(path: &Path, recovery: Option<&str>) -> Result<crate::ResidentExit, String> {
+pub fn run(
+    path: &Path,
+    recovery: Option<&str>,
+    reopen_settings: bool,
+) -> Result<crate::ResidentExit, String> {
     unsafe {
         let handle = CreateMutexW(null(), 0, w!("Local\\D5C9A59069D907909B153C76CEBDC023"));
         if handle.is_null() {
@@ -765,11 +772,19 @@ pub fn run(path: &Path, recovery: Option<&str>) -> Result<crate::ResidentExit, S
         }
         let mut msg = MSG::default();
         if let Some(problem) = recovery {
-            app.notice(problem)?;
+            // A failed handoff may have removed the old task before permissions changed.
+            if let Err(task_error) = crate::logon::sync(app.cfg.autostart, app.cfg.elevate) {
+                app.notice(&format!("{problem}\n{task_error}"))?;
+            } else {
+                app.notice(problem)?;
+            }
         } else if let Err(problem) = crate::logon::sync(app.cfg.autostart, app.cfg.elevate) {
             app.notice(&problem)?;
         } else if !app.cfg.warnings.is_empty() {
             app.config_notice()?;
+        }
+        if reopen_settings {
+            crate::settings::open()?;
         }
         loop {
             for _ in 0..64 {

@@ -9,6 +9,7 @@ mod fonts;
 mod framerate;
 mod input;
 mod label_text;
+mod launch;
 mod layout;
 mod logon;
 mod mouse_cast;
@@ -175,7 +176,21 @@ pub fn wait_process(process: HANDLE, timeout: std::time::Duration) -> Result<(),
     result
 }
 
-fn launch_unelevated() -> Result<(), String> {
+fn launch_unelevated(reopen_settings: bool) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|error| error.to_string())?;
+    let parameters = if reopen_settings {
+        "--resident --reopen-settings"
+    } else {
+        "--resident"
+    };
+    crate::launch::unelevated(&exe, parameters).or_else(|shell_error| {
+        launch_unelevated_token(parameters).map_err(|token_error| {
+            format!("Unelevated restart / 降权重启: {shell_error}; {token_error}")
+        })
+    })
+}
+
+fn launch_unelevated_token(parameters: &str) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|error| error.to_string())?;
     // Use the interactive shell's token so a permission change does not inherit this admin token.
     unsafe {
@@ -191,6 +206,23 @@ fn launch_unelevated() -> Result<(), String> {
         if ok == 0 {
             return Err(desktop::err());
         }
+        let mut elevation = TOKEN_ELEVATION::default();
+        let mut length = 0;
+        if GetTokenInformation(
+            token,
+            TokenElevation,
+            (&mut elevation as *mut TOKEN_ELEVATION).cast(),
+            size_of::<TOKEN_ELEVATION>() as u32,
+            &mut length,
+        ) == 0
+            || elevation.TokenIsElevated != 0
+        {
+            let error = desktop::err();
+            CloseHandle(token);
+            return Err(format!(
+                "Desktop shell has no usable normal token / 桌面外壳没有可用的普通权限令牌: {error}"
+            ));
+        }
         let mut primary = null_mut();
         let ok = DuplicateTokenEx(
             token,
@@ -205,7 +237,7 @@ fn launch_unelevated() -> Result<(), String> {
             return Err(desktop::err());
         }
         let mut command = desktop::wide(format!(
-            "{} --resident",
+            "{} {parameters}",
             quote_argument(&exe.to_string_lossy())
         ));
         let startup = STARTUPINFOW {
@@ -352,7 +384,10 @@ fn execute(args: &[String]) -> Result<(), String> {
     }
     let values: Vec<_> = args.iter().map(String::as_str).collect();
     #[cfg(not(debug_assertions))]
-    if !matches!(values.as_slice(), [] | ["--resident"] | ["--settings"]) {
+    if !matches!(
+        values.as_slice(),
+        [] | ["--resident"] | ["--resident", "--reopen-settings"] | ["--settings"]
+    ) {
         attach_cli_console();
     }
     let path = config::path()?;
@@ -396,18 +431,24 @@ fn execute(args: &[String]) -> Result<(), String> {
             )
         }
         [] => return launch(false),
-        ["--resident"] => {
+        ["--resident"] | ["--resident", "--reopen-settings"] => {
             if config::requested_elevation(&path)? && unsafe { IsUserAnAdmin() } == 0 {
                 return launch(true);
             }
             unsafe {
                 RegisterApplicationRestart(w!("--resident"), 0);
             }
+            let reopen_settings = std::cell::Cell::new(values.contains(&"--reopen-settings"));
             return supervise_resident(
-                |recovery| resident::run(&path, recovery),
+                |recovery| resident::run(&path, recovery, reopen_settings.replace(false)),
                 |elevation| {
                     if elevation == Some(false) && unsafe { IsUserAnAdmin() } != 0 {
-                        launch_unelevated()
+                        let reopen = settings::close_for_restart()?;
+                        let result = launch_unelevated(reopen);
+                        if result.is_err() {
+                            reopen_settings.set(reopen);
+                        }
+                        result
                     } else {
                         launch(elevation.unwrap_or(false))
                     }

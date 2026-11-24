@@ -61,6 +61,10 @@ pub fn sync_direct(enabled: bool, elevated: bool, owner: &str) -> Result<(), win
     } else {
         None
     };
+    sync_task(name, task)
+}
+
+fn sync_task(name: BSTR, task: Option<String>) -> windows::core::Result<()> {
     let update = || -> windows::core::Result<()> {
         unsafe {
             CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
@@ -89,6 +93,12 @@ pub fn sync_direct(enabled: bool, elevated: bool, owner: &str) -> Result<(), win
         }
     };
     update()
+}
+
+pub fn prepare(enabled: bool, elevated: bool, current_elevation: bool) -> Result<(), String> {
+    // Updating RunLevel does not remove an administrator-owned task's protected ACL.
+    // Delete while still elevated; the new resident recreates it with its normal token.
+    sync(enabled && !(current_elevation && !elevated), elevated)
 }
 
 pub fn sync(enabled: bool, elevated: bool) -> Result<(), String> {
@@ -139,6 +149,105 @@ pub fn sync(enabled: bool, elevated: bool) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    fn temporary_name() -> BSTR {
+        BSTR::from(format!(
+            "WinSizeP.Test.DeElevation.{}",
+            std::env::current_exe()
+                .unwrap()
+                .file_stem()
+                .unwrap()
+                .to_string_lossy()
+        ))
+    }
+    fn probe_path(operation: &str) -> std::path::PathBuf {
+        std::env::current_exe()
+            .unwrap()
+            .with_file_name(format!("logon-{operation}-probe.txt"))
+    }
+    fn temporary_definition(elevated: bool) -> String {
+        let owner = account().unwrap();
+        definition(&owner, elevated)
+            .unwrap()
+            .replace(
+                &format!(
+                    "<Triggers><LogonTrigger><UserId>{}</UserId></LogonTrigger></Triggers>",
+                    xml(&owner)
+                ),
+                "<Triggers />",
+            )
+            .replace("<Settings>", "<Settings><Enabled>false</Enabled>")
+    }
+    fn wait_probe(operation: &str) -> String {
+        let path = probe_path(operation);
+        if path.exists() {
+            std::fs::remove_file(&path).unwrap();
+        }
+        crate::launch::unelevated(
+            &std::env::current_exe().unwrap(),
+            &format!("--exact logon::tests::normal_{operation}_probe --ignored --nocapture"),
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !path.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        std::fs::read_to_string(path).expect("Normal task probe did not finish")
+    }
+    #[test]
+    #[ignore = "normal helper for the temporary task permission test"]
+    fn normal_deletion_probe() {
+        assert!(
+            !crate::security::process_elevated(unsafe {
+                windows_sys::Win32::System::Threading::GetCurrentProcess()
+            })
+            .unwrap()
+        );
+        let result = sync_task(temporary_name(), None);
+        std::fs::write(probe_path("deletion"), format!("{result:?}")).unwrap();
+    }
+    #[test]
+    #[ignore = "normal helper creates and deletes only a disabled WinSizeP.Test task"]
+    fn normal_creation_probe() {
+        assert!(
+            !crate::security::process_elevated(unsafe {
+                windows_sys::Win32::System::Threading::GetCurrentProcess()
+            })
+            .unwrap()
+        );
+        let result = sync_task(temporary_name(), Some(temporary_definition(false)))
+            .and_then(|_| sync_task(temporary_name(), None));
+        std::fs::write(probe_path("creation"), format!("{result:?}")).unwrap();
+    }
+    #[test]
+    #[ignore = "requires administrator rights; creates and removes one disabled WinSizeP.Test task"]
+    fn elevated_task_is_removed_before_normal_recreation() {
+        assert!(
+            crate::security::process_elevated(unsafe {
+                windows_sys::Win32::System::Threading::GetCurrentProcess()
+            })
+            .unwrap(),
+            "Run this test from an elevated process"
+        );
+        struct Cleanup;
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = sync_task(temporary_name(), None);
+            }
+        }
+        let _cleanup = Cleanup;
+        sync_task(temporary_name(), Some(temporary_definition(true))).unwrap();
+        let deletion = wait_probe("deletion");
+        println!("normal deletion of administrator-created task: {deletion}");
+        assert!(
+            deletion.contains("80070005"),
+            "Expected AccessDenied, got {deletion}"
+        );
+        sync_task(temporary_name(), None).unwrap();
+        let creation = wait_probe("creation");
+        println!("normal recreation and cleanup after administrator deletion: {creation}");
+        assert_eq!(creation, "Ok(())");
+    }
     #[test]
     fn task_definition_changes_run_level_and_preserves_owner() {
         for (elevated, level) in [(false, "LeastPrivilege"), (true, "HighestAvailable")] {

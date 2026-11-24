@@ -51,6 +51,29 @@ fn integrity(process: HANDLE) -> Result<u32, String> {
         Ok(*GetSidSubAuthority(label.Label.Sid, u32::from(count - 1)))
     }
 }
+pub fn process_elevated(process: HANDLE) -> Result<bool, String> {
+    unsafe {
+        let mut token = null_mut();
+        if OpenProcessToken(process, TOKEN_QUERY, &mut token) == 0 {
+            return Err(err());
+        }
+        let mut elevation = TOKEN_ELEVATION::default();
+        let mut size = 0;
+        let result = GetTokenInformation(
+            token,
+            TokenElevation,
+            (&mut elevation as *mut TOKEN_ELEVATION).cast(),
+            size_of::<TOKEN_ELEVATION>() as u32,
+            &mut size,
+        );
+        let error = err();
+        CloseHandle(token);
+        if result == 0 {
+            return Err(error);
+        }
+        Ok(elevation.TokenIsElevated != 0)
+    }
+}
 pub fn can_control_window(hwnd: windows_sys::Win32::Foundation::HWND) -> bool {
     thread_local! {static CURRENT:std::cell::Cell<Option<u32>>=const {std::cell::Cell::new(None)};}
     let current = CURRENT.with(|cached| {

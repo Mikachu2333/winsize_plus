@@ -60,6 +60,21 @@ const SS_OWNERDRAW: u32 = 13;
 thread_local! { static EDITOR: RefCell<Option<Editor>> = const { RefCell::new(None) }; }
 thread_local! { static UPDATING: Cell<bool> = const { Cell::new(false) }; }
 thread_local! { static MEASUREMENTS: RefCell<HashMap<(usize,i32,String),i32>> = RefCell::new(HashMap::new()); }
+pub fn close_for_restart() -> Result<bool, String> {
+    let window = unsafe { FindWindowW(CLASS, null()) };
+    if window.is_null() {
+        return Ok(false);
+    }
+    close_for_exit()?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while unsafe { IsWindow(window) } != 0 {
+        if Instant::now() >= deadline {
+            return Err("Settings did not close before restart / 设置窗口未能在重启前关闭".into());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Ok(true)
+}
 pub fn open() -> Result<(), String> {
     unsafe {
         let existing = FindWindowW(CLASS, null());
