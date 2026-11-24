@@ -76,6 +76,7 @@ pub struct Config {
     pub elevate: bool,
     pub autostart: bool,
     pub preview: bool,
+    pub target_marker: bool,
     pub show: String,
     pub duration: u32,
     pub theme: String,
@@ -236,6 +237,7 @@ pub fn standard_name(name: &str) -> String {
     match name {
         "mousecast" => return "MouseCast".into(),
         "keycast" => return "KeyCast".into(),
+        "centerwindow" => return "CenterWindow".into(),
         _ => {}
     }
     if let Some((_, action)) = ALIASES.iter().find(|(alias, _)| *alias == name) {
@@ -885,6 +887,7 @@ impl Config {
             elevate: boolean("general", "elevate")?,
             autostart: boolean("general", "autostart")?,
             preview: boolean("general", "preview")?,
+            target_marker: boolean("general", "target_marker")?,
             alt_hold_ms: number("general", "alt_hold_ms", 0, 60000)? as u32,
             show: choice("tip", "show", &["off", "time", "monitor", "window"])?,
             duration: number("tip", "duration_ms", 100, 120000)? as u32,

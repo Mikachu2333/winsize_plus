@@ -40,6 +40,7 @@ fn later(ms: u32) -> Instant {
     Instant::now() + Duration::from_millis(ms.into())
 }
 struct App {
+    marker: crate::target_marker::TargetMarker,
     paused: bool,
     cast: crate::cast::Visuals,
     mousecast: bool,
@@ -75,6 +76,7 @@ impl App {
         Ok(())
     }
     fn close_preview(&mut self) -> Result<(), String> {
+        self.marker.hide();
         self.held_window = None;
         self.preview_until = None;
         self.preview_check = None;
@@ -89,6 +91,9 @@ impl App {
         self.held_window = Some(window);
         self.preview_latched = latched;
         self.refresh_preview()?;
+        if self.cfg.target_marker {
+            self.marker.show(window)?;
+        }
         if self.preview.warnings().is_empty() {
             self.status(&self.cfg.show.clone())?;
         } else {
@@ -498,6 +503,7 @@ impl App {
                 Ok(())
             }
             input::ACTION => {
+                self.marker.hide();
                 let action = self.cfg.keys.get(&(msg.wParam as u32)).cloned();
                 // Borders must inspect the visible preview before deciding
                 // whether to show or hide it.
@@ -648,6 +654,7 @@ impl App {
                 self.close_preview()?;
             } else {
                 self.preview.tick(&self.cfg)?;
+                self.marker.follow()?;
                 self.preview_check = Some(later(100));
             }
         }
@@ -730,6 +737,7 @@ pub fn run(path: &Path, recovery: Option<&str>) -> Result<crate::ResidentExit, S
         let _hooks = input::Hooks::start(&cfg)?;
         input::set_casting(cfg.mousecast.enabled, cfg.keycast.enabled)?;
         let mut app = App {
+            marker: crate::target_marker::TargetMarker::default(),
             paused: false,
             cast: crate::cast::Visuals::new(),
             mousecast: cfg.mousecast.enabled,
@@ -838,6 +846,7 @@ mod tests {
     fn test_app() -> App {
         let cfg = crate::test_support::cfg();
         App {
+            marker: crate::target_marker::TargetMarker::default(),
             paused: false,
             cast: crate::cast::Visuals::new(),
             mousecast: false,
@@ -860,6 +869,45 @@ mod tests {
             snapshot: None,
             exit: None,
         }
+    }
+
+    #[test]
+    #[ignore = "opens temporary overlays to verify pause notices and pending-action cancellation"]
+    fn pause_hides_marker_and_cancels_actions_until_resumed() {
+        let _dpi = crate::test_support::Dpi::new();
+        let _hooks = input::Hooks::start(&crate::test_support::cfg()).unwrap();
+        let mut app = test_app();
+        app.cfg.zh = true;
+        let target = crate::overlay::Panel::new().unwrap();
+        target.style(0xffffff, 100);
+        target.show(crate::layout::Rect {
+            x: 100,
+            y: 100,
+            width: 600,
+            height: 400,
+        });
+        app.marker.show(target.0).unwrap();
+        app.command = "pending command".into();
+        app.act("pause").unwrap();
+        assert!(app.paused);
+        assert!(!app.marker.visible());
+        assert!(app.command.is_empty());
+        assert_eq!(app.overlay.tip_text(), "已暂停");
+        app.handle_event(MSG {
+            message: input::ACTION,
+            wParam: 0x46,
+            ..Default::default()
+        })
+        .unwrap();
+        app.handle_event(MSG {
+            message: input::CENTER,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(app.overlay.tip_text(), "已暂停");
+        app.act("pause").unwrap();
+        assert!(!app.paused);
+        assert_eq!(app.overlay.tip_text(), "开始捕获");
     }
 
     #[test]
@@ -923,6 +971,7 @@ mod tests {
         let overlay = Overlay::new().unwrap();
         let _hooks = input::Hooks::start(&cfg).unwrap();
         let mut app = App {
+            marker: crate::target_marker::TargetMarker::default(),
             paused: false,
             cast: crate::cast::Visuals::new(),
             mousecast: false,
@@ -991,6 +1040,7 @@ mod tests {
         let overlay = Overlay::new().unwrap();
         let _hooks = input::Hooks::start(&cfg).unwrap();
         let mut app = App {
+            marker: crate::target_marker::TargetMarker::default(),
             paused: false,
             cast: crate::cast::Visuals::new(),
             mousecast: false,
@@ -1076,6 +1126,7 @@ mod tests {
         let cfg = Config::parse(&config::help().parse().unwrap()).unwrap();
         let overlay = Overlay::new().unwrap();
         let mut app = App {
+            marker: crate::target_marker::TargetMarker::default(),
             paused: false,
             cast: crate::cast::Visuals::new(),
             mousecast: false,
@@ -1346,6 +1397,7 @@ mod tests {
         let overlay = Overlay::new().unwrap();
         let _hooks = input::Hooks::start(&cfg).unwrap();
         let mut app = App {
+            marker: crate::target_marker::TargetMarker::default(),
             paused: false,
             cast: crate::cast::Visuals::new(),
             mousecast: false,

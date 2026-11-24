@@ -248,6 +248,12 @@ fn describe(section: &str, key: &str) -> (&'static str, &'static str, &'static s
             "Show with the tip after Alt activation and hide together. Releasing held Alt closes both.",
             "Alt 触发后与提示框同步显示、隐藏；长按时松开 Alt 即关闭。",
         ),
+        ("general", "target_marker") => (
+            "Mark the window awaiting an Alt action",
+            "标示等待 Alt 操作的窗口",
+            "Fixed translucent pale-yellow 4 px frame inside the target. Clicks pass through; it disappears when an action begins.",
+            "在待操作窗口内侧显示固定的浅黄半透明 4 px 边框。鼠标穿透，开始操作后隐藏。",
+        ),
         ("general", "alt_hold_ms") => (
             "Alt hold delay (milliseconds)",
             "Alt 长按延迟（毫秒）",
