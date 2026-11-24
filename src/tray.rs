@@ -179,6 +179,7 @@ impl Tray {
     pub fn menu(
         &self,
         cfg: &Config,
+        paused: bool,
         anchor: isize,
         mut tick: impl FnMut(),
     ) -> Result<Option<&'static str>, String> {
@@ -201,8 +202,15 @@ impl Tray {
         }
         let _pump = MenuPump(self.hwnd, timer);
         let entries = [
-            ("settings", cfg.tr("Settings…", "设置…")),
-            ("help", cfg.tr("Help", "帮助")),
+            (
+                "pause",
+                if paused {
+                    cfg.tr("Enable", "启用")
+                } else {
+                    cfg.tr("Pause", "暂停")
+                },
+            ),
+            ("", ""),
             (
                 "mousecast",
                 cfg.tr("Toggle mouse annotations", "切换鼠标标注"),
@@ -211,8 +219,13 @@ impl Tray {
                 "keycast",
                 cfg.tr("Toggle keyboard annotations", "切换键盘标注"),
             ),
-            ("reload", cfg.tr("Reload configuration", "重载配置")),
+            ("", ""),
+            ("help", cfg.tr("Help", "帮助")),
             ("version", cfg.tr("Version", "版本")),
+            ("", ""),
+            ("settings", cfg.tr("Settings…", "设置…")),
+            ("reload", cfg.tr("Reload configuration", "重载配置")),
+            ("", ""),
             ("quit", cfg.tr("Exit", "退出")),
         ];
         let mut point = POINT {
@@ -242,7 +255,17 @@ impl Tray {
                 return Err(err());
             }
             for (index, (_, label)) in entries.iter().enumerate() {
-                if AppendMenuW(menu, MF_STRING, index + 1, wide(label).as_ptr()) == 0 {
+                if AppendMenuW(
+                    menu,
+                    if label.is_empty() {
+                        MF_SEPARATOR
+                    } else {
+                        MF_STRING
+                    },
+                    index + 1,
+                    wide(label).as_ptr(),
+                ) == 0
+                {
                     let problem = err();
                     DestroyMenu(menu);
                     return Err(problem);
@@ -297,7 +320,7 @@ mod tests {
         let mut released = false;
         let mut faded = false;
         let result = tray
-            .menu(&cfg, -1, || {
+            .menu(&cfg, false, -1, || {
                 if !released {
                     cast.mouse(2, crate::mouse_cast::RELEASE, point, &cfg)
                         .unwrap();

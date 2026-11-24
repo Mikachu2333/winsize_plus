@@ -53,6 +53,7 @@ enum Mode {
 }
 #[derive(Default)]
 struct Input {
+    paused: bool,
     mode: Mode,
     alt_mask: u8,
     gesture_mask: u8,
@@ -101,6 +102,7 @@ struct PointerAction {
     canceled: bool,
 }
 thread_local! {static INPUT:RefCell<Input>=RefCell::new(Input::default());}
+thread_local! {static KEYBOARD_HOOK: Cell<HHOOK> = const {Cell::new(null_mut())};}
 thread_local! {
     static EVENTS: RefCell<Option<EventSender>> = const { RefCell::new(None) };
     static INBOX: RefCell<Option<mpsc::Receiver<QueuedEvent>>> = const { RefCell::new(None) };
@@ -433,13 +435,14 @@ impl Input {
             }
         });
         unsafe {
-            let needed = self.guides
-                || self.cast_mouse
-                || self.preview_tracking
-                || self.drag.is_some()
-                || self.centered_button.is_some()
-                || (self.tip_scrollable && self.tip_window != 0)
-                || (self.target_allowed && self.pressed & self.gesture_mask != 0);
+            let needed = !self.paused
+                && (self.guides
+                    || self.cast_mouse
+                    || self.preview_tracking
+                    || self.drag.is_some()
+                    || self.centered_button.is_some()
+                    || (self.tip_scrollable && self.tip_window != 0)
+                    || (self.target_allowed && self.pressed & self.gesture_mask != 0));
             if needed && self.mouse.is_null() {
                 self.mouse =
                     SetWindowsHookExW(WH_MOUSE_LL, Some(mouse), GetModuleHandleW(null()), 0);
@@ -455,6 +458,9 @@ impl Input {
         }
     }
     fn keyboard(&mut self, key: u32, down: bool, time: u32) -> bool {
+        if self.paused {
+            return false;
+        }
         if key >= 256 {
             return false;
         }
@@ -652,7 +658,7 @@ impl Input {
 }
 unsafe extern "system" fn keyboard(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
-        if hook_stopped() {
+        if hook_stopped() || INPUT.with(|cell| cell.try_borrow().is_ok_and(|input| input.paused)) {
             return CallNextHookEx(null_mut(), code, wp, lp);
         }
         if code == HC_ACTION as i32 {
@@ -721,7 +727,7 @@ unsafe extern "system" fn keyboard(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT
 }
 unsafe extern "system" fn mouse(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
-        if hook_stopped() {
+        if hook_stopped() || INPUT.with(|cell| cell.try_borrow().is_ok_and(|input| input.paused)) {
             return CallNextHookEx(null_mut(), code, wp, lp);
         }
         if code == HC_ACTION as i32 {
@@ -1089,6 +1095,56 @@ pub fn configure(cfg: &Config) -> Result<(), String> {
         })
     })?
 }
+pub fn set_paused(paused: bool) -> Result<(), String> {
+    on_hook(move || {
+        INPUT.with_borrow_mut(|input| {
+            if input.paused == paused {
+                return Ok(());
+            }
+            // SAFETY: hooks are installed and removed on their owning worker thread.
+            unsafe {
+                if paused {
+                    let hook = KEYBOARD_HOOK.with(|slot| slot.replace(null_mut()));
+                    if !hook.is_null() {
+                        UnhookWindowsHookEx(hook);
+                    }
+                } else {
+                    let hook = SetWindowsHookExW(
+                        WH_KEYBOARD_LL,
+                        Some(keyboard),
+                        GetModuleHandleW(null()),
+                        0,
+                    );
+                    if hook.is_null() {
+                        return Err(err());
+                    }
+                    KEYBOARD_HOOK.with(|slot| slot.set(hook));
+                }
+            }
+            input.paused = paused;
+            input.reset_gesture();
+            if let Err(error) = input.update_mouse() {
+                // A failed resume leaves capture paused as the tray still reports.
+                input.paused = true;
+                unsafe {
+                    let hook = KEYBOARD_HOOK.with(|slot| slot.replace(null_mut()));
+                    if !hook.is_null() {
+                        UnhookWindowsHookEx(hook);
+                    }
+                }
+                return Err(error);
+            }
+            Ok(())
+        })
+    })??;
+    DEFERRED.with_borrow_mut(VecDeque::clear);
+    INBOX.with_borrow(|inbox| {
+        if let Some(inbox) = inbox {
+            for _ in inbox.try_iter() {}
+        }
+    });
+    Ok(())
+}
 pub struct Hooks {
     worker: Option<JoinHandle<()>>,
     // Raw handles also prevent moving this UI-thread guard to another thread.
@@ -1166,7 +1222,7 @@ impl Hooks {
                 });
                 // SAFETY: both hooks are installed, pumped and removed on this worker.
                 unsafe {
-                    let mut hook = SetWindowsHookExW(
+                    let hook = SetWindowsHookExW(
                         WH_KEYBOARD_LL,
                         Some(keyboard),
                         GetModuleHandleW(null()),
@@ -1176,24 +1232,31 @@ impl Hooks {
                         let _ = ready.send(Err(err()));
                         return;
                     }
+                    KEYBOARD_HOOK.with(|slot| slot.set(hook));
                     let _ = ready.send(Ok(()));
                     let mut heartbeat = std::time::Instant::now();
                     'pump: loop {
                         if worker_stop.load(Ordering::Acquire) {
                             break;
                         }
-                        if heartbeat.elapsed() > Duration::from_millis(750) {
+                        if heartbeat.elapsed() > Duration::from_millis(750)
+                            && !INPUT.with_borrow(|input| input.paused)
+                        {
                             // Windows may silently remove low-level hooks after a long stall.
                             // Re-arm on this owning thread and abandon incomplete gestures.
-                            UnhookWindowsHookEx(hook);
-                            hook = SetWindowsHookExW(
-                                WH_KEYBOARD_LL,
-                                Some(keyboard),
-                                GetModuleHandleW(null()),
-                                0,
-                            );
-                            let mut recovered = !hook.is_null();
+                            let mut recovered = false;
                             INPUT.with_borrow_mut(|input| {
+                                KEYBOARD_HOOK.with(|slot| {
+                                    UnhookWindowsHookEx(slot.get());
+                                    let hook = SetWindowsHookExW(
+                                        WH_KEYBOARD_LL,
+                                        Some(keyboard),
+                                        GetModuleHandleW(null()),
+                                        0,
+                                    );
+                                    slot.set(hook);
+                                    recovered = !hook.is_null();
+                                });
                                 if !input.mouse.is_null() {
                                     UnhookWindowsHookEx(input.mouse);
                                     input.mouse = null_mut();
@@ -1252,8 +1315,11 @@ impl Hooks {
                         // those messages can keep the wait from timing out indefinitely.
                         INPUT.with_borrow_mut(|input| input.advance_hold(GetTickCount()));
                     }
-                    UnhookWindowsHookEx(hook);
                     INPUT.with_borrow_mut(|input| {
+                        let hook = KEYBOARD_HOOK.with(|slot| slot.replace(null_mut()));
+                        if !hook.is_null() {
+                            UnhookWindowsHookEx(hook);
+                        }
                         if !input.mouse.is_null() {
                             UnhookWindowsHookEx(input.mouse);
                         }
@@ -1334,6 +1400,39 @@ impl Drop for Hooks {
 
 #[cfg(test)]
 pub(super) mod tests {
+    #[test]
+    fn pause_removes_hooks_and_pending_gestures_then_restores_capture() {
+        use super::*;
+        let cfg = crate::test_support::cfg();
+        let _hooks = Hooks::start(&cfg).unwrap();
+        set_casting(true, true).unwrap();
+        on_hook(|| {
+            INPUT.with_borrow_mut(|input| {
+                input.mode = Mode::Wait;
+                input.hold_started = Some(1);
+                input.pressed = 1;
+            })
+        })
+        .unwrap();
+        set_paused(true).unwrap();
+        assert!(
+            on_hook(|| INPUT.with_borrow_mut(|input| input.paused
+                && input.mouse.is_null()
+                && KEYBOARD_HOOK.with(Cell::get).is_null()
+                && input.mode == Mode::Idle
+                && input.hold_started.is_none()
+                && !input.keyboard(0x41, true, 10)))
+            .unwrap()
+        );
+        assert!(next_event().is_none());
+        set_paused(false).unwrap();
+        assert!(
+            on_hook(|| INPUT.with_borrow(|input| !input.paused
+                && !input.mouse.is_null()
+                && !KEYBOARD_HOOK.with(Cell::get).is_null()))
+            .unwrap()
+        );
+    }
     fn pending_hold(when: u32) -> super::Input {
         let mut input = super::Input {
             alt_mask: 1,

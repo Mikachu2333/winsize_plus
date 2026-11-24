@@ -40,6 +40,7 @@ fn later(ms: u32) -> Instant {
     Instant::now() + Duration::from_millis(ms.into())
 }
 struct App {
+    paused: bool,
     cast: crate::cast::Visuals,
     mousecast: bool,
     keycast: bool,
@@ -186,6 +187,22 @@ impl App {
     }
     fn act(&mut self, action: &str) -> Result<(), String> {
         match action {
+            "pause" => {
+                let paused = !self.paused;
+                input::set_paused(paused)?;
+                self.paused = paused;
+                self.drag = None;
+                self.command.clear();
+                self.cast.clear();
+                self.close_preview()?;
+                self.overlay.guides(0, &self.cfg)?;
+                self.clear();
+                self.notice(if paused {
+                    self.cfg.tr("Paused", "已暂停")
+                } else {
+                    self.cfg.tr("Capture started", "开始捕获")
+                })
+            }
             "mousecast" | "keycast" => {
                 let mouse = if action == "mousecast" {
                     !self.mousecast
@@ -379,6 +396,12 @@ impl App {
         Ok(())
     }
     fn handle_event(&mut self, msg: MSG) -> Result<(), String> {
+        if self.paused
+            && (input::ARMED..=input::CENTER).contains(&msg.message)
+            && msg.message != input::DISPLAY_CHANGED
+        {
+            return Ok(());
+        }
         match msg.message {
             input::RECOVERED => {
                 self.drag = None;
@@ -427,7 +450,7 @@ impl App {
                 let cfg = &self.cfg;
                 let mouse = self.mousecast;
                 let keys = self.keycast;
-                if let Some(action) = self.tray.menu(cfg, msg.lParam, || {
+                if let Some(action) = self.tray.menu(cfg, self.paused, msg.lParam, || {
                     // TrackPopupMenu owns the message loop until the menu closes.
                     if hide.is_some_and(|when| Instant::now() >= when) {
                         *hide = None;
@@ -707,6 +730,7 @@ pub fn run(path: &Path, recovery: Option<&str>) -> Result<crate::ResidentExit, S
         let _hooks = input::Hooks::start(&cfg)?;
         input::set_casting(cfg.mousecast.enabled, cfg.keycast.enabled)?;
         let mut app = App {
+            paused: false,
             cast: crate::cast::Visuals::new(),
             mousecast: cfg.mousecast.enabled,
             keycast: cfg.keycast.enabled,
@@ -814,6 +838,7 @@ mod tests {
     fn test_app() -> App {
         let cfg = crate::test_support::cfg();
         App {
+            paused: false,
             cast: crate::cast::Visuals::new(),
             mousecast: false,
             keycast: false,
@@ -898,6 +923,7 @@ mod tests {
         let overlay = Overlay::new().unwrap();
         let _hooks = input::Hooks::start(&cfg).unwrap();
         let mut app = App {
+            paused: false,
             cast: crate::cast::Visuals::new(),
             mousecast: false,
             keycast: false,
@@ -965,6 +991,7 @@ mod tests {
         let overlay = Overlay::new().unwrap();
         let _hooks = input::Hooks::start(&cfg).unwrap();
         let mut app = App {
+            paused: false,
             cast: crate::cast::Visuals::new(),
             mousecast: false,
             keycast: false,
@@ -1049,6 +1076,7 @@ mod tests {
         let cfg = Config::parse(&config::help().parse().unwrap()).unwrap();
         let overlay = Overlay::new().unwrap();
         let mut app = App {
+            paused: false,
             cast: crate::cast::Visuals::new(),
             mousecast: false,
             keycast: false,
@@ -1318,6 +1346,7 @@ mod tests {
         let overlay = Overlay::new().unwrap();
         let _hooks = input::Hooks::start(&cfg).unwrap();
         let mut app = App {
+            paused: false,
             cast: crate::cast::Visuals::new(),
             mousecast: false,
             keycast: false,
