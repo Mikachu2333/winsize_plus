@@ -100,6 +100,7 @@ pub struct Config {
     pub warnings: Vec<String>,
     pub preset_names: HashMap<String, String>,
     pub lines: [Line; 2],
+    pub crosshair_unified: bool,
     pub fps: f64,
     pub presets: HashMap<String, Layout>,
     pub keys: HashMap<u32, String>,
@@ -830,6 +831,8 @@ impl Config {
                 },
             })
         };
+        let crosshair_unified = choice("crosshair", "mode", &["unified", "custom"])? == "unified";
+        let horizontal = line("horizontal")?;
         Ok(Self {
             mousecast: MouseStyle {
                 enabled: boolean("mousecast", "enabled")?,
@@ -883,7 +886,15 @@ impl Config {
             resize_button: button("resize")?,
             warnings: Vec::new(),
             preset_names,
-            lines: [line("horizontal")?, line("vertical")?],
+            crosshair_unified,
+            lines: [
+                horizontal,
+                if crosshair_unified {
+                    horizontal
+                } else {
+                    line("vertical")?
+                },
+            ],
             fps: {
                 let rate = field("crosshair", "fps")?;
                 rate.as_integer()
@@ -1494,6 +1505,27 @@ pub fn load_snapshot(path: &Path, edit: Option<(&Identity, Switch)>) -> Result<L
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn crosshair_mode_preserves_custom_style_and_defaults_to_unified_yellow() {
+        let mut doc = help().parse::<DocumentMut>().unwrap();
+        doc["vertical"]["width"] = value(7);
+        doc["vertical"]["color"] = value("#123456");
+        let cfg = Config::parse(&doc).unwrap();
+        assert!(cfg.crosshair_unified);
+        assert!(cfg.lines[0] == cfg.lines[1]);
+        assert_eq!(
+            (cfg.lines[0].color, cfg.lines[0].opacity),
+            (crate::colors::colorref(0xffff3c), 204)
+        );
+        doc["crosshair"]["mode"] = value("custom");
+        let cfg = Config::parse(&doc.to_string().parse().unwrap()).unwrap();
+        assert!(!cfg.crosshair_unified);
+        assert_eq!(cfg.lines[1].width, 7);
+        assert_eq!(cfg.lines[1].color, crate::colors::colorref(0x123456));
+        doc["crosshair"]["mode"] = value("unified");
+        doc["vertical"]["width"] = value("unused");
+        assert!(Config::parse(&doc).is_ok());
+    }
     #[test]
     fn alt_hold_delay_defaults_migrates_and_validates() {
         let mut doc = help().parse::<DocumentMut>().unwrap();

@@ -46,6 +46,7 @@ fill_opacity = 48 # Translucent selection fill.
 
 [crosshair]
 fps = 30 # Integer, clamped to 24..1000.
+mode = "unified" # unified uses horizontal settings for both axes; custom keeps them independent.
 
 [horizontal]
 width = 2

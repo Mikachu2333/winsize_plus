@@ -51,6 +51,7 @@ const TAB_BASE: i32 = 100;
 const AXIS_H: i32 = 500;
 const AXIS_V: i32 = 501;
 const AXIS_BOTH: i32 = 502;
+const AXIS_CUSTOM: i32 = 503;
 const SS_LEFT: u32 = 0;
 const SS_CENTER: u32 = 1;
 const SS_OWNERDRAW: u32 = 13;
@@ -196,7 +197,7 @@ struct Editor {
     tabs: Vec<HWND>,
     status: HWND,
     status_until: Cell<Option<Instant>>,
-    axis_controls: [HWND; 3],
+    axis_controls: [HWND; 4],
     path: PathBuf,
     original: String,
     doc: DocumentMut,
@@ -394,12 +395,12 @@ impl Editor {
                     InvalidateRect(*hwnd, null(), 0);
                 }
             }
-            for (index, hwnd) in self.axis_controls.iter().enumerate() {
+            for hwnd in &self.axis_controls {
                 unsafe {
                     ShowWindow(*hwnd, if tab == 5 { SW_SHOW } else { SW_HIDE });
                 }
-                send(*hwnd, BM_SETCHECK, usize::from(axis == index), 0);
             }
+            self.update_axis_controls();
             self.update_values();
             self.layout()?;
             self.render()?;
@@ -418,6 +419,24 @@ impl Editor {
     }
     fn s(&self, n: i32) -> i32 {
         (n * self.dpi + 48) / 96
+    }
+    fn update_axis_controls(&self) {
+        for (i, control) in self.axis_controls.iter().enumerate() {
+            send(
+                *control,
+                BM_SETCHECK,
+                usize::from(match i {
+                    0 => self.axis == 0,
+                    1 => self.axis == 1,
+                    2 => self.cfg.crosshair_unified,
+                    _ => !self.cfg.crosshair_unified,
+                }),
+                0,
+            );
+            unsafe {
+                EnableWindow(*control, i32::from(i >= 2 || !self.cfg.crosshair_unified));
+            }
+        }
     }
     fn status(&self, text: &str) {
         set_text(self.status, text);
@@ -594,14 +613,18 @@ impl Editor {
                 } else if i == 1 {
                     self.cfg.tr("Vertical line", "竖线")
                 } else {
-                    self.cfg.tr("Both axes", "统一设置")
+                    if i == 2 {
+                        self.cfg.tr("Unified", "统一")
+                    } else {
+                        self.cfg.tr("Custom", "自定义")
+                    }
                 },
             );
             unsafe {
                 ShowWindow(*hwnd, if self.tab == 5 { SW_SHOW } else { SW_HIDE });
             }
-            send(*hwnd, BM_SETCHECK, usize::from(self.axis == i), 0);
         }
+        self.update_axis_controls();
         for (index, field) in schema::fields(self.tab, self.axis, &self.cfg, &self.doc)
             .into_iter()
             .enumerate()
@@ -1135,7 +1158,7 @@ impl Editor {
                         measured(
                             &caption(*control),
                             &self.font,
-                            (width / 3 - self.s(24)).max(1),
+                            (width / 2 - self.s(24)).max(1),
                         ) + self.s(10)
                     })
                     .max()
@@ -1144,13 +1167,13 @@ impl Editor {
                 for (i, control) in self.axis_controls.iter().enumerate() {
                     place(
                         *control,
-                        padding + i as i32 * (width / 3),
-                        y - self.scroll[1],
-                        width / 3,
+                        padding + (i % 2) as i32 * (width / 2),
+                        y + if i < 2 { axis_height } else { 0 } - self.scroll[1],
+                        width / 2,
                         axis_height,
                     );
                 }
-                y += axis_height + self.s(10);
+                y += axis_height * 2 + self.s(10);
             }
         }
         self.extent[1] = y + padding;
@@ -1387,12 +1410,6 @@ impl Editor {
                 _ => continue,
             };
             draft[section][key] = replacement;
-            if self.tab == 5 && self.axis == 2 && section == "horizontal" {
-                draft["vertical"][key] = draft[section][key].clone();
-                if key == "color" {
-                    draft["vertical"]["opacity"] = draft[section]["opacity"].clone();
-                }
-            }
         }
         Ok(draft)
     }
@@ -1801,19 +1818,22 @@ impl Editor {
             self.save()?;
             return self.switch_page((id - TAB_BASE) as usize, self.axis);
         }
-        if matches!(id, AXIS_H | AXIS_V | AXIS_BOTH) && event == BN_CLICKED {
+        if matches!(id, AXIS_H | AXIS_V | AXIS_BOTH | AXIS_CUSTOM) && event == BN_CLICKED {
             self.save()?;
-            if id == AXIS_BOTH && self.axis != 2 {
+            if matches!(id, AXIS_BOTH | AXIS_CUSTOM) {
                 let mut draft = self.doc.clone();
-                draft["vertical"] = draft["horizontal"].clone();
-                self.original = config::save_settings(&self.path, &self.original, &draft)?;
-                self.doc = self
-                    .original
-                    .parse::<DocumentMut>()
-                    .map_err(|error| error.to_string())?;
-                self.apply_config(Config::parse(&self.doc)?);
+                draft["crosshair"]["mode"] =
+                    value(if id == AXIS_BOTH { "unified" } else { "custom" });
+                self.commit_document(draft)?;
                 self.invalidate_pages();
-                self.status(self.cfg.tr("Saved", "已保存"));
+                if id == AXIS_BOTH {
+                    self.axis = 0;
+                }
+                return self.rebuild();
+            }
+            if self.cfg.crosshair_unified {
+                self.update_axis_controls();
+                return Ok(());
             }
             return self.switch_page(self.tab, (id - AXIS_H) as usize);
         }
@@ -2766,7 +2786,7 @@ pub fn run(path: &Path) -> Result<(), String> {
             tabs: Vec::new(),
             status: null_mut(),
             status_until: Cell::new(None),
-            axis_controls: [null_mut(); 3],
+            axis_controls: [null_mut(); 4],
             path: path.into(),
             original,
             doc,
@@ -2822,6 +2842,13 @@ pub fn run(path: &Path) -> Result<(), String> {
             "",
             BS_AUTORADIOBUTTON as u32 | BS_MULTILINE as u32 | WS_TABSTOP,
             AXIS_BOTH,
+        )?;
+        editor.axis_controls[3] = editor.create(
+            panes[1],
+            "BUTTON",
+            "",
+            BS_AUTORADIOBUTTON as u32 | BS_MULTILINE as u32 | WS_TABSTOP,
+            AXIS_CUSTOM,
         )?;
         if !cfg!(test) && !crate::resident::running() {
             crate::launch(editor.cfg.elevate)?;
@@ -2945,7 +2972,7 @@ mod tests {
             tabs: Vec::new(),
             status: null_mut(),
             status_until: Cell::new(None),
-            axis_controls: [null_mut(); 3],
+            axis_controls: [null_mut(); 4],
             path,
             original,
             doc,
@@ -3707,9 +3734,8 @@ mod tests {
                 let saved = config::read_settings(&output.join("config.toml"))?
                     .parse::<DocumentMut>()
                     .map_err(|e| e.to_string())?;
-                if saved["horizontal"]["width"].as_integer() != Some(3)
-                    || saved["vertical"]["width"].as_integer() != Some(3)
-                {
+                let effective = Config::parse(&saved)?;
+                if effective.lines[0].width != 3 || effective.lines[1].width != 3 {
                     return Err("Unified axis style did not update both lines".into());
                 }
                 // The window manager may offer a work area smaller than our usual

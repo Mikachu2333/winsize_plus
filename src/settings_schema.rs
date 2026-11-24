@@ -436,7 +436,7 @@ pub fn fields(tab: usize, axis: usize, cfg: &Config, doc: &DocumentMut) -> Vec<F
         2 => &["presets", "regions"],
         3 => &["outline"],
         4 => &["shortcuts", "keys", "commands"],
-        5 if axis != 1 => &["crosshair", "horizontal"],
+        5 if cfg.crosshair_unified || axis != 1 => &["crosshair", "horizontal"],
         5 => &["crosshair", "vertical"],
         7 => &["mousecast"],
         8 => &["keycast"],
@@ -483,6 +483,9 @@ pub fn fields(tab: usize, axis: usize, cfg: &Config, doc: &DocumentMut) -> Vec<F
                 .sort_by_key(|(key, _)| order.iter().position(|v| v == key).unwrap_or(order.len()));
         }
         for (key, item) in entries {
+            if *section == "crosshair" && key == "mode" {
+                continue;
+            }
             if !mapping
                 && ((key == "opacity" && !matches!(*section, "outline" | "mousecast" | "keycast"))
                     || DEFAULTS
