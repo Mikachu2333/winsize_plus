@@ -5,7 +5,10 @@ use windows_sys::{
     Win32::{
         Foundation::*,
         Graphics::Gdi::*,
-        UI::{Controls::*, HiDpi::GetDpiForWindow, WindowsAndMessaging::*},
+        UI::{
+            Controls::*, HiDpi::GetDpiForWindow, Input::KeyboardAndMouse::IsWindowEnabled,
+            WindowsAndMessaging::*,
+        },
     },
     core::w,
 };
@@ -65,6 +68,9 @@ pub fn draw(root: HWND, draw: &DRAWITEMSTRUCT) {
             if !selected {
                 FillRect(dc, &rect, crate::settings_theme::control());
                 SetTextColor(dc, crate::settings_theme::text());
+            }
+            if draw.itemState & ODS_DISABLED != 0 || IsWindowEnabled(draw.hwndItem) == 0 {
+                SetTextColor(dc, crate::settings_theme::hint());
             }
             if draw.itemID != u32::MAX {
                 let (get_length, get_text) = if draw.CtlType == ODT_LISTBOX {

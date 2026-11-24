@@ -914,6 +914,7 @@ impl Editor {
             }
             self.rows.push(row);
         }
+        self.update_enabled_controls();
         self.layout()?;
         for row in &self.rows {
             for hwnd in row.controls {
@@ -1474,6 +1475,54 @@ impl Editor {
         }
         Ok(())
     }
+    fn update_enabled_controls(&self) {
+        let field = |key: &str| {
+            self.rows
+                .iter()
+                .find(|row| row.field.section == "shortcuts" && row.field.key == key)
+        };
+        let enabled = |key: &str| {
+            field(key).map_or_else(
+                || {
+                    self.doc
+                        .get("shortcuts")
+                        .and_then(|section| section.get(key))
+                        .and_then(Item::as_bool)
+                        .unwrap_or(true)
+                },
+                |row| send(row.c(0), BM_GETCHECK, 0, 0) == 1,
+            )
+        };
+        let gestures = field("gesture").map_or_else(
+            || {
+                self.doc
+                    .get("shortcuts")
+                    .and_then(|section| section.get("gesture"))
+                    .and_then(Item::as_str)
+                    .unwrap_or("left")
+                    != "off"
+            },
+            |row| Self::selected_value(row, 0) != "off",
+        );
+        for (key, switch) in [
+            ("move_button", "move_enabled"),
+            ("resize_button", "resize_enabled"),
+            ("center_button", "center_enabled"),
+        ] {
+            if let Some(row) = field(key) {
+                let active = gestures && enabled(switch);
+                // SAFETY: these child HWNDs belong to the editor and stay alive for this call.
+                unsafe {
+                    if (IsWindowEnabled(row.c(0)) != 0) != active {
+                        if !active {
+                            send(row.c(0), CB_SHOWDROPDOWN, 0, 0);
+                        }
+                        EnableWindow(row.c(0), i32::from(active));
+                    }
+                }
+            }
+        }
+    }
     fn update_values(&self) {
         for row in &self.rows {
             let item = self
@@ -1573,6 +1622,7 @@ impl Editor {
                 _ => {}
             }
         }
+        self.update_enabled_controls();
     }
     fn render(&mut self) -> Result<(), String> {
         self.cast.clear();
@@ -1914,6 +1964,7 @@ impl Editor {
         if changed {
             self.dirty.insert(index);
             self.pending = Some(Instant::now() + Duration::from_millis(450));
+            self.update_enabled_controls();
             if let Ok(draft) = self.collect()
                 && let Ok(cfg) = Config::parse(&draft)
             {
@@ -3416,6 +3467,86 @@ mod tests {
                         return Err(format!("Cached tab {tab} took over one second"));
                     }
                 }
+                // Mouse controls follow switches immediately and retain saved selections.
+                send(hwnd, WM_COMMAND, (TAB_BASE + 4) as usize, 0);
+                wait_tab(hwnd, 4)?;
+                let fields = schema::fields(4, 0, &Config::parse(&doc).unwrap(), &doc);
+                let control_id = |key: &str| {
+                    BASE + fields
+                        .iter()
+                        .position(|field| field.section == "shortcuts" && field.key == key)
+                        .unwrap() as i32
+                        * STRIDE
+                };
+                for (switch, button) in [
+                    ("move_enabled", "move_button"),
+                    ("resize_enabled", "resize_button"),
+                    ("center_enabled", "center_button"),
+                ] {
+                    let pane = unsafe { GetDlgItem(hwnd, 2) };
+                    let checkbox = unsafe { GetDlgItem(pane, control_id(switch)) };
+                    let combo = unsafe { GetDlgItem(pane, control_id(button)) };
+                    let selection = send(combo, CB_GETCURSEL, 0, 0);
+                    send(checkbox, BM_CLICK, 0, 0);
+                    let deadline = Instant::now() + Duration::from_millis(300);
+                    while unsafe { IsWindowEnabled(combo) } != 0 && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    if unsafe { IsWindowEnabled(combo) } != 0 {
+                        return Err(format!("{button} did not follow its disabled switch"));
+                    }
+                    std::thread::sleep(Duration::from_millis(800));
+                    send(hwnd, WM_COMMAND, TAB_BASE as usize, 0);
+                    wait_tab(hwnd, 0)?;
+                    send(hwnd, WM_COMMAND, (TAB_BASE + 4) as usize, 0);
+                    wait_tab(hwnd, 4)?;
+                    let checkbox = unsafe { GetDlgItem(pane, control_id(switch)) };
+                    let combo = unsafe { GetDlgItem(pane, control_id(button)) };
+                    if unsafe { IsWindowEnabled(combo) } != 0
+                        || send(combo, CB_GETCURSEL, 0, 0) != selection
+                    {
+                        return Err(format!(
+                            "{button} lost its disabled state or selection after switching pages"
+                        ));
+                    }
+                    send(checkbox, BM_CLICK, 0, 0);
+                    let deadline = Instant::now() + Duration::from_millis(300);
+                    while unsafe { IsWindowEnabled(combo) } == 0 && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    if unsafe { IsWindowEnabled(combo) } == 0
+                        || send(combo, CB_GETCURSEL, 0, 0) != selection
+                    {
+                        return Err(format!(
+                            "{button} did not restore its saved selection when enabled"
+                        ));
+                    }
+                }
+                let pane = unsafe { GetDlgItem(hwnd, 2) };
+                let gesture = unsafe { GetDlgItem(pane, control_id("gesture")) };
+                let selection = send(gesture, CB_GETCURSEL, 0, 0);
+                send(gesture, CB_SETCURSEL, 3, 0);
+                send(
+                    hwnd,
+                    WM_COMMAND,
+                    control_id("gesture") as usize | ((CBN_SELCHANGE as usize) << 16),
+                    gesture as isize,
+                );
+                for key in ["move_button", "resize_button", "center_button"] {
+                    if unsafe { IsWindowEnabled(GetDlgItem(pane, control_id(key))) } != 0 {
+                        return Err(format!(
+                            "{key} remained enabled while mouse gestures were off"
+                        ));
+                    }
+                }
+                send(gesture, CB_SETCURSEL, selection as usize, 0);
+                send(
+                    hwnd,
+                    WM_COMMAND,
+                    control_id("gesture") as usize | ((CBN_SELCHANGE as usize) << 16),
+                    gesture as isize,
+                );
+
                 // Every preview pauses in the background and resumes with its checkbox intact.
                 let overlay_count = || unsafe {
                     let mut count = 0;
