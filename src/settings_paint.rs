@@ -27,7 +27,21 @@ pub fn draw(root: HWND, draw: &DRAWITEMSTRUCT) {
         let old = SelectObject(dc, font);
         let saved = SaveDC(dc);
         SetBkMode(dc, TRANSPARENT as i32);
-        if !GetPropW(draw.hwndItem, w!("Separator")).is_null() {
+        if draw.CtlID == 600 {
+            FillRect(dc, &rect, crate::settings_theme::notice());
+            SetTextColor(dc, crate::settings_theme::notice_text());
+            rect.left += scale(6);
+            rect.right -= scale(6);
+            rect.top += scale(4);
+            let label = text(draw.hwndItem);
+            DrawTextW(
+                dc,
+                label.as_ptr(),
+                (label.len() - 1) as i32,
+                &mut rect,
+                DT_LEFT | DT_WORDBREAK | DT_NOPREFIX,
+            );
+        } else if !GetPropW(draw.hwndItem, w!("Separator")).is_null() {
             FillRect(dc, &rect, crate::settings_theme::edge());
         } else if matches!(draw.CtlType, ODT_COMBOBOX | ODT_LISTBOX) {
             let selected = draw.itemState & ODS_SELECTED != 0;

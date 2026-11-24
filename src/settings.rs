@@ -47,6 +47,8 @@ const APP_EXIT: u32 = WM_APP + 85;
 const ACTIVATE_PREVIEW: u32 = WM_APP + 86;
 #[cfg(test)]
 const PREVIEW_STATE: u32 = WM_APP + 99;
+#[cfg(test)]
+const TEST_THEME: u32 = WM_APP + 98;
 const TAB_BASE: i32 = 100;
 const AXIS_H: i32 = 500;
 const AXIS_V: i32 = 501;
@@ -456,17 +458,13 @@ impl Editor {
             }
             return;
         }
-        let width = (text_width(&text, &self.font) + self.s(4))
+        let width = (text_width(&text, &self.font) + self.s(12))
             .min(client.right - self.s(32))
             .max(1);
-        let height = measured(&text, &self.font, width).min(self.font.height() * 2);
-        place(
-            self.status,
-            self.s(16),
-            client.bottom - height - self.s(8),
-            width,
-            height,
-        );
+        let height = measured(&text, &self.font, (width - self.s(12)).max(1))
+            .min(self.font.height() * 2)
+            + self.s(8);
+        place(self.status, 0, client.bottom - height, width, height);
         unsafe {
             SetWindowPos(
                 self.status,
@@ -948,6 +946,13 @@ impl Editor {
             GetClientRect(self.panes[0], &mut rect);
         }
         let width = (rect.right - padding * 2).max(1);
+        place(
+            unsafe { GetDlgItem(self.panes[0], 99) },
+            rect.right - 1,
+            0,
+            1,
+            height,
+        );
         let mut y = padding;
         for hwnd in &self.tabs {
             let h =
@@ -1835,6 +1840,7 @@ impl Editor {
                 self.update_axis_controls();
                 return Ok(());
             }
+            self.update_axis_controls();
             return self.switch_page(self.tab, (id - AXIS_H) as usize);
         }
         if id < BASE {
@@ -2196,6 +2202,15 @@ unsafe extern "system" fn control_proc(
     root: usize,
 ) -> LRESULT {
     unsafe {
+        #[cfg(test)]
+        if matches!(message, WM_SIZE | WM_PAINT) {
+            let key = if message == WM_SIZE {
+                w!("SizeCount")
+            } else {
+                w!("PaintCount")
+            };
+            SetPropW(hwnd, key, (GetPropW(hwnd, key) as usize + 1) as HANDLE);
+        }
         let combo = GetPropW(hwnd, w!("OwnerCombo"));
         if message == WM_WINDOWPOSCHANGING
             && !combo.is_null()
@@ -2370,22 +2385,21 @@ unsafe extern "system" fn pane_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: LP
                 FillRect(wp as HDC, &rect, crate::settings_theme::surface());
                 1
             }
-            WM_PAINT if GetDlgCtrlID(hwnd) == 1 => {
-                let mut paint = PAINTSTRUCT::default();
-                let dc = BeginPaint(hwnd, &mut paint);
-                let mut rect = RECT::default();
-                GetClientRect(hwnd, &mut rect);
-                rect.left = (rect.right - 1).max(0);
-                FillRect(dc, &rect, crate::settings_theme::edge());
-                EndPaint(hwnd, &paint);
-                0
-            }
             _ => DefWindowProcW(hwnd, message, wp, lp),
         }
     }
 }
 unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match message {
+        #[cfg(test)]
+        TEST_THEME => {
+            crate::settings_theme::test_dark(match wp {
+                1 => Some(false),
+                2 => Some(true),
+                _ => None,
+            });
+            unsafe { window_proc(hwnd, WM_THEMECHANGED, 0, 0) }
+        }
         #[cfg(test)]
         PREVIEW_STATE => EDITOR.with(|slot| {
             slot.try_borrow()
@@ -2824,12 +2838,14 @@ pub fn run(path: &Path) -> Result<(), String> {
                 TAB_BASE + index as i32,
             )?);
         }
-        editor.status = editor.create(hwnd, "STATIC", "", SS_LEFT | WS_BORDER, 600)?;
+        let divider = editor.create(panes[0], "STATIC", "", SS_OWNERDRAW, 99)?;
+        SetPropW(divider, w!("Separator"), 1usize as HANDLE);
+        editor.status = editor.create(hwnd, "STATIC", "", SS_OWNERDRAW, 600)?;
         editor.axis_controls[0] = editor.create(
             panes[1],
             "BUTTON",
             "",
-            BS_AUTORADIOBUTTON as u32 | BS_MULTILINE as u32 | WS_TABSTOP,
+            BS_AUTORADIOBUTTON as u32 | BS_MULTILINE as u32 | WS_TABSTOP | WS_GROUP,
             AXIS_H,
         )?;
         editor.axis_controls[1] = editor.create(
@@ -2843,7 +2859,7 @@ pub fn run(path: &Path) -> Result<(), String> {
             panes[1],
             "BUTTON",
             "",
-            BS_AUTORADIOBUTTON as u32 | BS_MULTILINE as u32 | WS_TABSTOP,
+            BS_AUTORADIOBUTTON as u32 | BS_MULTILINE as u32 | WS_TABSTOP | WS_GROUP,
             AXIS_BOTH,
         )?;
         editor.axis_controls[3] = editor.create(
@@ -3143,7 +3159,8 @@ mod tests {
         let path = folder.join("config.toml");
         std::fs::write(&path, config::help()).unwrap();
         assert!(unsafe { FindWindowW(CLASS, null()) }.is_null());
-        let controller = std::thread::spawn(|| {
+        let screenshots = folder.clone();
+        let controller = std::thread::spawn(move || {
             let _dpi = crate::test_support::Dpi::new();
             let deadline = Instant::now() + Duration::from_secs(10);
             let root = loop {
@@ -3156,6 +3173,8 @@ mod tests {
             };
             let result = std::panic::catch_unwind(|| unsafe {
                 for height in [780, 1000, 320, 480, 900, 320] {
+                    let combo = GetDlgItem(GetDlgItem(root, 2), BASE + 2 * STRIDE);
+                    let before_size = GetPropW(combo, w!("SizeCount")) as usize;
                     SetWindowPos(
                         root,
                         null_mut(),
@@ -3187,10 +3206,58 @@ mod tests {
                     let combo = GetDlgItem(right, BASE + 2 * STRIDE);
                     if !combo.is_null() {
                         assert_eq!(GetPropW(combo, w!("SettingsCombo")) as usize, 1);
+                        if height == 1000 {
+                            assert_eq!(
+                                GetPropW(combo, w!("SizeCount")) as usize,
+                                before_size,
+                                "height-only resize must not resize the language dropdown"
+                            );
+                        }
                     }
                 }
             });
             unsafe {
+                SetWindowPos(
+                    root,
+                    null_mut(),
+                    0,
+                    0,
+                    900,
+                    780,
+                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+                let language = GetDlgItem(GetDlgItem(root, 2), BASE + 2 * STRIDE);
+                send(language, CB_SETCURSEL, 1, 0);
+                send(
+                    root,
+                    WM_COMMAND,
+                    (BASE + 2 * STRIDE) as usize | ((CBN_SELCHANGE as usize) << 16),
+                    language as isize,
+                );
+                std::thread::sleep(Duration::from_millis(800));
+                for (mode, name) in [(1, "light"), (2, "dark")] {
+                    send(root, TEST_THEME, mode, 0);
+                    std::thread::sleep(Duration::from_millis(100));
+                    let pane = GetDlgItem(root, 2);
+                    let dc = GetDC(pane);
+                    let background = GetPixel(dc, 4, 4);
+                    ReleaseDC(pane, dc);
+                    assert_eq!(background, if mode == 1 { 0xffffff } else { 0x202020 });
+                    let status = GetDlgItem(root, 600);
+                    assert!(!caption(status).is_empty());
+                    assert_eq!(GetWindow(root, GW_CHILD), status);
+                    let mut status_rect = RECT::default();
+                    let mut root_rect = RECT::default();
+                    GetClientRect(root, &mut root_rect);
+                    GetWindowRect(status, &mut status_rect);
+                    MapWindowPoints(null_mut(), root, (&mut status_rect as *mut RECT).cast(), 2);
+                    assert_eq!(
+                        (status_rect.left, status_rect.bottom),
+                        (0, root_rect.bottom)
+                    );
+                    snapshot(root, &screenshots.join(format!("{name}.bmp")));
+                }
+                send(root, TEST_THEME, 0, 0);
                 PostMessageW(root, WM_CLOSE, 0, 0);
             }
             result.unwrap();
@@ -3741,6 +3808,40 @@ mod tests {
                 let effective = Config::parse(&saved)?;
                 if effective.lines[0].width != 3 || effective.lines[1].width != 3 {
                     return Err("Unified axis style did not update both lines".into());
+                }
+                send(hwnd, WM_COMMAND, AXIS_CUSTOM as usize, 0);
+                let pane = unsafe { GetDlgItem(hwnd, 2) };
+                if unsafe { IsWindowEnabled(GetDlgItem(pane, AXIS_H)) } == 0
+                    || unsafe { IsWindowEnabled(GetDlgItem(pane, AXIS_V)) } == 0
+                {
+                    return Err("Custom mode did not enable both axis choices".into());
+                }
+                send(unsafe { GetDlgItem(pane, AXIS_H) }, BM_CLICK, 0, 0);
+                std::thread::sleep(Duration::from_millis(100));
+                if send(unsafe { GetDlgItem(pane, AXIS_CUSTOM) }, BM_GETCHECK, 0, 0) != 1 {
+                    return Err("Selecting an axis cleared the custom mode".into());
+                }
+                send(hwnd, WM_COMMAND, AXIS_V as usize, 0);
+                let vertical_width = unsafe { GetDlgItem(pane, BASE + 2 * STRIDE) };
+                send(vertical_width, EM_SETSEL, 0, -1);
+                send(vertical_width, EM_REPLACESEL, 1, w!("7") as isize);
+                std::thread::sleep(Duration::from_millis(800));
+                let custom = config::read_settings(&output.join("config.toml"))?
+                    .parse::<DocumentMut>()
+                    .map_err(|e| e.to_string())?;
+                if custom["crosshair"]["mode"].as_str() != Some("custom")
+                    || Config::parse(&custom)?.lines[1].width != 7
+                {
+                    return Err("Custom mode or vertical style was not saved".into());
+                }
+                send(hwnd, WM_COMMAND, AXIS_BOTH as usize, 0);
+                let unified = config::read_settings(&output.join("config.toml"))?
+                    .parse::<DocumentMut>()
+                    .map_err(|e| e.to_string())?;
+                if unified["vertical"]["width"].as_integer() != Some(7)
+                    || Config::parse(&unified)?.lines[1].width != 3
+                {
+                    return Err("Unified mode lost the saved custom vertical style".into());
                 }
                 // The window manager may offer a work area smaller than our usual
                 // minimum at high scaling. Controls must wrap within a narrow pane.
