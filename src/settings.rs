@@ -234,7 +234,16 @@ fn text_width(text: &str, font: &Font) -> i32 {
     }
 }
 fn send(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> isize {
-    unsafe { SendMessageW(hwnd, msg, wp, lp) }
+    unsafe {
+        if msg == CB_SETITEMHEIGHT && SendMessageW(hwnd, CB_GETITEMHEIGHT, wp, 0) == lp {
+            return 0;
+        }
+        if msg == CB_SETDROPPEDWIDTH && SendMessageW(hwnd, CB_GETDROPPEDWIDTH, 0, 0) == wp as isize
+        {
+            return wp as isize;
+        }
+        SendMessageW(hwnd, msg, wp, lp)
+    }
 }
 fn caption(hwnd: HWND) -> String {
     unsafe {
@@ -261,14 +270,23 @@ fn place(hwnd: HWND, x: i32, y: i32, width: i32, height: i32) {
                 (&mut old as *mut RECT).cast(),
                 2,
             );
-            if (
-                old.left,
-                old.top,
-                old.right - old.left,
-                old.bottom - old.top,
-            ) == (x, y, width.max(1), height.max(1))
-            {
+            // A combo reports its collapsed height, whereas SetWindowPos receives the
+            // dropdown height. Remember that request to avoid resizing it on every tick.
+            let combo = !GetPropW(hwnd, w!("SettingsCombo")).is_null();
+            let same_height = if combo {
+                GetPropW(hwnd, w!("RequestedHeight")) as usize == height.max(1) as usize
+            } else {
+                old.bottom - old.top == height.max(1)
+            };
+            if (old.left, old.top, old.right - old.left) == (x, y, width.max(1)) && same_height {
                 return;
+            }
+            if combo {
+                SetPropW(
+                    hwnd,
+                    w!("RequestedHeight"),
+                    height.max(1) as usize as HANDLE,
+                );
             }
             SetWindowPos(
                 hwnd,
@@ -277,7 +295,7 @@ fn place(hwnd: HWND, x: i32, y: i32, width: i32, height: i32) {
                 y,
                 width.max(1),
                 height.max(1),
-                SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOCOPYBITS,
+                SWP_NOACTIVATE | SWP_NOZORDER,
             );
         }
     }
@@ -481,6 +499,7 @@ impl Editor {
                 self.window.0 as usize,
             ))?;
             if is_combo {
+                desktop::check(SetPropW(hwnd, w!("SettingsCombo"), 1usize as HANDLE))?;
                 let mut info = COMBOBOXINFO {
                     cbSize: size_of::<COMBOBOXINFO>() as u32,
                     ..Default::default()
@@ -869,13 +888,11 @@ impl Editor {
         Ok(())
     }
     fn layout(&mut self) -> Result<(), String> {
-        let _redraw = RedrawGuard::new(self.panes[1]);
         let mut client = RECT::default();
         unsafe {
             GetClientRect(self.window.0, &mut client);
         }
-        let footer = self.font.height() * 2 + self.s(16);
-        let height = (client.bottom - footer).max(1);
+        let height = client.bottom.max(1);
         let left = self.sidebar_width(client.right);
         place(self.panes[0], 0, 0, left, height);
         place(self.panes[1], left, 0, client.right - left, height);
@@ -1126,8 +1143,23 @@ impl Editor {
                 nPos: self.scroll[pane],
                 ..Default::default()
             };
-            unsafe {
-                SetScrollInfo(self.panes[pane], SB_VERT, &info, 1);
+            if pane == 1 {
+                unsafe {
+                    // Keep the scrollbar gutter stable when content starts/stops overflowing.
+                    let info = SCROLLINFO {
+                        fMask: info.fMask | SIF_DISABLENOSCROLL,
+                        ..info
+                    };
+                    let mut old = SCROLLINFO {
+                        cbSize: info.cbSize,
+                        fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
+                        ..Default::default()
+                    };
+                    GetScrollInfo(self.panes[pane], SB_VERT, &mut old);
+                    if (old.nMax, old.nPage, old.nPos) != (info.nMax, info.nPage, info.nPos) {
+                        SetScrollInfo(self.panes[pane], SB_VERT, &info, 1);
+                    }
+                }
             }
         }
         unsafe {
@@ -1217,7 +1249,9 @@ impl Editor {
             if !batch.is_null() {
                 EndDeferWindowPos(batch);
             }
-            SetScrollPos(self.panes[pane], SB_VERT, self.scroll[pane], 1);
+            if pane == 1 {
+                SetScrollPos(self.panes[pane], SB_VERT, self.scroll[pane], 1);
+            }
         }
         Ok(())
     }
@@ -2296,6 +2330,16 @@ unsafe extern "system" fn pane_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: LP
                 FillRect(wp as HDC, &rect, GetSysColorBrush(COLOR_WINDOW));
                 1
             }
+            WM_PAINT if GetDlgCtrlID(hwnd) == 1 => {
+                let mut paint = PAINTSTRUCT::default();
+                let dc = BeginPaint(hwnd, &mut paint);
+                let mut rect = RECT::default();
+                GetClientRect(hwnd, &mut rect);
+                rect.left = (rect.right - 1).max(0);
+                FillRect(dc, &rect, GetSysColorBrush(COLOR_3DSHADOW));
+                EndPaint(hwnd, &paint);
+                0
+            }
             _ => DefWindowProcW(hwnd, message, wp, lp),
         }
     }
@@ -2650,7 +2694,11 @@ pub fn run(path: &Path) -> Result<(), String> {
                 WS_EX_CONTROLPARENT,
                 PANE,
                 null(),
-                WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_CLIPCHILDREN,
+                WS_CHILD
+                    | WS_VISIBLE
+                    | WS_CLIPCHILDREN
+                    | WS_CLIPSIBLINGS
+                    | if index == 1 { WS_VSCROLL } else { 0 },
                 0,
                 0,
                 1,
@@ -3009,6 +3057,71 @@ mod tests {
             DeleteDC(memory);
             ReleaseDC(hwnd, dc);
         }
+    }
+
+    #[test]
+    #[ignore = "opens a temporary settings window and exercises live resize"]
+    fn resize_keeps_panes_at_bottom_and_sidebar_centered() {
+        let folder = std::env::current_dir().unwrap().join("target/resize-test");
+        std::fs::create_dir_all(&folder).unwrap();
+        let path = folder.join("config.toml");
+        std::fs::write(&path, config::help()).unwrap();
+        assert!(unsafe { FindWindowW(CLASS, null()) }.is_null());
+        let controller = std::thread::spawn(|| {
+            let _dpi = crate::test_support::Dpi::new();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let root = loop {
+                let root = unsafe { FindWindowW(CLASS, null()) };
+                if !root.is_null() {
+                    break root;
+                }
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            let result = std::panic::catch_unwind(|| unsafe {
+                for height in [780, 1000, 320, 480, 900, 320] {
+                    SetWindowPos(
+                        root,
+                        null_mut(),
+                        0,
+                        0,
+                        900,
+                        height,
+                        SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+                    std::thread::sleep(Duration::from_millis(100));
+                    let mut client = RECT::default();
+                    GetClientRect(root, &mut client);
+                    for id in [1, 2] {
+                        let pane = GetDlgItem(root, id);
+                        let mut rect = RECT::default();
+                        GetWindowRect(pane, &mut rect);
+                        MapWindowPoints(null_mut(), root, (&mut rect as *mut RECT).cast(), 2);
+                        assert_eq!(rect.bottom, client.bottom, "pane {id}, height {height}");
+                    }
+                    let sidebar = GetDlgItem(root, 1);
+                    assert_eq!(GetWindowLongW(sidebar, GWL_STYLE) as u32 & WS_VSCROLL, 0);
+                    let mut pane = RECT::default();
+                    GetClientRect(sidebar, &mut pane);
+                    let mut tab = RECT::default();
+                    GetWindowRect(GetDlgItem(sidebar, TAB_BASE), &mut tab);
+                    MapWindowPoints(null_mut(), sidebar, (&mut tab as *mut RECT).cast(), 2);
+                    assert!((tab.left - (pane.right - tab.right)).abs() <= 1);
+                    let right = GetDlgItem(root, 2);
+                    let combo = GetDlgItem(right, BASE + 2 * STRIDE);
+                    if !combo.is_null() {
+                        assert_eq!(GetPropW(combo, w!("SettingsCombo")) as usize, 1);
+                    }
+                }
+            });
+            unsafe {
+                PostMessageW(root, WM_CLOSE, 0, 0);
+            }
+            result.unwrap();
+        });
+        let _dpi = crate::test_support::Dpi::new();
+        run(&path).unwrap();
+        controller.join().unwrap();
     }
 
     #[test]
