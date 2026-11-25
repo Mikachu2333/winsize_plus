@@ -17,6 +17,8 @@ A Windows window management tool that uses Alt shortcuts and mouse actions to mo
 
 Run `winsizep.exe` and open Settings from the tray menu. Left Alt is the default: hold it or double-tap it, then press a key. Mouse actions target the foreground window selected when Alt was pressed.
 
+After an Alt hold activates capture or a WinSizeP action consumes input, releasing Alt suppresses the foreground application's menu activation. A short Alt tap and native shortcuts used before capture retain their usual behavior.
+
 | Common input | Action |
 | --- | --- |
 | Alt + left drag | Move the window |

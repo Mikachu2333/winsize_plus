@@ -50,6 +50,9 @@ pub fn display_changed() {
 }
 const LEFT: u32 = VK_LMENU as u32;
 const RIGHT: u32 = VK_RMENU as u32;
+// VK_E8 is unassigned: unlike Ctrl it cannot change a real modifier's state.
+const MENU_MASK_KEY: u16 = 0xe8;
+const MENU_MASK_TAG: usize = 0x5753_504d;
 
 #[derive(Default, PartialEq, Eq)]
 enum Mode {
@@ -69,6 +72,7 @@ struct Input {
     hold_ms: u32,
     hold_started: Option<u32>,
     hold_active: bool,
+    mask_alt_menu: bool,
     last_tap: Option<(u32, u32)>,
     pressed: u8,
     tap: Option<(u32, u32)>,
@@ -351,6 +355,7 @@ impl Input {
                 self.last_tap = None;
             }
             if self.target_allowed {
+                self.mask_alt_menu = true;
                 post(ALT_HOLD, self.gesture_target as usize, 0);
             }
             let _ = self.update_mouse();
@@ -371,6 +376,7 @@ impl Input {
         self.cancel_hold();
         self.mode = Mode::Idle;
         self.pressed = 0;
+        self.mask_alt_menu = false;
         self.tap = None;
         self.last_tap = None;
         self.second = false;
@@ -400,6 +406,7 @@ impl Input {
             self.last_tap = None;
             self.second = false;
             if self.pressed == 0 {
+                self.mask_alt_menu = false;
                 self.target_allowed = false;
                 self.mode = Mode::Idle;
                 self.drag = None;
@@ -466,6 +473,21 @@ impl Input {
         }
     }
     fn keyboard(&mut self, key: u32, down: bool, time: u32) -> bool {
+        let eaten = self.keyboard_inner(key, down, time);
+        if eaten && down && !matches!(key, LEFT | RIGHT) && self.pressed != 0 {
+            self.mask_alt_menu = true;
+        }
+        eaten
+    }
+    fn masks_release(&self, key: u32, down: bool) -> bool {
+        let side = match key {
+            LEFT => 1,
+            RIGHT => 2,
+            _ => 0,
+        };
+        !down && !self.second && self.mask_alt_menu && self.pressed & side != 0
+    }
+    fn keyboard_inner(&mut self, key: u32, down: bool, time: u32) -> bool {
         if self.paused {
             return false;
         }
@@ -561,6 +583,9 @@ impl Input {
                 return self.second;
             }
             self.pressed &= !side;
+            if self.pressed == 0 {
+                self.mask_alt_menu = false;
+            }
             if self.pressed & (self.gesture_mask | self.alt_mask) == 0 {
                 if self.hold_active {
                     post(ALT_RELEASE, 0, 0);
@@ -664,6 +689,27 @@ impl Input {
         eat
     }
 }
+fn mask_alt_menu() {
+    let keys = [0, KEYEVENTF_KEYUP].map(|flags| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: MENU_MASK_KEY,
+                dwFlags: flags,
+                dwExtraInfo: MENU_MASK_TAG,
+                ..Default::default()
+            },
+        },
+    });
+    // SAFETY: the array owns two initialized keyboard records for this synchronous call.
+    // Send before forwarding Alt-up so the foreground app sees an intervening key.
+    // If injection is denied, still forward the physical Alt-up to avoid a stuck Alt.
+    unsafe {
+        if SendInput(keys.len() as u32, keys.as_ptr(), size_of::<INPUT>() as i32) == 1 {
+            SendInput(1, &keys[1], size_of::<INPUT>() as i32);
+        }
+    }
+}
 unsafe extern "system" fn keyboard(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
         if hook_stopped() || INPUT.with(|cell| cell.try_borrow().is_ok_and(|input| input.paused)) {
@@ -671,6 +717,11 @@ unsafe extern "system" fn keyboard(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT
         }
         if code == HC_ACTION as i32 {
             let data = &*(lp as *const KBDLLHOOKSTRUCT);
+            // All WinSizeP hooks must pass their own mask through without casting it,
+            // treating it as an application shortcut, or recursively modifying input.
+            if data.dwExtraInfo == MENU_MASK_TAG && data.flags & LLKHF_INJECTED != 0 {
+                return CallNextHookEx(null_mut(), code, wp, lp);
+            }
             let down = matches!(wp as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
             let key = if data.vkCode == VK_PROCESSKEY.into() {
                 match data.scanCode {
@@ -718,10 +769,19 @@ unsafe extern "system" fn keyboard(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT
                     post_event(CAST_KEY, key as usize, detail as isize, Some(point));
                 }
             }
-            if INPUT.with(|cell| {
-                cell.try_borrow_mut()
-                    .is_ok_and(|mut input| input.keyboard(key, down, data.time))
-            }) {
+            let (eaten, mask) = INPUT.with(|cell| {
+                let Ok(mut input) = cell.try_borrow_mut() else {
+                    return (false, false);
+                };
+                input.advance_hold(data.time);
+                let mask = input.masks_release(key, down);
+                (input.keyboard(key, down, data.time), mask)
+            });
+            // Drop the RefCell borrow before SendInput can reenter any hook.
+            if mask && !eaten {
+                mask_alt_menu();
+            }
+            if eaten {
                 // Every WinSizeP UI thread has its own hook. Let the other hook observe Esc
                 // before consuming it, so resident tips and settings previews close together.
                 if key == VK_ESCAPE as u32 {
@@ -1543,6 +1603,287 @@ pub(super) mod tests {
         let (index, flag) = super::bit(0x51);
         input.bound[index] = flag;
         input
+    }
+    #[test]
+    fn menu_mask_is_reserved_for_captured_alt_gestures() {
+        use super::*;
+        let mut input = pending_hold(100);
+        assert!(
+            !input.masks_release(LEFT, false),
+            "short Alt tap must keep its menu"
+        );
+        input.keyboard(LEFT, false, 300);
+        assert!(!input.mask_alt_menu);
+
+        let mut input = pending_hold(100);
+        input.advance_hold(2100);
+        assert!(input.masks_release(LEFT, false));
+        assert!(!input.masks_release(LEFT, true));
+        assert!(!input.masks_release(RIGHT, false));
+        input.preview_tracking = true;
+        assert!(input.keyboard(VK_ESCAPE as u32, true, 2101));
+        assert!(
+            input.masks_release(LEFT, false),
+            "Esc must not turn a canceled preview into a menu"
+        );
+        input.keyboard(LEFT, false, 2102);
+        assert!(!input.mask_alt_menu);
+
+        for key in [VK_TAB, VK_CONTROL, VK_SHIFT, 0x58] {
+            let mut input = pending_hold(100);
+            input.keyboard(key as u32, true, 300);
+            input.advance_hold(2200);
+            assert!(!input.masks_release(LEFT, false), "native shortcut {key}");
+        }
+        let mut excluded = pending_hold(100);
+        excluded.target_allowed = false;
+        excluded.advance_hold(2100);
+        assert!(!excluded.masks_release(LEFT, false));
+        let mut second = pending_hold(100);
+        second.second = true;
+        second.advance_hold(2100);
+        assert!(
+            !second.masks_release(LEFT, false),
+            "the second Alt press was never forwarded"
+        );
+        let mut right = pending_hold(100);
+        right.pressed = 2;
+        right.alt_mask = 2;
+        right.advance_hold(2100);
+        assert!(right.masks_release(RIGHT, false));
+        right.reconcile_keys(|_| false);
+        assert!(!right.mask_alt_menu);
+    }
+
+    #[test]
+    fn menu_mask_events_do_not_trigger_bindings_or_annotations() {
+        use super::*;
+        let _hooks = Hooks::escape_only().unwrap();
+        on_hook(|| {
+            INPUT.with_borrow_mut(|input| {
+                input.cast_keys = true;
+                input.mode = Mode::Command;
+                input.pressed = 1;
+                input.hold_active = true;
+                let (index, flag) = bit(MENU_MASK_KEY as u32);
+                input.bound[index] = flag;
+            });
+            for message in [WM_KEYDOWN, WM_KEYUP] {
+                let event = KBDLLHOOKSTRUCT {
+                    vkCode: MENU_MASK_KEY as u32,
+                    flags: LLKHF_INJECTED,
+                    dwExtraInfo: MENU_MASK_TAG,
+                    ..Default::default()
+                };
+                assert_eq!(
+                    unsafe {
+                        keyboard(
+                            HC_ACTION as i32,
+                            message as usize,
+                            (&event as *const _) as isize,
+                        )
+                    },
+                    0
+                );
+            }
+            INPUT.with_borrow(|input| assert!(input.mode == Mode::Command && input.hold_active));
+        })
+        .unwrap();
+        assert!(next_event().is_none());
+    }
+
+    #[test]
+    #[ignore = "focuses a temporary menu window and sends Alt input to verify native menu activation"]
+    fn captured_alt_does_not_activate_the_foreground_menu() {
+        use super::*;
+        use windows_sys::core::w;
+        const PHYSICAL_TEST_TAG: usize = 0x5753_5054;
+        unsafe extern "system" fn replay_physical(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+            if code == HC_ACTION as i32 {
+                // Exercise the production hook at the real input boundary with test
+                // events interpreted as physical. Other injected events retain their flags.
+                let mut event = unsafe { *(lp as *const KBDLLHOOKSTRUCT) };
+                if event.dwExtraInfo == PHYSICAL_TEST_TAG {
+                    event.flags &= !(LLKHF_INJECTED | LLKHF_LOWER_IL_INJECTED);
+                    return unsafe { keyboard(code, wp, (&event as *const _) as isize) };
+                }
+            }
+            unsafe { keyboard(code, wp, lp) }
+        }
+        unsafe extern "system" fn probe(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+            unsafe {
+                if msg == WM_SYSCOMMAND && wp as u32 & 0xfff0 == SC_KEYMENU {
+                    let count = GetPropW(hwnd, w!("MenuCount")) as usize;
+                    SetPropW(hwnd, w!("MenuCount"), (count + 1) as HANDLE);
+                    return 0;
+                }
+                if matches!(msg, WM_KEYDOWN | WM_SYSKEYDOWN) && wp == MENU_MASK_KEY as usize {
+                    let count = GetPropW(hwnd, w!("MaskCount")) as usize;
+                    SetPropW(hwnd, w!("MaskCount"), (count + 1) as HANDLE);
+                }
+                DefWindowProcW(hwnd, msg, wp, lp)
+            }
+        }
+        fn send_key(key: u16, down: bool) {
+            let event = INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: key,
+                        dwFlags: if down { 0 } else { KEYEVENTF_KEYUP },
+                        dwExtraInfo: PHYSICAL_TEST_TAG,
+                        ..Default::default()
+                    },
+                },
+            };
+            assert_eq!(
+                unsafe { SendInput(1, &event, size_of::<INPUT>() as i32) },
+                1
+            );
+            settle();
+        }
+        fn settle() {
+            for _ in 0..5 {
+                crate::test_support::pump();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        struct Window(HWND, HWND);
+        impl Drop for Window {
+            fn drop(&mut self) {
+                unsafe {
+                    let release = INPUT {
+                        r#type: INPUT_KEYBOARD,
+                        Anonymous: INPUT_0 {
+                            ki: KEYBDINPUT {
+                                wVk: VK_LMENU,
+                                dwFlags: KEYEVENTF_KEYUP,
+                                dwExtraInfo: MENU_MASK_TAG,
+                                ..Default::default()
+                            },
+                        },
+                    };
+                    SendInput(1, &release, size_of::<INPUT>() as i32);
+                    DestroyWindow(self.0);
+                    SetForegroundWindow(self.1);
+                }
+            }
+        }
+        let _dpi = crate::test_support::Dpi::new();
+        let mut cfg = crate::test_support::cfg();
+        cfg.alt_hold_ms = 120;
+        let hooks = Hooks::start(&cfg).unwrap();
+        on_hook(|| unsafe {
+            let replacement = SetWindowsHookExW(
+                WH_KEYBOARD_LL,
+                Some(replay_physical),
+                GetModuleHandleW(null()),
+                0,
+            );
+            assert!(!replacement.is_null());
+            UnhookWindowsHookEx(KEYBOARD_HOOK.with(|slot| slot.replace(replacement)));
+        })
+        .unwrap();
+        let root = unsafe {
+            let class = WNDCLASSW {
+                lpfnWndProc: Some(probe),
+                hInstance: GetModuleHandleW(null()),
+                lpszClassName: w!("WinSizeP.MenuMask.Test"),
+                ..Default::default()
+            };
+            assert_ne!(RegisterClassW(&class), 0);
+            let menu = CreateMenu();
+            let popup = CreatePopupMenu();
+            assert_ne!(AppendMenuW(popup, MF_STRING, 1, w!("Test item")), 0);
+            assert_ne!(AppendMenuW(menu, MF_POPUP, popup as usize, w!("&File")), 0);
+            let previous = GetForegroundWindow();
+            let hwnd = CreateWindowExW(
+                0,
+                class.lpszClassName,
+                w!("WinSizeP Alt menu regression"),
+                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                100,
+                100,
+                480,
+                300,
+                null_mut(),
+                menu,
+                class.hInstance,
+                null(),
+            );
+            assert!(!hwnd.is_null());
+            let foreground_thread = GetWindowThreadProcessId(previous, null_mut());
+            let attached = AttachThreadInput(GetCurrentThreadId(), foreground_thread, 1) != 0;
+            SetForegroundWindow(hwnd);
+            SetFocus(hwnd);
+            if attached {
+                AttachThreadInput(GetCurrentThreadId(), foreground_thread, 0);
+            }
+            Window(hwnd, previous)
+        };
+        settle();
+        assert_eq!(unsafe { GetForegroundWindow() }, root.0);
+        for (scenario, hold, action, menus, masks) in [
+            ("short tap", false, None, 1, 0),
+            ("native Alt+F", false, Some(0x46), 1, 0),
+            ("hold only", true, None, 0, 1),
+            ("captured shortcut", true, Some(0x51), 0, 1),
+            ("canceled preview", true, Some(VK_ESCAPE), 0, 1),
+        ] {
+            on_hook(|| INPUT.with_borrow_mut(Input::reset_gesture)).unwrap();
+            configure(&cfg).unwrap();
+            unsafe {
+                RemovePropW(root.0, w!("MenuCount"));
+                RemovePropW(root.0, w!("MaskCount"));
+            }
+            send_key(VK_LMENU, true);
+            // The application excludes its own windows in production; this fixture
+            // is deliberately an in-process target so it can observe menu messages.
+            on_hook(|| INPUT.with_borrow_mut(|input| input.target_allowed = true)).unwrap();
+            if hold {
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                while !on_hook(|| INPUT.with_borrow(|input| input.hold_active)).unwrap() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "hold activation: {scenario}, state={:?}",
+                        on_hook(|| INPUT.with_borrow(|input| (
+                            input.pressed,
+                            input.hold_started,
+                            input.hold_active,
+                            input.hold_ms,
+                            unsafe { GetAsyncKeyState(VK_LMENU as i32) },
+                            input.last_event,
+                            unsafe { GetTickCount() }
+                        )))
+                        .unwrap()
+                    );
+                    settle();
+                }
+            }
+            if let Some(key) = action {
+                if key == VK_ESCAPE {
+                    on_hook(|| INPUT.with_borrow_mut(|input| input.preview_tracking = true))
+                        .unwrap();
+                }
+                send_key(key, true);
+                send_key(key, false);
+            }
+            send_key(VK_LMENU, false);
+            let count = unsafe { GetPropW(root.0, w!("MenuCount")) } as usize;
+            // This probe handles SC_KEYMENU without entering a modal menu loop;
+            // a mnemonic may therefore report both keydown and WM_SYSCHAR.
+            assert_eq!(count > 0, menus > 0, "{scenario}: menu activations={count}");
+            assert_eq!(
+                unsafe { GetPropW(root.0, w!("MaskCount")) } as usize,
+                masks,
+                "{scenario}"
+            );
+            assert!(
+                unsafe { GetAsyncKeyState(VK_MENU as i32) } >= 0,
+                "Alt remained down: {scenario}"
+            );
+        }
+        drop(hooks);
     }
     #[test]
     fn alt_hold_activates_at_the_deadline_once_and_consumes_matching_release() {
