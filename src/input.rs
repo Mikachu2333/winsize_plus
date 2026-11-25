@@ -1062,12 +1062,7 @@ pub fn configure(cfg: &Config) -> Result<(), String> {
     let (alt, gesture, hold_ms, exclusions, move_button, resize_button, double_ms) = (
         mask(&cfg.alt),
         mask(&cfg.gesture),
-        // Compensate activation latency only for configured holds longer than one second.
-        if cfg.alt_hold_ms > 1000 {
-            cfg.alt_hold_ms - 250
-        } else {
-            cfg.alt_hold_ms
-        },
+        cfg.alt_hold_ms,
         cfg.exclusions.clone(),
         cfg.move_button,
         cfg.resize_button,
@@ -1435,9 +1430,9 @@ pub(super) mod tests {
             (0, 0),
             (750, 750),
             (1000, 1000),
-            (1001, 751),
-            (1500, 1250),
-            (60000, 59750),
+            (1001, 1001),
+            (1500, 1500),
+            (60000, 60000),
         ] {
             cfg.alt_hold_ms = saved;
             configure(&cfg).unwrap();
