@@ -60,6 +60,10 @@ const SS_LEFT: u32 = 0;
 const SS_CENTER: u32 = 1;
 const SS_OWNERDRAW: u32 = 13;
 const SS_NOTIFY: u32 = 0x0100;
+// Keep the gap between save notices independent of user configuration.
+const SAVE_STATUS_DELAY_MS: u32 = 100;
+const SAVE_STATUS_TIMER: usize = 2;
+const ERROR_STATUS_DURATION: Duration = Duration::from_secs(10);
 thread_local! { static EDITOR: RefCell<Option<Editor>> = const { RefCell::new(None) }; }
 thread_local! { static UPDATING: Cell<bool> = const { Cell::new(false) }; }
 thread_local! {
@@ -219,7 +223,9 @@ struct Editor {
     tabs: Vec<HWND>,
     status: HWND,
     status_until: Cell<Option<Instant>>,
+    pending_status: RefCell<Option<(Instant, String, bool)>>,
     save_error: Cell<bool>,
+    last_error: RefCell<Option<String>>,
     axis_controls: [HWND; 4],
     path: PathBuf,
     original: String,
@@ -320,7 +326,15 @@ fn place(hwnd: HWND, x: i32, y: i32, width: i32, height: i32) {
                 y,
                 width.max(1),
                 height.max(1),
-                SWP_NOACTIVATE | SWP_NOZORDER,
+                SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOCOPYBITS,
+            );
+            // Resizing can change line wrapping and the edit formatting rectangle.
+            // Repaint the whole child instead of retaining pixels from its old width.
+            RedrawWindow(
+                hwnd,
+                null(),
+                null_mut(),
+                RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN,
             );
         }
     }
@@ -465,17 +479,81 @@ impl Editor {
         if self.save_error.get() {
             return;
         }
+        self.show_status(text, false);
+    }
+    fn show_status(&self, text: &str, error: bool) {
+        self.pending_status.borrow_mut().take();
+        unsafe {
+            KillTimer(self.window.0, SAVE_STATUS_TIMER);
+        }
+        self.save_error.set(error);
+        self.last_error.replace(error.then(|| text.to_owned()));
         set_text(self.status, text);
-        self.status_until
-            .set(Some(Instant::now() + Duration::from_secs(3)));
+        self.status_until.set(Some(
+            Instant::now()
+                + if error {
+                    ERROR_STATUS_DURATION
+                } else {
+                    Duration::from_secs(3)
+                },
+        ));
         self.layout_status();
     }
     fn error(&self, text: &str) {
-        self.save_error.set(false);
-        self.status(text);
-        self.save_error.set(true);
+        // Automatic save retries must not keep the same error visible forever.
+        if self.save_error.get() && self.last_error.borrow().as_deref() == Some(text) {
+            return;
+        }
+        self.show_status(text, true);
+    }
+    fn saved_status(&self, text: &str, error: bool) {
+        let interrupted = self.pending_status.borrow().is_some()
+            || (!caption(self.status).is_empty()
+                && self
+                    .status_until
+                    .get()
+                    .is_some_and(|until| Instant::now() < until));
+        if !interrupted {
+            self.show_status(text, error);
+            return;
+        }
+        // Repeated saves replace the pending notice and restart its quiet interval.
+        self.pending_status.replace(Some((
+            Instant::now() + Duration::from_millis(SAVE_STATUS_DELAY_MS.into()),
+            text.to_owned(),
+            error,
+        )));
+        self.save_error.set(error);
+        self.last_error.replace(error.then(|| text.to_owned()));
         self.status_until.set(None);
+        set_text(self.status, "");
         self.layout_status();
+        unsafe {
+            SetTimer(self.window.0, SAVE_STATUS_TIMER, SAVE_STATUS_DELAY_MS, None);
+        }
+    }
+    fn show_pending_status(&self, now: Instant) {
+        // Ignore a timer message queued for an earlier save. A newer save must get
+        // its full delay even when the old timer message was already in the queue.
+        let ready = self
+            .pending_status
+            .borrow_mut()
+            .take_if(|(when, _, _)| now >= *when);
+        if let Some((_, text, error)) = ready {
+            self.show_status(&text, error);
+        }
+    }
+    fn update_status(&self, now: Instant) {
+        self.show_pending_status(now);
+        if self
+            .status_until
+            .get()
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.status_until.set(None);
+            set_text(self.status, "");
+            self.layout_status();
+        }
     }
     fn layout_status(&self) {
         let mut client = RECT::default();
@@ -1026,6 +1104,9 @@ impl Editor {
         Ok(())
     }
     fn layout(&mut self) -> Result<(), String> {
+        unsafe {
+            RemovePropW(self.window.0, w!("ResizeQueued"));
+        }
         let mut client = RECT::default();
         unsafe {
             GetClientRect(self.window.0, &mut client);
@@ -1317,6 +1398,16 @@ impl Editor {
         if adjusted || rect.right != initial_right_width {
             self.layout()?;
         }
+        // Complete this resize before Windows draws the next drag frame. This also
+        // erases newly exposed text and the background behind rounded status corners.
+        unsafe {
+            RedrawWindow(
+                self.window.0,
+                null(),
+                null_mut(),
+                RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW,
+            );
+        }
         Ok(())
     }
     fn sidebar_width(&self, total: i32) -> i32 {
@@ -1574,8 +1665,8 @@ impl Editor {
         self.dirty.clear();
         self.save_error.set(false);
         match crate::logon::elevation_warning(&self.cfg) {
-            Some(warning) => self.error(&warning),
-            None => self.status(self.cfg.tr("Saved", "已保存")),
+            Some(warning) => self.saved_status(&warning, true),
+            None => self.saved_status(self.cfg.tr("Saved", "已保存"), false),
         }
         self.invalidate_pages();
         if rebuild || self.rows_changed() {
@@ -1861,7 +1952,7 @@ impl Editor {
         self.dirty.clear();
         self.pending = None;
         self.save_error.set(false);
-        self.status(self.cfg.tr("Saved", "已保存"));
+        self.saved_status(self.cfg.tr("Saved", "已保存"), false);
         if !self.rows_changed() {
             self.invalidate_pages();
             self.refresh_mapping_options();
@@ -2022,6 +2113,11 @@ impl Editor {
         Ok(())
     }
     fn command(&mut self, id: i32, event: u32, sender: HWND) -> Result<(), String> {
+        if matches!(event, BN_CLICKED | CBN_SELCHANGE | EN_CHANGE | EDIT_COMMIT) {
+            // A new user action can report the same problem again; background
+            // retries without another edit keep the original ten-second deadline.
+            self.last_error.borrow_mut().take();
+        }
         if event == CBN_DROPDOWN && id >= BASE {
             self.active_combo = Some(sender);
         }
@@ -2224,15 +2320,7 @@ impl Editor {
             self.hover(combo, -1);
         }
         self.tooltip.tick();
-        if self
-            .status_until
-            .get()
-            .is_some_and(|deadline| now >= deadline)
-        {
-            self.status_until.set(None);
-            set_text(self.status, "");
-            self.layout_status();
-        }
+        self.update_status(now);
         if self.pending.is_some_and(|when| now >= when) {
             self.save()?;
         }
@@ -2525,7 +2613,13 @@ unsafe extern "system" fn control_proc(
             // The format box must contain a whole line even when top padding is nonzero.
             // GDI otherwise resets the edit rectangle to its default top-aligned position.
             rect.bottom = (rect.top + metrics.tmHeight).max(rect.bottom - padding);
-            send(hwnd, EM_SETRECT, 0, (&rect as *const RECT) as isize);
+            send(hwnd, EM_SETRECTNP, 0, (&rect as *const RECT) as isize);
+            RedrawWindow(
+                hwnd,
+                null(),
+                null_mut(),
+                RDW_INVALIDATE | RDW_ERASE | RDW_FRAME,
+            );
             return result;
         }
         if class.eq_ignore_ascii_case("edit") && message == WM_GETDLGCODE {
@@ -2719,18 +2813,34 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
             unsafe {
                 if GetPropW(hwnd, w!("ResizeQueued")).is_null() {
                     SetPropW(hwnd, w!("ResizeQueued"), 1usize as HANDLE);
+                }
+            }
+            with_editor(|e| e.layout());
+            // Nested resize callbacks cannot borrow Editor; finish them after the
+            // current operation. Ordinary live resizing is laid out synchronously.
+            if !unsafe { GetPropW(hwnd, w!("ResizeQueued")) }.is_null() {
+                unsafe {
                     PostMessageW(hwnd, RESIZE, 0, 0);
                 }
             }
             0
         }
         RESIZE => {
-            unsafe {
-                RemovePropW(hwnd, w!("ResizeQueued"));
+            if !unsafe { GetPropW(hwnd, w!("ResizeQueued")) }.is_null() {
+                with_editor(|e| e.layout());
             }
+            0
+        }
+        WM_EXITSIZEMOVE => {
             with_editor(|e| e.layout());
             0
         }
+        WM_WINDOWPOSCHANGING => unsafe {
+            if lp != 0 && (*(lp as *const WINDOWPOS)).flags & SWP_NOSIZE == 0 {
+                (*(lp as *mut WINDOWPOS)).flags |= SWP_NOCOPYBITS;
+            }
+            DefWindowProcW(hwnd, message, wp, lp)
+        },
         WM_GETMINMAXINFO => {
             unsafe {
                 let info = &mut *(lp as *mut MINMAXINFO);
@@ -2822,7 +2932,14 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
             1
         },
         WM_TIMER => {
-            with_editor(|e| e.tick());
+            with_editor(|e| {
+                if wp == SAVE_STATUS_TIMER {
+                    e.show_pending_status(Instant::now());
+                    Ok(())
+                } else {
+                    e.tick()
+                }
+            });
             0
         }
         WM_VSCROLL | SCROLL => {
@@ -3093,7 +3210,9 @@ pub fn run(path: &Path) -> Result<(), String> {
             tabs: Vec::new(),
             status: null_mut(),
             status_until: Cell::new(None),
+            pending_status: RefCell::new(None),
             save_error: Cell::new(false),
+            last_error: RefCell::new(None),
             axis_controls: [null_mut(); 4],
             path: path.into(),
             original,
@@ -3285,7 +3404,9 @@ mod tests {
             tabs: Vec::new(),
             status: null_mut(),
             status_until: Cell::new(None),
+            pending_status: RefCell::new(None),
             save_error: Cell::new(false),
+            last_error: RefCell::new(None),
             axis_controls: [null_mut(); 4],
             path,
             original,
@@ -3439,10 +3560,59 @@ mod tests {
         let _hooks = input::Hooks::escape_only().unwrap();
         let mut editor = test_editor(0, "settings-modal-test");
         let hwnd = editor.window.0;
+        editor.saved_status("Initial save", false);
+        assert_eq!(caption(editor.status), "Initial save");
+        assert!(editor.pending_status.borrow().is_none());
+        editor.update_status(editor.status_until.get().unwrap());
+        editor.saved_status("After normal expiry", false);
+        assert_eq!(caption(editor.status), "After normal expiry");
+        assert!(editor.pending_status.borrow().is_none());
         editor.error("Save failed: full detailed error");
         editor.status("Saved");
         assert_eq!(caption(editor.status), "Save failed: full detailed error");
-        assert!(editor.status_until.get().is_none());
+        let error_until = editor.status_until.get().unwrap();
+        assert!(error_until > Instant::now() + Duration::from_secs(9));
+        editor.error("Save failed: full detailed error");
+        assert_eq!(editor.status_until.get(), Some(error_until));
+        editor.update_status(error_until);
+        assert!(caption(editor.status).is_empty());
+        editor.error("Save failed: full detailed error");
+        assert!(
+            caption(editor.status).is_empty(),
+            "automatic retries restarted the same error"
+        );
+        editor.error("A different error");
+        editor.saved_status("First save", false);
+        assert!(caption(editor.status).is_empty());
+        assert_eq!(
+            unsafe { GetWindowLongW(editor.status, GWL_STYLE) } as u32 & WS_VISIBLE,
+            0
+        );
+        let first = editor.pending_status.borrow().as_ref().unwrap().0;
+        editor.saved_status("Latest save", false);
+        let latest = editor.pending_status.borrow().as_ref().unwrap().0;
+        assert!(latest > first);
+        editor.show_pending_status(first);
+        assert!(
+            caption(editor.status).is_empty(),
+            "stale timer showed the newer notice early"
+        );
+        editor.show_pending_status(latest - Duration::from_nanos(1));
+        assert!(caption(editor.status).is_empty());
+        assert!(
+            editor.status_until.get().is_none(),
+            "hidden time must not consume the display lifetime"
+        );
+        editor.show_pending_status(latest);
+        assert_eq!(caption(editor.status), "Latest save");
+        assert!(editor.pending_status.borrow().is_none());
+        assert!(editor.status_until.get().unwrap() > Instant::now() + Duration::from_secs(2));
+        editor.saved_status("Stale success", false);
+        let stale = editor.pending_status.borrow().as_ref().unwrap().0;
+        editor.error("Save failed: full detailed error");
+        editor.show_pending_status(stale);
+        assert_eq!(caption(editor.status), "Save failed: full detailed error");
+        assert!(editor.status_until.get().unwrap() > Instant::now() + Duration::from_secs(9));
         let region = unsafe { CreateRectRgn(0, 0, 0, 0) };
         assert_ne!(unsafe { GetWindowRgn(editor.status, region) }, ERROR);
         assert_eq!(unsafe { PtInRegion(region, 0, 0) }, 0);
@@ -3616,6 +3786,117 @@ mod tests {
             ReleaseDC(hwnd, dc);
             pixels
         }
+    }
+
+    #[test]
+    #[ignore = "resizes a multiline edit across wrapping widths and compares with a full repaint"]
+    fn long_edit_text_repaints_after_shrinking_and_growing() {
+        let _dpi = crate::test_support::Dpi::new();
+        let _hooks = input::Hooks::escape_only().unwrap();
+        let editor = test_editor(0, "settings-edit-paint-test");
+        let root = editor.window.0;
+        unsafe {
+            SetWindowLongPtrW(root, GWLP_WNDPROC, window_proc as *const () as isize);
+            for pane in editor.panes {
+                ShowWindow(pane, SW_HIDE);
+            }
+            SetWindowPos(
+                root,
+                null_mut(),
+                0,
+                0,
+                1000,
+                600,
+                SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOZORDER,
+            );
+            ShowWindow(root, SW_SHOW);
+        }
+        let text = "A long configuration value with several words to wrap. 窗口缩小时旧文字必须完全擦除，不能留下前一次绘制的字符。";
+        let edit = editor
+            .create(root, "EDIT", text, WS_BORDER | WS_TABSTOP, 900)
+            .unwrap();
+        for dark in [false, true] {
+            crate::settings_theme::test_dark(Some(dark));
+            unsafe {
+                RedrawWindow(
+                    root,
+                    null(),
+                    null_mut(),
+                    RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW,
+                );
+            }
+            for width in [850, 300, 180, 650, 180, 850] {
+                place(edit, 20, 20, width, 220);
+                crate::test_support::pump();
+                unsafe {
+                    RedrawWindow(root, null(), null_mut(), RDW_UPDATENOW | RDW_ALLCHILDREN);
+                }
+                let rect = RECT {
+                    left: 0,
+                    top: 0,
+                    right: 900,
+                    bottom: 260,
+                };
+                let incremental = painted_pixels(root, rect);
+                unsafe {
+                    RedrawWindow(
+                        root,
+                        null(),
+                        null_mut(),
+                        RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW,
+                    );
+                }
+                let full = painted_pixels(root, rect);
+                let changed = incremental
+                    .iter()
+                    .zip(&full)
+                    .filter(|(a, b)| a != b)
+                    .count();
+                assert_eq!(
+                    changed, 0,
+                    "stale multiline edit pixels at width={width}, dark={dark}"
+                );
+                assert_eq!(caption(edit), text);
+            }
+            place(edit, 20, 20, 1000, 220);
+            for width in [1250, 800, 1150, 780, 1250] {
+                unsafe {
+                    SetWindowPos(
+                        root,
+                        null_mut(),
+                        0,
+                        0,
+                        width,
+                        600,
+                        SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOZORDER,
+                    );
+                }
+                crate::test_support::pump();
+                unsafe {
+                    RedrawWindow(root, null(), null_mut(), RDW_UPDATENOW | RDW_ALLCHILDREN);
+                }
+                let mut rect = RECT::default();
+                unsafe {
+                    GetClientRect(root, &mut rect);
+                }
+                rect.bottom = 260;
+                let incremental = painted_pixels(root, rect);
+                unsafe {
+                    RedrawWindow(
+                        root,
+                        null(),
+                        null_mut(),
+                        RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW,
+                    );
+                }
+                let full = painted_pixels(root, rect);
+                assert_eq!(
+                    incremental, full,
+                    "text clipped by parent width={width}, dark={dark}"
+                );
+            }
+        }
+        crate::settings_theme::test_dark(None);
     }
 
     #[test]

@@ -37,6 +37,8 @@ Customize shortcuts, mouse actions, regions, and annotations in Settings. See tr
 
 The configuration file, `winsizep_config.toml`, stays beside the executable. Reading, saving, and opening it always use ordinary user permissions. Access failures identify the file and error; click the error message at the bottom left of Settings to read the full details. Concurrent save conflicts preserve a `.conflict.toml` file for reviewing external changes.
 
+Save errors remain visible for 10 seconds. Clicking one opens a details message box that stays open until dismissed. When a new save replaces an active notice, the old notice disappears for 100 ms before the new one appears. The first notice and notices following normal expiry appear immediately.
+
 Administrator autostart requires an executable and parent directories that ordinary users cannot replace. If this check fails, WinSizeP refuses registration and attempts to remove the previous startup task. You can continue using the application with administrator autostart disabled.
 
 ## Command line
