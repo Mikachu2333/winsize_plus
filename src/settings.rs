@@ -479,13 +479,29 @@ impl Editor {
     }
     fn layout_status(&self) {
         let mut client = RECT::default();
+        let mut previous = RECT::default();
         unsafe {
             GetClientRect(self.window.0, &mut client);
+            GetWindowRect(self.status, &mut previous);
+            MapWindowPoints(
+                null_mut(),
+                self.window.0,
+                (&mut previous as *mut RECT).cast(),
+                2,
+            );
         }
         let text = caption(self.status);
         if text.is_empty() {
             unsafe {
-                ShowWindow(self.status, SW_HIDE);
+                if GetWindowLongW(self.status, GWL_STYLE) as u32 & WS_VISIBLE != 0 {
+                    ShowWindow(self.status, SW_HIDE);
+                    RedrawWindow(
+                        self.window.0,
+                        &previous,
+                        null_mut(),
+                        RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN,
+                    );
+                }
             }
             return;
         }
@@ -499,25 +515,38 @@ impl Editor {
                 self.font.height() * 2
             },
         ) + self.s(8);
-        place(self.status, 0, client.bottom - height, width, height);
         unsafe {
-            // SetWindowRgn clips owner drawing and hit testing; Windows owns a successful region.
-            let diameter = self.s(10).min(width).min(height).max(1);
-            let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, diameter, diameter);
-            if !region.is_null() && SetWindowRgn(self.status, region, 1) == 0 {
-                DeleteObject(region);
-            }
+            // Move and reshape without copying pixels painted under the previous clip.
+            // Repaint both footprints afterwards, including the panes visible in the corners.
             SetWindowPos(
                 self.status,
                 HWND_TOP,
                 0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                client.bottom - height,
+                width,
+                height,
+                SWP_NOACTIVATE | SWP_NOREDRAW | SWP_NOCOPYBITS | SWP_SHOWWINDOW,
             );
-            ShowWindow(self.status, SW_SHOWNOACTIVATE);
-            InvalidateRect(self.status, null(), 1);
+            // SetWindowRgn clips owner drawing and hit testing; Windows owns a successful region.
+            let diameter = self.s(10).min(width).min(height).max(1);
+            let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, diameter, diameter);
+            if !region.is_null() && SetWindowRgn(self.status, region, 0) == 0 {
+                DeleteObject(region);
+            }
+            let current = RECT {
+                left: 0,
+                top: client.bottom - height,
+                right: width,
+                bottom: client.bottom,
+            };
+            let mut damaged = RECT::default();
+            UnionRect(&mut damaged, &previous, &current);
+            RedrawWindow(
+                self.window.0,
+                &damaged,
+                null_mut(),
+                RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN,
+            );
         }
     }
     fn create(
@@ -3544,6 +3573,170 @@ mod tests {
             DeleteDC(memory);
             ReleaseDC(hwnd, dc);
         }
+    }
+
+    fn painted_pixels(hwnd: HWND, rect: RECT) -> Vec<u32> {
+        // Read only this test window's client surface, including overlapping children.
+        unsafe {
+            let dc = GetDCEx(hwnd, null_mut(), DCX_CACHE);
+            assert!(!dc.is_null());
+            let memory = CreateCompatibleDC(dc);
+            let width = rect.right - rect.left;
+            let height = rect.bottom - rect.top;
+            let info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: width,
+                    biHeight: -height,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut bits = null_mut();
+            let bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
+            assert!(!bitmap.is_null());
+            let old = SelectObject(memory, bitmap);
+            assert_ne!(
+                BitBlt(
+                    memory, 0, 0, width, height, dc, rect.left, rect.top, SRCCOPY
+                ),
+                0
+            );
+            GdiFlush();
+            let pixels = std::slice::from_raw_parts(bits as *const u32, (width * height) as usize)
+                .iter()
+                .map(|pixel| pixel & 0xffffff)
+                .collect();
+            SelectObject(memory, old);
+            DeleteObject(bitmap);
+            DeleteDC(memory);
+            ReleaseDC(hwnd, dc);
+            pixels
+        }
+    }
+
+    #[test]
+    #[ignore = "opens a temporary settings window and compares resize paints with a full repaint"]
+    fn status_corners_repaint_cleanly_when_resized_or_hidden() {
+        let _dpi = crate::test_support::Dpi::new();
+        let _hooks = input::Hooks::escape_only().unwrap();
+        let mut editor = test_editor(0, "settings-status-paint-test");
+        let root = editor.window.0;
+        unsafe {
+            SetWindowLongPtrW(root, GWLP_WNDPROC, window_proc as *const () as isize);
+            SetWindowLongW(
+                root,
+                GWL_STYLE,
+                (GetWindowLongW(root, GWL_STYLE) as u32 | WS_CLIPCHILDREN) as i32,
+            );
+            SetWindowLongW(
+                editor.status,
+                GWL_STYLE,
+                (WS_CHILD | WS_VISIBLE | SS_OWNERDRAW | SS_NOTIFY) as i32,
+            );
+            for pane in editor.panes {
+                SetWindowLongPtrW(pane, GWLP_WNDPROC, pane_proc as *const () as isize);
+                SetWindowLongW(
+                    pane,
+                    GWL_STYLE,
+                    (WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS) as i32,
+                );
+            }
+            ShowWindow(root, SW_SHOW);
+        }
+        for dark in [false, true] {
+            crate::settings_theme::test_dark(Some(dark));
+            unsafe {
+                RedrawWindow(
+                    root,
+                    null(),
+                    null_mut(),
+                    RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW,
+                );
+            }
+            editor.error("Configuration could not be saved. Click here for the full error. 配置无法保存，点击查看完整错误信息。");
+            for (width, height) in [(900, 700), (600, 420), (1050, 800), (680, 490), (900, 700)] {
+                unsafe {
+                    SetWindowPos(
+                        root,
+                        null_mut(),
+                        0,
+                        0,
+                        width,
+                        height,
+                        SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+                }
+                editor.layout().unwrap();
+                crate::test_support::pump();
+                unsafe {
+                    RedrawWindow(root, null(), null_mut(), RDW_UPDATENOW | RDW_ALLCHILDREN);
+                }
+                let mut rect = RECT::default();
+                unsafe {
+                    GetClientRect(root, &mut rect);
+                }
+                rect.top = (rect.bottom - 180).max(0);
+                let incremental = painted_pixels(root, rect);
+                unsafe {
+                    RedrawWindow(
+                        root,
+                        null(),
+                        null_mut(),
+                        RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW,
+                    );
+                }
+                let full = painted_pixels(root, rect);
+                let changed = incremental
+                    .iter()
+                    .zip(&full)
+                    .filter(|(a, b)| a != b)
+                    .count();
+                let samples: Vec<_> = incremental
+                    .iter()
+                    .zip(&full)
+                    .enumerate()
+                    .filter(|(_, (a, b))| a != b)
+                    .take(16)
+                    .map(|(i, (a, b))| {
+                        (
+                            i as i32 % rect.right,
+                            rect.top + i as i32 / rect.right,
+                            format!("{a:06x}->{b:06x}"),
+                        )
+                    })
+                    .collect();
+                assert_eq!(
+                    changed, 0,
+                    "stale pixels after {width}x{height}, dark={dark}: {samples:?}"
+                );
+            }
+            set_text(editor.status, "");
+            editor.layout_status();
+            crate::test_support::pump();
+            unsafe {
+                RedrawWindow(root, null(), null_mut(), RDW_UPDATENOW | RDW_ALLCHILDREN);
+            }
+            let mut rect = RECT::default();
+            unsafe {
+                GetClientRect(root, &mut rect);
+            }
+            rect.top = rect.bottom - 180;
+            let hidden = painted_pixels(root, rect);
+            unsafe {
+                RedrawWindow(
+                    root,
+                    null(),
+                    null_mut(),
+                    RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW,
+                );
+            }
+            assert_eq!(hidden, painted_pixels(root, rect));
+        }
+        crate::settings_theme::test_dark(None);
     }
 
     #[test]

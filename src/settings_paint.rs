@@ -31,6 +31,24 @@ pub fn draw(root: HWND, draw: &DRAWITEMSTRUCT) {
         let saved = SaveDC(dc);
         SetBkMode(dc, TRANSPARENT as i32);
         if draw.CtlID == 600 {
+            // Owner drawing can run while the window's resize region is changing.
+            // Clip this paint to its current bounds as well as the window region.
+            let diameter = scale(10)
+                .min(rect.right - rect.left)
+                .min(rect.bottom - rect.top)
+                .max(1);
+            let region = CreateRoundRectRgn(
+                rect.left,
+                rect.top,
+                rect.right + 1,
+                rect.bottom + 1,
+                diameter,
+                diameter,
+            );
+            if !region.is_null() {
+                ExtSelectClipRgn(dc, region, RGN_AND);
+                DeleteObject(region);
+            }
             FillRect(dc, &rect, crate::settings_theme::notice());
             SetTextColor(dc, crate::settings_theme::notice_text());
             rect.left += scale(6);
