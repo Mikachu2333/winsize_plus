@@ -50,6 +50,11 @@ impl Drop for Apartment {
 }
 
 pub fn sync_direct(enabled: bool, elevated: bool, owner: &str) -> Result<(), windows::core::Error> {
+    if enabled && elevated {
+        validate_elevated_startup().map_err(|error| {
+            windows::core::Error::new(windows::core::HRESULT::from_win32(5), error)
+        })?;
+    }
     let name = BSTR::from(format!(
         "WinSizeP-{}",
         owner.replace('!', "!!").replace('\\', "!")
@@ -95,22 +100,20 @@ fn sync_task(name: BSTR, task: Option<String>) -> windows::core::Result<()> {
     update()
 }
 
-/// Starting an elevated program that anyone can replace hands out administrator
-/// rights. Portable use is common, so this only warns.
+fn validate_elevated_startup() -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    if crate::security::replaceable_without_elevation(&exe)? {
+        return Err("Administrator autostart requires a protected program folder. Move WinSizeP to a folder ordinary users cannot modify, or disable administrator autostart. / 管理员自启动要求程序位于普通用户无法修改的受保护目录；请移动程序或关闭管理员自启动。".into());
+    }
+    Ok(())
+}
+
+/// Explain why an elevated startup request cannot be applied.
 pub fn elevation_warning(cfg: &crate::config::Config) -> Option<String> {
     if !(cfg.autostart && cfg.elevate) {
         return None;
     }
-    let exe = std::env::current_exe().ok()?;
-    crate::security::replaceable_without_elevation(&exe)
-        .ok()?
-        .then(|| {
-            cfg.tr(
-                "Warning: WinSizeP starts with administrator rights from a folder that can be changed without them. Any program could replace it to gain those rights; consider a protected folder.",
-                "警告：WinSizeP 将以管理员权限自启动，但其所在文件夹无需管理员权限即可修改，其他程序可替换它来获得管理员权限。建议移到受保护的文件夹。",
-            )
-            .to_owned()
-        })
+    validate_elevated_startup().err()
 }
 
 /// Run the task update in a child at this process's own level: (exit code, message).
@@ -149,6 +152,19 @@ fn update(enabled: bool, elevated: bool, owner: &str) -> Result<(Option<i32>, St
 }
 
 pub fn sync(enabled: bool, elevated: bool) -> Result<(), String> {
+    if enabled
+        && elevated
+        && let Err(error) = validate_elevated_startup()
+    {
+        // An older release may have already registered an unsafe task. Remove it
+        // before reporting the rejected request, including its administrator ACL.
+        return Err(match sync(false, false) {
+            Ok(()) => error,
+            Err(cleanup) => format!(
+                "{error}\nCould not remove the previous startup task / 无法移除旧自启动任务: {cleanup}"
+            ),
+        });
+    }
     let owner = account()?;
     let failed = |message: String| Err(format!("Autostart / 自动启动: {message}"));
     let helper = |enabled: bool, elevated: bool| {
@@ -182,6 +198,14 @@ pub fn sync(enabled: bool, elevated: bool) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn writable_programs_are_rejected_before_task_registration() {
+        let error = sync_direct(true, true, "WinSizeP.Audit.UnsafePath").unwrap_err();
+        assert!(
+            error.message().contains("protected program folder"),
+            "{error}"
+        );
+    }
     fn temporary_name() -> BSTR {
         BSTR::from(format!(
             "WinSizeP.Test.DeElevation.{}",

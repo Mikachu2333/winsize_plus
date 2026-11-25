@@ -79,7 +79,7 @@ fn notify_data(hwnd: HWND) -> NOTIFYICONDATAW {
     }
 }
 
-fn add(hwnd: HWND, icon: HICON) {
+fn add(hwnd: HWND, icon: HICON) -> Result<(), String> {
     let mut data = notify_data(hwnd);
     data.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP | NIF_MESSAGE;
     data.uCallbackMessage = CALLBACK;
@@ -93,11 +93,11 @@ fn add(hwnd: HWND, icon: HICON) {
     }
     data.szTip = tip;
     unsafe {
-        if Shell_NotifyIconW(NIM_ADD, &data) != 0 {
-            data.Anonymous.uVersion = NOTIFYICON_VERSION_4;
-            Shell_NotifyIconW(NIM_SETVERSION, &data);
-        }
+        desktop::check(Shell_NotifyIconW(NIM_ADD, &data))?;
+        data.Anonymous.uVersion = NOTIFYICON_VERSION_4;
+        Shell_NotifyIconW(NIM_SETVERSION, &data);
     }
+    Ok(())
 }
 
 unsafe extern "system" fn taskbar_event(
@@ -109,7 +109,7 @@ unsafe extern "system" fn taskbar_event(
     icon: usize,
 ) -> LRESULT {
     if message as usize == taskbar_created {
-        add(hwnd, icon as HICON);
+        let _ = add(hwnd, icon as HICON);
     }
     if message == CALLBACK {
         let event = lp as u32 & 0xffff;
@@ -167,12 +167,13 @@ impl Tray {
             }
             ChangeWindowMessageFilterEx(hwnd, message, MSGFLT_ALLOW, std::ptr::null_mut());
             ChangeWindowMessageFilterEx(hwnd, CALLBACK, MSGFLT_ALLOW, null_mut());
-            add(hwnd, icon);
-            Ok(Self {
+            let tray = Self {
                 hwnd,
                 icon,
                 taskbar_created: message as usize,
-            })
+            };
+            add(hwnd, icon)?;
+            Ok(tray)
         }
     }
 

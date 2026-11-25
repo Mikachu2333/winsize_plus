@@ -16,7 +16,7 @@ impl Drop for Apartment {
     }
 }
 
-pub fn unelevated(exe: &Path, parameters: &str) -> Result<(), String> {
+fn shell(exe: &Path, parameters: &str) -> Result<(), String> {
     // Refuse to delegate to an elevated shell, which would preserve administrator rights.
     unsafe {
         use windows_sys::Win32::{
@@ -71,9 +71,86 @@ pub fn unelevated(exe: &Path, parameters: &str) -> Result<(), String> {
     run().map_err(|error| format!("Desktop launch / 桌面启动: {error}"))
 }
 
+/// Prefer token-based creation; bound Explorer automation inside a disposable helper.
+pub fn unelevated(
+    exe: &Path,
+    parameters: &str,
+) -> Result<Option<std::os::windows::io::OwnedHandle>, String> {
+    match crate::config_access::launch(exe, parameters) {
+        Ok(process) => Ok(Some(process)),
+        Err(token_error) => shell_bounded(exe, parameters)
+            .map(|()| None)
+            .map_err(|shell_error| format!("{token_error}; {shell_error}")),
+    }
+}
+
+fn shell_bounded(exe: &Path, parameters: &str) -> Result<(), String> {
+    use std::{
+        os::windows::{io::AsRawHandle, process::CommandExt},
+        process::{Command, Stdio},
+        time::Duration,
+    };
+    let mut command = Command::new(std::env::current_exe().map_err(|e| e.to_string())?);
+    #[cfg(not(test))]
+    command.args([
+        "--shell-launch",
+        exe.to_str().ok_or("Invalid executable path")?,
+        parameters,
+    ]);
+    #[cfg(test)]
+    command
+        .args(["--exact", "launch::tests::shell_launch_probe", "--ignored"])
+        .env("WINSIZEP_SHELL_EXE", exe)
+        .env("WINSIZEP_SHELL_PARAMETERS", parameters);
+    let mut child = command
+        .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    if let Err(error) = crate::wait_process(child.as_raw_handle(), Duration::from_secs(10)) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    let status = child.wait().map_err(|e| e.to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("Desktop launch / 桌面启动: {status}"))
+    }
+}
+
+pub fn shell_helper(exe: &Path, parameters: &str) -> Result<(), String> {
+    // End before the parent gives up, even if Explorer never returns from COM.
+    let (done, wait) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        if matches!(
+            wait.recv_timeout(std::time::Duration::from_secs(8)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ) {
+            std::process::exit(1);
+        }
+    });
+    let result = shell(exe, parameters);
+    drop(done);
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "isolated Explorer automation helper"]
+    fn shell_launch_probe() {
+        shell_helper(
+            Path::new(&std::env::var_os("WINSIZEP_SHELL_EXE").unwrap()),
+            &std::env::var("WINSIZEP_SHELL_PARAMETERS").unwrap(),
+        )
+        .unwrap();
+    }
+
     fn probe_path() -> std::path::PathBuf {
         std::env::current_exe()
             .unwrap()
@@ -89,7 +166,7 @@ mod tests {
         std::fs::write(probe_path(), format!("{} {elevated}", std::process::id())).unwrap();
     }
     #[test]
-    #[ignore = "launches one hidden test process through Explorer"]
+    #[ignore = "launches one hidden test process with the ordinary user token"]
     fn shell_launcher_uses_interactive_token() {
         let path = probe_path();
         if path.exists() {

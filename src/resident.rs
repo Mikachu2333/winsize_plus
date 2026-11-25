@@ -1,14 +1,13 @@
 use crate::{
     cli::{Request, Switch},
     config::{self, Config},
-    desktop::{self, err, wide},
+    desktop::{self, err},
     framerate::FrameClock,
     input,
     overlay::Overlay,
     preview::Preview,
 };
 use std::{
-    fs,
     path::{Path, PathBuf},
     ptr::{null, null_mut},
     time::{Duration, Instant},
@@ -19,6 +18,8 @@ use windows_sys::{
     },
     core::w,
 };
+#[cfg(test)]
+use {crate::desktop::wide, std::fs};
 
 struct Watch(HANDLE);
 impl Drop for Watch {
@@ -129,7 +130,7 @@ impl App {
         self.overlay.hide_tip()
     }
     fn load(&mut self, automatic: bool) -> Result<(), String> {
-        let bytes = fs::read(&self.path).ok();
+        let bytes = crate::config_access::read(&self.path).ok();
         if automatic && bytes.is_some() && bytes == self.snapshot {
             return Ok(());
         }
@@ -742,6 +743,8 @@ pub fn run(
     path: &Path,
     recovery: Option<&str>,
     reopen_settings: bool,
+    startup: Option<&crate::handoff::Child>,
+    fallback: &mut Option<Config>,
 ) -> Result<crate::ResidentExit, String> {
     unsafe {
         let handle = CreateMutexW(null(), 0, w!("Local\\D5C9A59069D907909B153C76CEBDC023"));
@@ -759,25 +762,26 @@ pub fn run(
         // Losing the folder watcher (network share, removable drive) must not end the
         // resident: reopen it periodically and fall back to polling meanwhile.
         let open_watch = || {
-            let handle = FindFirstChangeNotificationW(
-                wide(path.parent()?).as_ptr(),
-                0,
-                FILE_NOTIFY_CHANGE_FILE_NAME
-                    | FILE_NOTIFY_CHANGE_LAST_WRITE
-                    | FILE_NOTIFY_CHANGE_SIZE,
-            );
-            (handle != INVALID_HANDLE_VALUE).then(|| Watch(handle))
+            crate::config_access::watch(path.parent()?)
+                .ok()
+                .map(|handle| Watch(handle as HANDLE))
         };
         let mut watch = open_watch();
         let mut rewatch = watch.is_none().then(|| later(5000));
-        let loaded = config::load_snapshot(path, None)?;
-        let mut cfg = loaded.config;
+        let (mut cfg, snapshot, write_error) = match config::load_snapshot(path, None) {
+            Ok(loaded) => (loaded.config, Some(loaded.bytes), loaded.write_error),
+            Err(error) if recovery.is_some() => (
+                fallback.take().ok_or_else(|| error.clone())?,
+                None,
+                Some(error),
+            ),
+            Err(error) => return Err(error),
+        };
         if recovery.is_some() {
             // A failed handoff resumes this process at its original integrity level.
             // Keep the requested file untouched so an explicit reload can retry.
             cfg.elevate = crate::security::elevated();
         }
-        let snapshot = Some(loaded.bytes);
         let overlay = Overlay::new()?;
         let _hooks = input::Hooks::start(&cfg)?;
         input::set_casting(cfg.mousecast.enabled, cfg.keycast.enabled)?;
@@ -808,6 +812,11 @@ pub fn run(
         if app.mousecast {
             app.cast.prepare_mouse(desktop::cursor()?, &app.cfg)?;
         }
+        // Configuration, hooks, renderers and the tray are now usable. Startup task
+        // synchronization may prompt the user and is not part of resident readiness.
+        if let Some(startup) = startup {
+            startup.confirm()?;
+        }
         let mut msg = MSG::default();
         if let Some(problem) = recovery {
             // A failed lowering removed the task while still elevated: register it again,
@@ -822,11 +831,13 @@ pub fn run(
             }
         } else if let Err(problem) = crate::logon::sync(app.cfg.autostart, app.cfg.elevate) {
             app.notice(&problem)?;
+        } else if let Some(problem) = write_error {
+            app.notice(&problem)?;
         } else if !app.cfg.warnings.is_empty() {
             app.config_notice()?;
         }
-        if reopen_settings {
-            crate::settings::open()?;
+        if reopen_settings && let Err(problem) = crate::settings::open() {
+            let _ = app.notice(&problem);
         }
         loop {
             for _ in 0..64 {
@@ -841,6 +852,7 @@ pub fn run(
                 let _ = app.notice(&problem);
             }
             if let Some(restart) = app.exit.take() {
+                *fallback = Some(app.cfg);
                 return Ok(restart);
             }
             if rewatch.is_some_and(|when| Instant::now() >= when) {
@@ -848,9 +860,7 @@ pub fn run(
                 rewatch = watch.is_none().then(|| later(5000));
                 // Changes made while nothing was watching are picked up here. Without a
                 // watcher this doubles as a slow poll, as long as the file is reachable.
-                if watch.is_some() || path.exists() {
-                    app.reload = Some(Instant::now());
-                }
+                app.reload = Some(Instant::now());
             }
             let timeout = rewatch.map_or(app.timeout(), |when| {
                 app.timeout()

@@ -4,9 +4,11 @@ mod cast;
 mod cli;
 mod colors;
 mod config;
+mod config_access;
 mod desktop;
 mod fonts;
 mod framerate;
+mod handoff;
 mod input;
 mod label_text;
 mod launch;
@@ -27,14 +29,16 @@ mod tray;
 
 use std::{
     io::BufRead,
-    os::windows::process::CommandExt,
+    os::windows::{
+        io::{FromRawHandle, OwnedHandle},
+        process::CommandExt,
+    },
     process::{Command, ExitCode, Stdio},
-    ptr::{null, null_mut},
+    ptr::null_mut,
 };
 use windows_sys::{
     Win32::{
         Foundation::*,
-        Security::*,
         System::{Recovery::RegisterApplicationRestart, Threading::*},
         UI::{HiDpi::*, Shell::*, WindowsAndMessaging::*},
     },
@@ -180,135 +184,62 @@ pub fn wait_process(process: HANDLE, timeout: std::time::Duration) -> Result<(),
 }
 
 fn launch_unelevated(reopen_settings: bool) -> Result<(), String> {
-    let exe = std::env::current_exe().map_err(|error| error.to_string())?;
-    let parameters = if reopen_settings {
-        "--resident --reopen-settings"
-    } else {
-        "--resident"
-    };
-    crate::launch::unelevated(&exe, parameters).or_else(|shell_error| {
-        launch_unelevated_token(parameters).map_err(|token_error| {
-            format!("Unelevated restart / 降权重启: {shell_error}; {token_error}")
-        })
-    })
-}
-
-fn launch_unelevated_token(parameters: &str) -> Result<(), String> {
-    let exe = std::env::current_exe().map_err(|error| error.to_string())?;
-    // Use the interactive shell's token so a permission change does not inherit this admin token.
-    unsafe {
-        let mut pid = 0;
-        GetWindowThreadProcessId(GetShellWindow(), &mut pid);
-        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-        if process.is_null() {
-            return Err(desktop::err());
-        }
-        let mut token = null_mut();
-        let ok = OpenProcessToken(process, TOKEN_QUERY | TOKEN_DUPLICATE, &mut token);
-        CloseHandle(process);
-        if ok == 0 {
-            return Err(desktop::err());
-        }
-        let mut elevation = TOKEN_ELEVATION::default();
-        let mut length = 0;
-        let queried = GetTokenInformation(
-            token,
-            TokenElevation,
-            (&mut elevation as *mut TOKEN_ELEVATION).cast(),
-            size_of::<TOKEN_ELEVATION>() as u32,
-            &mut length,
-        );
-        if queried == 0 || elevation.TokenIsElevated != 0 {
-            let reason = if queried == 0 {
-                desktop::err()
-            } else {
-                "it is elevated / 它以管理员权限运行".into()
-            };
-            CloseHandle(token);
-            return Err(format!(
-                "Desktop shell has no usable normal token / 桌面外壳没有可用的普通权限令牌: {reason}"
-            ));
-        }
-        let mut primary = null_mut();
-        let ok = DuplicateTokenEx(
-            token,
-            TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY,
-            null(),
-            SecurityImpersonation,
-            TokenPrimary,
-            &mut primary,
-        );
-        CloseHandle(token);
-        if ok == 0 {
-            return Err(desktop::err());
-        }
-        let mut command = desktop::wide(format!(
-            "{} {parameters}",
-            quote_argument(&exe.to_string_lossy())
-        ));
-        let startup = STARTUPINFOW {
-            cb: size_of::<STARTUPINFOW>() as u32,
-            ..Default::default()
-        };
-        let mut child = PROCESS_INFORMATION::default();
-        let ok = CreateProcessWithTokenW(
-            primary,
-            0,
-            null(),
-            command.as_mut_ptr(),
-            CREATE_NO_WINDOW,
-            null(),
-            null(),
-            &startup,
-            &mut child,
-        );
-        let error = desktop::err();
-        CloseHandle(primary);
-        if ok == 0 {
-            return Err(error);
-        }
-        CloseHandle(child.hThread);
-        CloseHandle(child.hProcess);
-    }
-    Ok(())
+    launch_resident(false, reopen_settings)
 }
 
 fn launch(elevate: bool) -> Result<(), String> {
     if resident::running() {
         return Ok(());
     }
-    let exe = std::env::current_exe().map_err(|err| err.to_string())?;
-    if elevate && !security::elevated() {
-        let (result, error) = unsafe {
-            let result = ShellExecuteW(
-                null_mut(),
-                w!("runas"),
-                desktop::wide(exe).as_ptr(),
-                w!("--resident"),
-                null(),
-                SW_HIDE,
-            );
-            (result as isize, desktop::err())
-        };
-        if result <= 32 {
-            // The return value is the authoritative code; the thread error only adds detail.
-            return Err(if result == SE_ERR_ACCESSDENIED as isize {
-                "UAC: canceled or denied / 已取消或被拒绝".into()
-            } else {
-                format!("UAC ({result}): {error}")
-            });
+    launch_resident(elevate, false)
+}
+
+fn launch_resident(elevate: bool, reopen: bool) -> Result<(), String> {
+    let handoff = handoff::Parent::new()?;
+    let exe = std::env::current_exe().map_err(|error| error.to_string())?;
+    let parameters = format!(
+        "--resident-handoff {} {} {}",
+        handoff.id,
+        u8::from(elevate),
+        u8::from(reopen)
+    );
+    let process = if elevate && !security::elevated() {
+        let exe = desktop::wide(&exe);
+        let parameters = desktop::wide(&parameters);
+        // SAFETY: strings outlive the call and the process handle gains one owner.
+        unsafe {
+            let mut info = SHELLEXECUTEINFOW {
+                cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
+                fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI,
+                lpVerb: w!("runas"),
+                lpFile: exe.as_ptr(),
+                lpParameters: parameters.as_ptr(),
+                nShow: SW_HIDE,
+                ..Default::default()
+            };
+            if ShellExecuteExW(&mut info) == 0 {
+                return Err(format!("UAC: {}", desktop::err()));
+            }
+            if info.hProcess.is_null() {
+                return Err("No successor process / 未启动新进程".into());
+            }
+            Some(OwnedHandle::from_raw_handle(info.hProcess))
         }
+    } else if !elevate && security::elevated() {
+        launch::unelevated(&exe, &parameters)?
     } else {
-        Command::new(exe)
-            .arg("--resident")
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|err| err.to_string())?;
-    }
-    Ok(())
+        Some(OwnedHandle::from(
+            Command::new(exe)
+                .raw_arg(&parameters)
+                .creation_flags(CREATE_NO_WINDOW)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|e| e.to_string())?,
+        ))
+    };
+    handoff.wait(process.as_ref())
 }
 
 #[cfg(not(debug_assertions))]
@@ -423,6 +354,26 @@ fn execute(args: &[String]) -> Result<(), String> {
             _ => first.clone(),
         };
     }
+    let startup = if args.first().is_some_and(|arg| arg == "--resident-handoff") {
+        if args.len() != 4
+            || !matches!(args[2].as_str(), "0" | "1")
+            || !matches!(args[3].as_str(), "0" | "1")
+        {
+            return Err("Invalid restart arguments".into());
+        }
+        let child = handoff::Child::open(&args[1])?;
+        if security::elevated() != (args[2] == "1") {
+            return Err("Successor has incorrect permissions / 新进程权限不符".into());
+        }
+        let reopen = args[3] == "1";
+        args = vec!["--resident".into()];
+        if reopen {
+            args.push("--reopen-settings".into());
+        }
+        Some(child)
+    } else {
+        None
+    };
     let values: Vec<_> = args.iter().map(String::as_str).collect();
     #[cfg(not(debug_assertions))]
     if !matches!(
@@ -433,6 +384,9 @@ fn execute(args: &[String]) -> Result<(), String> {
     }
     let path = config::path()?;
     match values.as_slice() {
+        ["--shell-launch", exe, parameters] => {
+            return launch::shell_helper(std::path::Path::new(exe), parameters);
+        }
         ["--version" | "-V"] => println!("WinSizeP {}", env!("CARGO_PKG_VERSION")),
         ["--help" | "-h"] => {
             println!(
@@ -477,12 +431,25 @@ fn execute(args: &[String]) -> Result<(), String> {
                 path.display()
             )
         }
-        [] => return launch(false),
+        [] => {
+            if !resident::running() {
+                // The initial background host chooses permissions from the configuration
+                // and can remain resident if consent is refused.
+                Command::new(std::env::current_exe().map_err(|e| e.to_string())?)
+                    .arg("--resident")
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .map_err(|e| e.to_string())?;
+            }
+        }
         ["--resident"] | ["--resident", "--reopen-settings"] => {
             let requested = config::requested_elevation(&path)?;
             let reopen = values.contains(&"--reopen-settings");
             let mut problem = None;
-            if requested && !security::elevated() {
+            if startup.is_none() && requested && !security::elevated() {
                 // A canceled prompt must not leave the user without a resident.
                 match launch(true) {
                     Ok(()) => return Ok(()),
@@ -493,7 +460,11 @@ fn execute(args: &[String]) -> Result<(), String> {
                         ))
                     }
                 }
-            } else if !requested && security::elevated() && security::can_lower() {
+            } else if startup.is_none()
+                && !requested
+                && security::elevated()
+                && security::can_lower()
+            {
                 // Started elevated by hand, by an installer or by an outdated task. The
                 // configuration decides: staying elevated would also register a task that
                 // a normal start can no longer update without asking for consent.
@@ -506,9 +477,20 @@ fn execute(args: &[String]) -> Result<(), String> {
                 RegisterApplicationRestart(w!("--resident"), 0);
             }
             let reopen_settings = std::cell::Cell::new(reopen);
+            let mut fallback = None;
+            let mut startup = startup;
             return supervise_resident(
                 problem,
-                |recovery| resident::run(&path, recovery, reopen_settings.replace(false)),
+                |recovery| {
+                    let confirmation = startup.take();
+                    resident::run(
+                        &path,
+                        recovery,
+                        reopen_settings.replace(false),
+                        confirmation.as_ref(),
+                        &mut fallback,
+                    )
+                },
                 |elevation| {
                     // A plain restart keeps the configured permissions. Resolving them here
                     // keeps a canceled prompt inside this still-running process.

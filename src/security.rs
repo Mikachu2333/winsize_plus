@@ -127,7 +127,23 @@ pub fn raise_was_declined() -> bool {
 /// Whether a process without administrator rights could replace `exe` or plant files
 /// beside it. Such a program must not be started elevated without a prompt.
 pub fn replaceable_without_elevation(exe: &std::path::Path) -> Result<bool, String> {
+    crate::config_access::run(|| replaceable_as_current_user(exe))?
+}
+fn replaceable_as_current_user(exe: &std::path::Path) -> Result<bool, String> {
+    use std::os::windows::fs::MetadataExt;
     use windows_sys::Win32::Storage::FileSystem::*;
+    // Reparse points can redirect a protected-looking path to another directory.
+    // Elevated startup requires a fixed path whose complete ancestry can be checked.
+    for path in exe.ancestors() {
+        if std::fs::symlink_metadata(path)
+            .map_err(|e| e.to_string())?
+            .file_attributes()
+            & FILE_ATTRIBUTE_REPARSE_POINT
+            != 0
+        {
+            return Ok(true);
+        }
+    }
     struct Token(HANDLE);
     impl Drop for Token {
         fn drop(&mut self) {
@@ -139,40 +155,11 @@ pub fn replaceable_without_elevation(exe: &std::path::Path) -> Result<bool, Stri
     // SAFETY: every buffer outlives its synchronous call; handles and the descriptor
     // are released by the guards above.
     unsafe {
-        let mut process = null_mut();
-        if OpenProcessToken(
-            GetCurrentProcess(),
-            TOKEN_QUERY | TOKEN_DUPLICATE,
-            &mut process,
-        ) == 0
-        {
+        let mut impersonation = null_mut();
+        if OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut impersonation) == 0 {
             return Err(err());
         }
-        let process = Token(process);
-        // Judge with the normal half of a split token; AccessCheck needs an
-        // impersonation token, which the linked token already is.
-        let mut linked = TOKEN_LINKED_TOKEN::default();
-        let mut size = 0;
-        let token = if elevated()
-            && GetTokenInformation(
-                process.0,
-                TokenLinkedToken,
-                (&mut linked as *mut TOKEN_LINKED_TOKEN).cast(),
-                size_of::<TOKEN_LINKED_TOKEN>() as u32,
-                &mut size,
-            ) != 0
-        {
-            Token(linked.LinkedToken)
-        } else if elevated() {
-            // No normal token exists (UAC disabled): everything this user runs is elevated.
-            return Ok(false);
-        } else {
-            let mut copy = null_mut();
-            if DuplicateToken(process.0, SecurityIdentification, &mut copy) == 0 {
-                return Err(err());
-            }
-            Token(copy)
-        };
+        let token = Token(impersonation);
         let granted = |path: &std::path::Path| -> Result<u32, String> {
             let mut descriptor = null_mut();
             let status = GetNamedSecurityInfoW(
@@ -217,10 +204,18 @@ pub fn replaceable_without_elevation(exe: &std::path::Path) -> Result<bool, Stri
         };
         let control = WRITE_DAC | WRITE_OWNER;
         let folder = exe.parent().ok_or("Executable folder")?;
-        Ok(
-            granted(exe)? & (FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE | control) != 0
-                || granted(folder)? & (FILE_ADD_FILE | FILE_DELETE_CHILD | control) != 0,
-        )
+        if granted(exe)? & (FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE | control) != 0
+            || granted(folder)? & (FILE_ADD_FILE | FILE_DELETE_CHILD | control) != 0
+        {
+            return Ok(true);
+        }
+        // A protected immediate directory can still be renamed through a writable ancestor.
+        for ancestor in folder.ancestors() {
+            if granted(ancestor)? & (DELETE | FILE_DELETE_CHILD | control) != 0 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 }
 pub fn can_control_window(hwnd: windows_sys::Win32::Foundation::HWND) -> bool {
@@ -251,7 +246,10 @@ pub fn can_control_window(hwnd: windows_sys::Win32::Foundation::HWND) -> bool {
 fn user_sid() -> Result<String, String> {
     unsafe {
         let mut token = null_mut();
-        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+        if OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut token) == 0
+            && (GetLastError() != ERROR_NO_TOKEN
+                || OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0)
+        {
             return Err(err());
         }
         let mut length = 0;
@@ -295,6 +293,33 @@ fn user_sid() -> Result<String, String> {
 /// another user's process to modify the mutex. The medium label avoids no-write-up denial.
 pub fn config_mutex() -> Result<HANDLE, String> {
     let sid = user_sid()?;
+    user_object(&sid, |attributes| unsafe {
+        let name = wide(format!("Local\\WinSizeP.Config.v2.{sid}"));
+        CreateMutexExW(
+            attributes,
+            name.as_ptr(),
+            0,
+            SYNCHRONIZATION_SYNCHRONIZE | MUTEX_MODIFY_STATE,
+        )
+    })
+}
+
+pub fn handoff_event(name: &str) -> Result<usize, String> {
+    user_object(&user_sid()?, |attributes| unsafe {
+        CreateEventExW(
+            attributes,
+            wide(name).as_ptr(),
+            CREATE_EVENT_MANUAL_RESET,
+            SYNCHRONIZATION_SYNCHRONIZE | EVENT_MODIFY_STATE,
+        )
+    })
+    .map(|handle| handle as usize)
+}
+
+fn user_object(
+    sid: &str,
+    create: impl FnOnce(&SECURITY_ATTRIBUTES) -> HANDLE,
+) -> Result<HANDLE, String> {
     let sddl = wide(format!("D:P(A;;GA;;;SY)(A;;GA;;;{sid})S:(ML;;NW;;;ME)"));
     unsafe {
         let mut descriptor = null_mut();
@@ -313,17 +338,11 @@ pub fn config_mutex() -> Result<HANDLE, String> {
             lpSecurityDescriptor: descriptor,
             bInheritHandle: 0,
         };
-        let name = wide(format!("Local\\WinSizeP.Config.v2.{sid}"));
-        let mutex = CreateMutexExW(
-            &attributes,
-            name.as_ptr(),
-            0,
-            SYNCHRONIZATION_SYNCHRONIZE | MUTEX_MODIFY_STATE,
-        );
-        if mutex.is_null() {
+        let handle = create(&attributes);
+        if handle.is_null() {
             Err(err())
         } else {
-            Ok(mutex)
+            Ok(handle)
         }
     }
 }

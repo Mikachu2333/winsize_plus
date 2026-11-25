@@ -1462,10 +1462,22 @@ fn lock() -> Result<Lock, String> {
 }
 
 fn write(path: &Path, text: &str, expected: Option<&[u8]>) -> io::Result<()> {
-    let temp = path.with_extension(format!("{}.tmp", std::process::id()));
-    // Every caller holds the configuration mutex, so a file of this name can only be
-    // left over from a killed process whose identifier has been reused.
-    let _ = fs::remove_file(&temp);
+    write_before_replace(path, text, expected, || {})
+}
+
+fn write_before_replace(
+    path: &Path,
+    text: &str,
+    expected: Option<&[u8]>,
+    before_replace: impl FnOnce(),
+) -> io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::*;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(io::Error::other)?
+        .as_nanos();
+    let temp = path.with_extension(format!("{}.{nonce}.tmp", std::process::id()));
+    let backup = path.with_extension(format!("{}.{nonce}.conflict.toml", std::process::id()));
     let mut file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -1474,8 +1486,8 @@ fn write(path: &Path, text: &str, expected: Option<&[u8]>) -> io::Result<()> {
         file.write_all(text.as_bytes())?;
         file.sync_all()?;
         drop(file);
-        // Editors outside WinSizeP do not acquire our mutex. Refuse an observed
-        // intervening edit rather than replacing a version we never merged.
+        // The early check avoids needless replacements; ReplaceFile's backup below
+        // also preserves edits that arrive after this check.
         let current = match fs::read(path) {
             Ok(bytes) => Some(bytes),
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
@@ -1487,22 +1499,114 @@ fn write(path: &Path, text: &str, expected: Option<&[u8]>) -> io::Result<()> {
                 "Configuration changed during save; retry / 保存期间配置已变化，请重试",
             ));
         }
-        fs::rename(&temp, path)
+        before_replace();
+        let target_name = crate::desktop::wide(path);
+        let temp_name = crate::desktop::wide(&temp);
+        if let Some(expected) = expected {
+            let backup_name = crate::desktop::wide(&backup);
+            // SAFETY: all paths remain live for the synchronous atomic replacement.
+            if unsafe {
+                ReplaceFileW(
+                    target_name.as_ptr(),
+                    temp_name.as_ptr(),
+                    backup_name.as_ptr(),
+                    0,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            } == 0
+            {
+                let error = io::Error::last_os_error();
+                // Some ReplaceFile failures already moved the old target to backup.
+                // Keep both recovery files and include their paths in the error.
+                if backup.exists() {
+                    return Err(io::Error::other(format!(
+                        "Concurrent configuration edit preserved at {}; pending save at {}: {error}",
+                        backup.display(),
+                        temp.display()
+                    )));
+                }
+                return Err(error);
+            }
+            preserve_concurrent_edit(&backup, expected)?;
+        } else if unsafe {
+            // MoveFileEx without REPLACE_EXISTING refuses a concurrently created target.
+            MoveFileExW(
+                temp_name.as_ptr(),
+                target_name.as_ptr(),
+                MOVEFILE_WRITE_THROUGH,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     })();
-    if result.is_err() {
+    if result.is_err() && !backup.exists() {
         let _ = fs::remove_file(temp);
     }
     result
 }
+fn preserve_concurrent_edit(backup: &Path, expected: &[u8]) -> io::Result<()> {
+    use std::{
+        io::Read,
+        os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
+    };
+    use windows_sys::Win32::{Foundation::GENERIC_READ, Storage::FileSystem::*};
+    let conflict = || {
+        io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!(
+                "Concurrent configuration edit preserved at {}; review both files / 并发修改已保存在 {}，请核对两个文件",
+                backup.display(),
+                backup.display()
+            ),
+        )
+    };
+    // Deny writes while comparing, including writers holding a handle to the replaced file.
+    // If a writer is still active, leave its file intact and report its recovery location.
+    let mut old = fs::OpenOptions::new()
+        .read(true)
+        .access_mode(GENERIC_READ | DELETE)
+        .share_mode(FILE_SHARE_READ)
+        .open(backup)
+        .map_err(|_| conflict())?;
+    let mut bytes = Vec::new();
+    old.read_to_end(&mut bytes).map_err(|_| conflict())?;
+    if bytes != expected {
+        return Err(conflict());
+    }
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    // SAFETY: delete the compared file by its live handle while writes and renames
+    // remain denied; no path lookup can switch which version is being removed.
+    if unsafe {
+        SetFileInformationByHandle(
+            old.as_raw_handle(),
+            FileDispositionInfo,
+            (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+            size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(conflict());
+    }
+    Ok(())
+}
+
 pub fn read_settings(path: &Path) -> Result<String, String> {
-    let _lock = lock()?;
-    decode(&fs::read(path).map_err(|err| err.to_string())?)
+    crate::config_access::run(|| {
+        let _lock = lock()?;
+        decode(&fs::read(path).map_err(|err| crate::config_access::error(path, &err.to_string()))?)
+    })?
 }
 pub fn requested_elevation(path: &Path) -> Result<bool, String> {
+    crate::config_access::run(|| requested_elevation_inner(path))?
+}
+fn requested_elevation_inner(path: &Path) -> Result<bool, String> {
     let text = match fs::read(path) {
         Ok(bytes) => decode(&bytes)?,
         Err(error) if error.kind() == io::ErrorKind::NotFound => help().to_owned(),
-        Err(error) => return Err(error.to_string()),
+        Err(error) => return Err(crate::config_access::error(path, &error.to_string())),
     };
     let (mut doc, _) = document(&text)?;
     migrate(&mut doc)?;
@@ -1510,16 +1614,21 @@ pub fn requested_elevation(path: &Path) -> Result<bool, String> {
 }
 
 pub fn save_settings(path: &Path, original: &str, doc: &DocumentMut) -> Result<String, String> {
+    crate::config_access::run(|| save_settings_inner(path, original, doc))?
+}
+fn save_settings_inner(path: &Path, original: &str, doc: &DocumentMut) -> Result<String, String> {
     Config::parse(doc)?;
     let _lock = lock()?;
-    let bytes = fs::read(path).map_err(|err| err.to_string())?;
+    let bytes =
+        fs::read(path).map_err(|err| crate::config_access::error(path, &err.to_string()))?;
     let (base, _) = document(original)?;
     let (mut disk, _) = document(&decode(&bytes)?)?;
     merge_edits(base.as_table(), doc.as_table(), disk.as_table_mut());
     migrate(&mut disk)?;
     recover(&mut disk)?;
     let saved = disk.to_string();
-    write(path, &saved, Some(&bytes)).map_err(|err| err.to_string())?;
+    write(path, &saved, Some(&bytes))
+        .map_err(|err| crate::config_access::error(path, &err.to_string()))?;
     Ok(saved)
 }
 
@@ -1534,12 +1643,19 @@ pub struct Loaded {
 }
 
 pub fn load(path: &Path, edit: Option<(&Identity, Switch)>) -> Result<Config, String> {
-    load_snapshot(path, edit).map(|loaded| loaded.config)
+    let loaded = load_snapshot(path, edit)?;
+    if let Some(error) = loaded.write_error {
+        return Err(error);
+    }
+    Ok(loaded.config)
 }
 
 /// All returned values describe the same read (or the same committed write), except
 /// when a repair could not be stored: see `Loaded::write_error`.
 pub fn load_snapshot(path: &Path, edit: Option<(&Identity, Switch)>) -> Result<Loaded, String> {
+    crate::config_access::run(|| load_snapshot_inner(path, edit))?
+}
+fn load_snapshot_inner(path: &Path, edit: Option<(&Identity, Switch)>) -> Result<Loaded, String> {
     let _lock = lock()?;
     let (bytes, new) = match fs::read(path) {
         Ok(bytes) => (bytes, false),
@@ -1550,10 +1666,10 @@ pub fn load_snapshot(path: &Path, edit: Option<(&Identity, Switch)>) -> Result<L
                 Err(err) if err.kind() == io::ErrorKind::NotFound => {
                     (help().as_bytes().to_vec(), true)
                 }
-                Err(err) => return Err(err.to_string()),
+                Err(err) => return Err(crate::config_access::error(path, &err.to_string())),
             }
         }
-        Err(err) => return Err(err.to_string()),
+        Err(err) => return Err(crate::config_access::error(path, &err.to_string())),
     };
     let text = decode(&bytes)?;
     let (mut doc, repaired) = document(&text)?;
@@ -1603,8 +1719,12 @@ pub fn load_snapshot(path: &Path, edit: Option<(&Identity, Switch)>) -> Result<L
             // A read-only or locked file still yields a usable configuration. Failing
             // here would also retry forever: the temporary file made for the attempt
             // wakes the folder watcher again. Only a requested edit must reach the disk.
-            Err(error) if !new && edit.is_none() => (text, bytes, Some(error.to_string())),
-            Err(error) => return Err(error.to_string()),
+            Err(error) if !new && edit.is_none() => (
+                text,
+                bytes,
+                Some(crate::config_access::error(path, &error.to_string())),
+            ),
+            Err(error) => return Err(crate::config_access::error(path, &error.to_string())),
         }
     } else {
         (text, bytes, None)
@@ -1620,6 +1740,67 @@ pub fn load_snapshot(path: &Path, edit: Option<(&Identity, Switch)>) -> Result<L
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn replacement_keeps_intervening_and_still_open_edits_recoverable() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let folder = std::env::current_dir()
+            .unwrap()
+            .join("target/config-conflict-test");
+        fs::create_dir_all(&folder).unwrap();
+        let path = folder.join("config.toml");
+        fs::write(&path, "original").unwrap();
+        write(&path, "saved", Some(b"original")).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"saved");
+        assert!(write(&path, "stale", Some(b"original")).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"saved");
+        assert!(write(&path, "new", None).is_err());
+        let error = write_before_replace(&path, "merged", Some(b"saved"), || {
+            fs::write(&path, "external between check and replacement").unwrap();
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(fs::read(&path).unwrap(), b"merged");
+        let recovered = fs::read_dir(&folder)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .ends_with(".conflict.toml")
+            })
+            .unwrap();
+        assert!(error.to_string().contains(&recovered.display().to_string()));
+        assert_eq!(
+            fs::read(&recovered).unwrap(),
+            b"external between check and replacement"
+        );
+        fs::remove_file(recovered).unwrap();
+
+        let backup = folder.join("replaced.conflict.toml");
+        fs::write(&backup, "external edit").unwrap();
+        let conflict = preserve_concurrent_edit(&backup, b"original").unwrap_err();
+        assert!(conflict.to_string().contains(&backup.display().to_string()));
+        assert_eq!(fs::read(&backup).unwrap(), b"external edit");
+        fs::write(&backup, "original").unwrap();
+        let mut writer = fs::OpenOptions::new()
+            .write(true)
+            .share_mode(
+                windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ
+                    | windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE
+                    | windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE,
+            )
+            .open(&backup)
+            .unwrap();
+        assert!(preserve_concurrent_edit(&backup, b"original").is_err());
+        writer.write_all(b"late edit").unwrap();
+        drop(writer);
+        assert_eq!(fs::read(&backup).unwrap(), b"late edit");
+        preserve_concurrent_edit(&backup, b"late edit").unwrap();
+        assert!(!backup.exists());
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(folder).unwrap();
+    }
     use super::*;
     #[test]
     fn crosshair_mode_preserves_custom_style_and_defaults_to_unified_yellow() {
