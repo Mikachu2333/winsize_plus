@@ -221,7 +221,13 @@ impl Preview {
         self.frame = desktop::bounds(hwnd)
             .map(|(_, frame)| frame)
             .unwrap_or(desktop::screen(point, 0)?.work);
-        self.follow(point, cfg)
+        let result = self.follow(point, cfg);
+        if result.is_err() {
+            // The desktop-wide outline is shown before the labels are rendered. A failure
+            // after that point has no timer to remove it, so take it down here.
+            self.hide();
+        }
+        result
     }
     pub fn hide(&mut self) {
         self.base.hide();
@@ -246,7 +252,7 @@ impl Preview {
     pub fn warnings(&self) -> &[String] {
         &self.warnings
     }
-    fn rebuild(&mut self, monitor: HMONITOR, _point: POINT, cfg: &Config) -> Result<(), String> {
+    fn rebuild(&mut self, monitor: HMONITOR, cfg: &Config) -> Result<(), String> {
         let display = desktop::display(monitor)?;
         let virtual_area = desktop::desktop();
         let displays = desktop::displays()?;
@@ -416,7 +422,7 @@ impl Preview {
         if self.display.as_ref().is_none_or(|(old, _)| *old != monitor)
             || self.display_epoch != desktop::display_epoch()
         {
-            self.rebuild(monitor, point, cfg)?;
+            self.rebuild(monitor, cfg)?;
         }
         if let Some(name) = &self.locked {
             let selected = self.regions.iter().position(|region| &region.name == name);
@@ -429,11 +435,17 @@ impl Preview {
             || point.x >= area.x + area.width - 2
             || point.y >= area.y + area.height - 2;
         if self.focused {
-            if edge
-                || self
-                    .selected
-                    .is_none_or(|index| !contains(self.regions[index].rect, point))
-            {
+            // A grid cell may map to a region elsewhere (another monitor, a custom
+            // mapping, the taskbar strip), so there the pointer's cell decides.
+            let inside = |index: usize| {
+                if self.grid {
+                    cfg.cell(display.number, area.grid(point.x, point.y) as u32 + 1)
+                        .is_some_and(|name| self.regions[index].name == name)
+                } else {
+                    contains(self.regions[index].rect, point)
+                }
+            };
+            if edge || self.selected.is_none_or(|index| !inside(index)) {
                 self.show_base(cfg)?;
             } else {
                 return Ok(());

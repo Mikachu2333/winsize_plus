@@ -136,14 +136,37 @@ impl App {
         let loaded = config::load_snapshot(&self.path, None)?;
         let mut cfg = loaded.config;
         let snapshot = loaded.bytes;
+        let unsaved = loaded.write_error;
+        let current = crate::security::elevated();
+        if !cfg.elevate {
+            crate::security::raise_declined(false);
+        }
+        if !current && cfg.elevate && automatic && crate::security::raise_was_declined() {
+            // Consent was refused for this request. Keep running normally instead of
+            // prompting again after every edit; an explicit reload or restart retries.
+            cfg.elevate = false;
+        }
         let sync_task =
             !automatic || (cfg.autostart, cfg.elevate) != (self.cfg.autostart, self.cfg.elevate);
-        let current_elevation = unsafe { windows_sys::Win32::UI::Shell::IsUserAnAdmin() } != 0;
-        let lowering = current_elevation && !cfg.elevate;
-        let mut restart = cfg.elevate != current_elevation;
+        // Only a split token has a normal half to return to: with UAC disabled or the
+        // built-in Administrator account every instance is elevated.
+        let lowering = current && !cfg.elevate && crate::security::can_lower();
+        let raising = !current && cfg.elevate;
+        let mut restart = lowering || raising;
         let mut startup_error = None;
-        if (sync_task || lowering)
-            && let Err(error) = crate::logon::prepare(cfg.autostart, cfg.elevate, current_elevation)
+        let task = if raising {
+            // The elevated successor registers the task itself; doing it here as well
+            // would ask for consent twice.
+            None
+        } else if lowering {
+            // Updating RunLevel does not remove an administrator-owned task's protected
+            // ACL. Delete while still elevated; the normal successor creates it again.
+            Some(false)
+        } else {
+            sync_task.then_some(cfg.autostart)
+        };
+        if let Some(enabled) = task
+            && let Err(error) = crate::logon::sync(enabled, cfg.elevate)
         {
             // Keep independent settings working when consent is canceled; retry startup on
             // the next explicit reload/edit instead of repeatedly prompting for UAC.
@@ -175,6 +198,16 @@ impl App {
         }
         if let Some(error) = startup_error {
             self.notice(&error)
+        } else if let Some(error) = unsaved {
+            self.notice(&format!(
+                "{}: {error}",
+                self.cfg.tr(
+                    "Configuration applied, but the file could not be updated",
+                    "配置已应用，但无法更新配置文件"
+                )
+            ))
+        } else if sync_task && let Some(warning) = crate::logon::elevation_warning(&self.cfg) {
+            self.notice(&warning)
         } else {
             self.config_notice()
         }
@@ -265,6 +298,8 @@ impl App {
             "reload" => self.load(false),
             "restart" | "quit" => {
                 if action == "quit" {
+                    // Only a refused save keeps the resident alive. An unresponsive
+                    // settings window must not make quitting impossible.
                     crate::settings::close_for_exit()?;
                 }
                 self.exit = Some(if action == "restart" {
@@ -339,14 +374,12 @@ impl App {
                 };
                 desktop::apply(self.window, &req, &self.cfg, &self.path, desktop::cursor()?)?;
                 if name == "ignore" {
-                    self.cfg = config::load(&self.path, None)?;
-                    let id = desktop::identity(self.window);
-                    let excluded = self.cfg.exclusions.iter().any(|rule| rule.matches(&id));
-                    self.notice(if excluded {
-                        self.cfg.tr("Excluded", "已排除")
-                    } else {
-                        self.cfg.tr("Included", "已取消排除")
-                    })?;
+                    // Adopt our own write so the folder watcher does not reload it again
+                    // and replace this notice.
+                    let loaded = config::load_snapshot(&self.path, None)?;
+                    self.cfg = loaded.config;
+                    self.snapshot = Some(loaded.bytes);
+                    self.notice(self.cfg.tr("Excluded", "已排除"))?;
                     input::configure(&self.cfg)?;
                 } else if name == "top" {
                     let top = desktop::topmost(self.window)?;
@@ -723,21 +756,26 @@ pub fn run(
         if status == ERROR_ALREADY_EXISTS {
             return Ok(crate::ResidentExit::Quit);
         }
-        let watch = FindFirstChangeNotificationW(
-            wide(path.parent().ok_or("Config directory")?).as_ptr(),
-            0,
-            FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE,
-        );
-        if watch == INVALID_HANDLE_VALUE {
-            return Err(err());
-        }
-        let watch = Watch(watch);
+        // Losing the folder watcher (network share, removable drive) must not end the
+        // resident: reopen it periodically and fall back to polling meanwhile.
+        let open_watch = || {
+            let handle = FindFirstChangeNotificationW(
+                wide(path.parent()?).as_ptr(),
+                0,
+                FILE_NOTIFY_CHANGE_FILE_NAME
+                    | FILE_NOTIFY_CHANGE_LAST_WRITE
+                    | FILE_NOTIFY_CHANGE_SIZE,
+            );
+            (handle != INVALID_HANDLE_VALUE).then(|| Watch(handle))
+        };
+        let mut watch = open_watch();
+        let mut rewatch = watch.is_none().then(|| later(5000));
         let loaded = config::load_snapshot(path, None)?;
         let mut cfg = loaded.config;
         if recovery.is_some() {
             // A failed handoff resumes this process at its original integrity level.
             // Keep the requested file untouched so an explicit reload can retry.
-            cfg.elevate = windows_sys::Win32::UI::Shell::IsUserAnAdmin() != 0;
+            cfg.elevate = crate::security::elevated();
         }
         let snapshot = Some(loaded.bytes);
         let overlay = Overlay::new()?;
@@ -772,8 +810,12 @@ pub fn run(
         }
         let mut msg = MSG::default();
         if let Some(problem) = recovery {
-            // A failed handoff may have removed the old task before permissions changed.
-            if let Err(task_error) = crate::logon::sync(app.cfg.autostart, app.cfg.elevate) {
+            // A failed lowering removed the task while still elevated: register it again,
+            // which needs no consent here. After a refused elevation nothing was changed,
+            // and touching an administrator-owned task would only ask for consent again.
+            if crate::security::elevated()
+                && let Err(task_error) = crate::logon::sync(app.cfg.autostart, app.cfg.elevate)
+            {
                 app.notice(&format!("{problem}\n{task_error}"))?;
             } else {
                 app.notice(problem)?;
@@ -801,15 +843,50 @@ pub fn run(
             if let Some(restart) = app.exit.take() {
                 return Ok(restart);
             }
-            match MsgWaitForMultipleObjectsEx(
-                2,
-                [watch.0, app.frames.handle()].as_ptr(),
-                app.timeout(),
+            if rewatch.is_some_and(|when| Instant::now() >= when) {
+                watch = open_watch();
+                rewatch = watch.is_none().then(|| later(5000));
+                // Changes made while nothing was watching are picked up here. Without a
+                // watcher this doubles as a slow poll, as long as the file is reachable.
+                if watch.is_some() || path.exists() {
+                    app.reload = Some(Instant::now());
+                }
+            }
+            let timeout = rewatch.map_or(app.timeout(), |when| {
+                app.timeout()
+                    .min(when.saturating_duration_since(Instant::now()).as_millis() as u32 + 1)
+            });
+            // The watcher, when present, is the first handle; later results shift by one.
+            let handles = [
+                watch.as_ref().map_or(null_mut(), |watch| watch.0),
+                app.frames.handle(),
+            ];
+            let skipped = usize::from(watch.is_none());
+            let signaled = MsgWaitForMultipleObjectsEx(
+                (2 - skipped) as u32,
+                handles[skipped..].as_ptr(),
+                timeout,
                 QS_ALLINPUT,
                 MWMO_INPUTAVAILABLE,
-            ) {
+            );
+            let signaled = if signaled < WAIT_OBJECT_0 + 3 {
+                signaled + skipped as u32
+            } else {
+                signaled
+            };
+            match signaled {
                 WAIT_OBJECT_0 => {
-                    desktop::check(FindNextChangeNotification(watch.0))?;
+                    if watch
+                        .as_ref()
+                        .is_some_and(|watch| FindNextChangeNotification(watch.0) == 0)
+                    {
+                        watch = None;
+                        rewatch = Some(later(5000));
+                        let _ = app.notice(app.cfg.tr(
+                            "Configuration folder is unavailable; retrying",
+                            "配置文件夹暂不可用，将自动重试",
+                        ));
+                    }
                     app.reload = Some(later(160));
                 }
                 value if value == WAIT_OBJECT_0 + 1 => {
@@ -833,6 +910,11 @@ pub fn run(
                     }
                 }
                 WAIT_TIMEOUT => {}
+                // A watcher whose folder disappeared can fail the whole wait.
+                _ if watch.is_some() => {
+                    watch = None;
+                    rewatch = Some(later(5000));
+                }
                 _ => return Err(err()),
             }
         }
@@ -1558,9 +1640,11 @@ mod tests {
                 visible(&observed, true)?;
                 visible(&observed, false)?;
                 visible(&observed_tips, false)?;
+                // 200 ms hold + 900 ms tip, plus scheduling and the 20 ms polling above.
                 assert!(
-                    started.elapsed() < Duration::from_millis(1200),
-                    "Held preview outlived the tip"
+                    started.elapsed() < Duration::from_millis(1500),
+                    "Held preview outlived the tip: {:?}",
+                    started.elapsed()
                 );
                 key(VK_LMENU, false);
                 println!("held Alt preview and tip expired together");

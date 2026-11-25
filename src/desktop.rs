@@ -447,9 +447,16 @@ fn restore(hwnd: HWND) -> Result<(), String> {
         if IsZoomed(hwnd) == 0 && IsIconic(hwnd) == 0 {
             return Ok(());
         }
+        let mut minimized = IsIconic(hwnd) != 0;
         check(ShowWindowAsync(hwnd, SW_RESTORE))?;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        let mut deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
         while IsZoomed(hwnd) != 0 || IsIconic(hwnd) != 0 {
+            if minimized && IsIconic(hwnd) == 0 {
+                // A window minimized while maximized is restored to maximized first.
+                minimized = false;
+                check(ShowWindowAsync(hwnd, SW_RESTORE))?;
+                deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+            }
             if std::time::Instant::now() >= deadline {
                 return Err("Window restore timed out / 窗口还原超时".into());
             }
@@ -566,6 +573,8 @@ fn position(hwnd: HWND, req: &Request, cfg: &Config, point: POINT) -> Result<(),
         let mut stable = Instant::now();
         let mut last_request = Instant::now();
         let mut corrections = 0;
+        let mut refused = None;
+        let mut answered: Option<Instant> = None;
         while Instant::now() < until {
             std::thread::sleep(Duration::from_millis(10));
             let (outer, frame) = bounds(hwnd)?;
@@ -573,6 +582,7 @@ fn position(hwnd: HWND, req: &Request, cfg: &Config, point: POINT) -> Result<(),
             if current != observed {
                 observed = current;
                 stable = Instant::now();
+                answered = None;
             }
             if stable.elapsed() < Duration::from_millis(60) {
                 continue;
@@ -580,7 +590,22 @@ fn position(hwnd: HWND, req: &Request, cfg: &Config, point: POINT) -> Result<(),
             if frame == wanted {
                 return Ok(());
             }
+            // A window that enforces its own size (fixed dialogs, minimum track size,
+            // character-cell consoles) never matches. Once a repeated request leaves it
+            // where it was and its thread keeps answering, that rectangle is final. A
+            // busy thread does not answer, so a pending move is never mistaken for this.
+            let mut reply = 0;
+            if refused == Some(frame)
+                && SendMessageTimeoutW(hwnd, WM_NULL, 0, 0, SMTO_ABORTIFHUNG, 50, &mut reply) != 0
+            {
+                match answered {
+                    Some(first) if first.elapsed() >= Duration::from_millis(40) => return Ok(()),
+                    Some(_) => {}
+                    None => answered = Some(Instant::now()),
+                }
+            }
             if corrections < 4 && last_request.elapsed() >= Duration::from_millis(180) {
+                refused = Some(frame);
                 set_frame(hwnd, wanted, outer, frame)?;
                 last_request = Instant::now();
                 stable = Instant::now();

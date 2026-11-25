@@ -46,16 +46,7 @@ impl Font {
         bold: bool,
         italic: bool,
     ) -> Result<Self, String> {
-        Self::with_quality(family, points, dpi, bold, italic, CLEARTYPE_QUALITY)
-    }
-    fn with_quality(
-        family: &str,
-        points: i32,
-        dpi: i32,
-        bold: bool,
-        italic: bool,
-        quality: u8,
-    ) -> Result<Self, String> {
+        let quality = CLEARTYPE_QUALITY;
         let mut face = system_face(dpi);
         if !family.eq_ignore_ascii_case("SystemFont") {
             face.lfFaceName = [0; 32];

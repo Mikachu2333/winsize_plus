@@ -1315,20 +1315,39 @@ fn recover(doc: &mut DocumentMut) -> Result<Config, String> {
                 }
                 let replacement = defaults.get(section).and_then(|s| s.get(key)).cloned();
                 if let Some(default) = replacement {
-                    if doc
-                        .get(section)
-                        .and_then(|s| s.get(key))
-                        .is_some_and(|old| old.to_string() == default.to_string())
+                    // Compare values only: the user's comments are kept on replacement,
+                    // so the text around an already-default value still differs.
+                    if semantic(doc.get(section).and_then(|s| s.get(key)))
+                        == semantic(Some(&default))
                     {
                         // A removed preset can invalidate an otherwise default binding.
                         if matches!(section, "keys" | "commands" | "grid") {
-                            doc[section][key] = value("");
+                            assign(&mut doc[section][key], value(""));
+                        } else if section == "shortcuts"
+                            && let Some(action) = key.strip_suffix("_button")
+                        {
+                            // The default button collides with another action's edited
+                            // button. Turn this action off rather than rejecting the file.
+                            doc[section][&format!("{action}_enabled")] = value(false);
                         } else {
                             return Err(error);
                         }
                     } else {
-                        doc[section][key] = default;
+                        assign(&mut doc[section][key], default);
                     }
+                } else if section == "presets"
+                    && !error.contains("reserved")
+                    && doc[section][key]
+                        .as_str()
+                        .is_none_or(|text| text.parse::<Layout>().is_err())
+                    && let Some(fallback) = defaults.get("presets").and_then(|s| s.get("Center"))
+                {
+                    // A custom region has no default of its own. Keep its name, and with it
+                    // every binding that refers to it, and substitute the centered region.
+                    assign(
+                        &mut doc[section][key],
+                        value(fallback.as_str().unwrap_or_default()),
+                    );
                 } else if let Some(table) = doc.get_mut(section).and_then(Item::as_table_mut) {
                     table.remove(key);
                 } else {
@@ -1339,6 +1358,15 @@ fn recover(doc: &mut DocumentMut) -> Result<Config, String> {
         }
     }
     Err("Too many invalid settings / 配置错误过多".into())
+}
+
+/// Replace a value while keeping the comments and spacing written around it.
+pub fn assign(item: &mut Item, replacement: Item) {
+    let decor = item.as_value().map(|old| old.decor().clone());
+    *item = replacement;
+    if let (Some(decor), Some(new)) = (decor, item.as_value_mut()) {
+        *new.decor_mut() = decor;
+    }
 }
 
 fn semantic(item: Option<&Item>) -> String {
@@ -1369,9 +1397,13 @@ fn merge_edits(base: &Table, draft: &Table, disk: &mut Table) {
             merge_edits(a, b, c);
         } else if semantic(disk.get(&key)) == semantic(before) {
             match wanted {
-                Some(item) => {
-                    disk.insert(&key, item.clone());
-                }
+                Some(item) => match disk.get_mut(&key) {
+                    // Inserting over an entry would discard the comments around it.
+                    Some(existing) => assign(existing, item.clone()),
+                    None => {
+                        disk.insert(&key, item.clone());
+                    }
+                },
                 None => {
                     disk.remove(&key);
                 }
@@ -1431,6 +1463,9 @@ fn lock() -> Result<Lock, String> {
 
 fn write(path: &Path, text: &str, expected: Option<&[u8]>) -> io::Result<()> {
     let temp = path.with_extension(format!("{}.tmp", std::process::id()));
+    // Every caller holds the configuration mutex, so a file of this name can only be
+    // left over from a killed process whose identifier has been reused.
+    let _ = fs::remove_file(&temp);
     let mut file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -1493,13 +1528,17 @@ pub struct Loaded {
     pub document: DocumentMut,
     pub text: String,
     pub bytes: Vec<u8>,
+    /// Why migrated or repaired values could not be stored. `text` and `bytes` then
+    /// still describe the file as it is, while `config` and `document` are repaired.
+    pub write_error: Option<String>,
 }
 
 pub fn load(path: &Path, edit: Option<(&Identity, Switch)>) -> Result<Config, String> {
     load_snapshot(path, edit).map(|loaded| loaded.config)
 }
 
-/// All returned values describe the same read (or the same committed write).
+/// All returned values describe the same read (or the same committed write), except
+/// when a repair could not be stored: see `Loaded::write_error`.
 pub fn load_snapshot(path: &Path, edit: Option<(&Identity, Switch)>) -> Result<Loaded, String> {
     let _lock = lock()?;
     let (bytes, new) = match fs::read(path) {
@@ -1539,10 +1578,11 @@ pub fn load_snapshot(path: &Path, edit: Option<(&Identity, Switch)>) -> Result<L
                 .as_array_of_tables_mut()
                 .ok_or("exclusions")?;
             if after {
+                // Titles change with the document or tab, which would silently end the
+                // exclusion. A title can still be added by hand to narrow a rule.
                 let mut table = Table::new();
                 table.insert("name", value(&id.name));
                 table.insert("class", value(&id.class));
-                table.insert("title", value(&id.title));
                 rules.push(table)
             } else {
                 for index in matches.into_iter().rev() {
@@ -1553,19 +1593,28 @@ pub fn load_snapshot(path: &Path, edit: Option<(&Identity, Switch)>) -> Result<L
             config = Config::parse(&doc)?;
         }
     }
-    let (text, bytes) = if changed {
-        let text = doc.to_string();
-        write(path, &text, (!new).then_some(bytes.as_slice())).map_err(|err| err.to_string())?;
-        let bytes = text.as_bytes().to_vec();
-        (text, bytes)
+    let (text, bytes, write_error) = if changed {
+        let repaired = doc.to_string();
+        match write(path, &repaired, (!new).then_some(bytes.as_slice())) {
+            Ok(()) => {
+                let bytes = repaired.as_bytes().to_vec();
+                (repaired, bytes, None)
+            }
+            // A read-only or locked file still yields a usable configuration. Failing
+            // here would also retry forever: the temporary file made for the attempt
+            // wakes the folder watcher again. Only a requested edit must reach the disk.
+            Err(error) if !new && edit.is_none() => (text, bytes, Some(error.to_string())),
+            Err(error) => return Err(error.to_string()),
+        }
     } else {
-        (text, bytes)
+        (text, bytes, None)
     };
     Ok(Loaded {
         config,
         document: doc,
         text,
         bytes,
+        write_error,
     })
 }
 
@@ -2261,10 +2310,58 @@ mod tests {
         let mut doc = help().parse::<DocumentMut>().unwrap();
         doc["presets"]["My Region"] = value("broken");
         doc["keys"]["P"] = value("tOP");
+        doc["keys"]["F9"] = value("My Region");
         let cfg = recover(&mut doc).unwrap();
-        assert!(!cfg.presets.contains_key("my region"));
+        // The broken region keeps its name and bindings and takes the centered default.
+        assert!(cfg.presets["my region"] == cfg.presets["center"]);
+        assert_eq!(doc["keys"]["F9"].as_str(), Some("My Region"));
         assert_eq!(doc["keys"]["P"].as_str(), Some("Top"));
         assert_eq!(cfg.warnings, ["presets.My Region"]);
+    }
+    #[test]
+    fn default_button_conflict_disables_that_action_instead_of_rejecting_the_file() {
+        let mut doc = help().parse::<DocumentMut>().unwrap();
+        doc["shortcuts"]["move_button"] = value("middle");
+        let cfg = recover(&mut doc).unwrap();
+        assert_eq!(cfg.move_button, Some(4));
+        assert_eq!(cfg.center_button, None);
+        assert_eq!(cfg.warnings, ["shortcuts.center_button"]);
+    }
+    #[test]
+    fn edited_and_recovered_values_keep_their_comments() {
+        let folder = std::env::temp_dir().join(format!("winsizep-decor-{}", std::process::id()));
+        fs::create_dir_all(&folder).unwrap();
+        let path = folder.join("config.toml");
+        let original = help().replace("duration_ms = 3000", "# 上方注释\nduration_ms = 3000");
+        assert!(original.contains("# 上方注释"));
+        fs::write(&path, &original).unwrap();
+        let loaded = load_snapshot(&path, None).unwrap();
+        let mut draft = loaded.document;
+        assign(&mut draft["tip"]["duration_ms"], value(4000));
+        assign(&mut draft["general"]["alt_hold_ms"], value(900));
+        let saved = save_settings(&path, &loaded.text, &draft)
+            .unwrap()
+            .replace("\r\n", "\n");
+        assert!(
+            saved.contains("# 上方注释\nduration_ms = 4000 # Starts when"),
+            "{saved}"
+        );
+        assert!(saved.contains("alt_hold_ms = 900 # Hold Alt"), "{saved}");
+        // Recovery replaces only the value as well.
+        let broken = saved.replace(
+            "alt_hold_ms = 900 # Hold Alt",
+            "alt_hold_ms = -1 # 用户注释",
+        );
+        fs::write(&path, &broken).unwrap();
+        let loaded = load_snapshot(&path, None).unwrap();
+        assert_eq!(loaded.config.warnings, ["general.alt_hold_ms"]);
+        assert!(
+            loaded.text.contains("alt_hold_ms = 1500 # 用户注释"),
+            "{}",
+            loaded.text
+        );
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(folder).unwrap();
     }
     #[test]
     fn parsing_preserves_comments_hashes_and_multiline_strings() {

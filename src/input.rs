@@ -37,9 +37,16 @@ pub const CAST_KEY: u32 = WM_APP + 14;
 pub const CAST_MOUSE: u32 = WM_APP + 15;
 pub const RECOVERED: u32 = WM_APP + 16;
 pub const CENTER: u32 = WM_APP + 17;
+thread_local! { static DISPLAY_PENDING: Cell<bool> = const { Cell::new(false) }; }
 pub fn display_changed() {
     desktop::invalidate_displays();
-    post(DISPLAY_CHANGED, 0, 0);
+    // Every overlay window receives the same broadcast. One event is enough: its
+    // handler reads the current topology whenever it runs.
+    if !DISPLAY_PENDING.with(|pending| pending.replace(true))
+        && !post_event(DISPLAY_CHANGED, 0, 0, None)
+    {
+        DISPLAY_PENDING.with(|pending| pending.set(false));
+    }
 }
 const LEFT: u32 = VK_LMENU as u32;
 const RIGHT: u32 = VK_RMENU as u32;
@@ -75,7 +82,6 @@ struct Input {
     last_event: u32,
     mouse: HHOOK,
     point: POINT,
-    queued: bool,
     tip_visible: bool,
     tip_scrollable: bool,
     tip_window: usize,
@@ -176,6 +182,9 @@ fn receive_event() -> Option<QueuedEvent> {
     Some(event)
 }
 fn event_message(event: QueuedEvent) -> MSG {
+    if event.message == DISPLAY_CHANGED {
+        DISPLAY_PENDING.with(|pending| pending.set(false));
+    }
     CURRENT.with(|current| current.set(event.point.map(|point| (event.message, point))));
     MSG {
         message: event.message,
@@ -315,8 +324,8 @@ fn post_event(message: u32, wp: usize, lp: isize, point: Option<POINT>) -> bool 
         if events.send.send(event).is_err() {
             return false;
         }
-        // Only integers cross the window-message boundary. On queue saturation the
-        // next outer-loop drain still reads the owned event; MOVE can retry waking.
+        // Only integers cross the window-message boundary. If the wakeup cannot be
+        // posted, the owned event stays in the channel for the next outer-loop drain.
         unsafe { PostMessageW(events.window as HWND, WAKE, 0, 0) != 0 }
     })
 }
@@ -370,7 +379,6 @@ impl Input {
         self.gesture_target = null_mut();
         self.drag = None;
         self.centered_button = None;
-        self.queued = false;
         self.cast_buttons = 0;
         self.cast_wheel_time = None;
     }
@@ -981,10 +989,7 @@ pub fn moved() -> POINT {
     }) {
         return point;
     }
-    INPUT.with_borrow_mut(|input| {
-        input.queued = false;
-        input.point
-    })
+    INPUT.with_borrow(|input| input.point)
 }
 fn post_move(point: POINT) {
     let needed = EVENTS.with_borrow(|events| {
@@ -1148,6 +1153,18 @@ pub fn set_paused(paused: bool) -> Result<(), String> {
             for _ in inbox.try_iter() {}
         }
     });
+    // A discarded MOVE or SCROLL_READY leaves its "already queued" latch set, and
+    // nothing else clears it: pointer tracking and wheel marks would stay dead after
+    // resuming. Reset after draining so a concurrent hook event cannot be lost.
+    DISPLAY_PENDING.with(|pending| pending.set(false));
+    EVENTS.with_borrow(|events| {
+        if let Some(events) = events {
+            events.movement.queued.store(false, Ordering::Release);
+            if let Ok(mut scroll) = events.scroll.lock() {
+                *scroll = PendingScroll::default();
+            }
+        }
+    });
     Ok(())
 }
 pub struct Hooks {
@@ -1185,10 +1202,12 @@ impl Hooks {
         }
         let wake = unsafe { CreateEventW(null(), 0, 0, null()) };
         if wake.is_null() {
+            // Read the cause before cleanup replaces it.
+            let error = err();
             unsafe {
                 DestroyWindow(window);
             }
-            return Err(err());
+            return Err(error);
         }
         let wake = Arc::new(WakeEvent(wake as usize));
         let stopped = Arc::new(AtomicBool::new(false));
@@ -1350,6 +1369,7 @@ impl Hooks {
             })
         });
         INBOX.with_borrow_mut(|inbox| *inbox = Some(receive_events));
+        DISPLAY_PENDING.with(|pending| pending.set(false));
         let hooks = Self {
             worker: Some(worker),
             wake,

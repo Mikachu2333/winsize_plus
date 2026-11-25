@@ -44,6 +44,8 @@ const RESIZE: u32 = WM_APP + 82;
 const HOVER: u32 = WM_APP + 83;
 const EDIT_LAYOUT: u32 = WM_APP + 84;
 const APP_EXIT: u32 = WM_APP + 85;
+/// Private WM_COMMAND notification: Enter was pressed in an edit field.
+const EDIT_COMMIT: u32 = 0x7f00;
 const ACTIVATE_PREVIEW: u32 = WM_APP + 86;
 #[cfg(test)]
 const PREVIEW_STATE: u32 = WM_APP + 99;
@@ -65,7 +67,9 @@ pub fn close_for_restart() -> Result<bool, String> {
     if window.is_null() {
         return Ok(false);
     }
-    close_for_exit()?;
+    if !close_for_exit()? {
+        return Err("Settings did not respond / 设置窗口没有响应".into());
+    }
     let deadline = Instant::now() + Duration::from_secs(5);
     while unsafe { IsWindow(window) } != 0 {
         if Instant::now() >= deadline {
@@ -97,11 +101,13 @@ pub fn open() -> Result<(), String> {
 
 /// Ask the settings process to flush its pending edits and leave its message loop.
 /// A failed save leaves both processes running so the error can be corrected.
-pub fn close_for_exit() -> Result<(), String> {
+/// `Ok(false)` means the window did not answer at all (hung, or protected by a higher
+/// integrity level): the caller decides whether it may go on without it.
+pub fn close_for_exit() -> Result<bool, String> {
     unsafe {
         let hwnd = FindWindowW(CLASS, null());
         if hwnd.is_null() {
-            return Ok(());
+            return Ok(true);
         }
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -120,16 +126,10 @@ pub fn close_for_exit() -> Result<(), String> {
                 &mut result,
             );
             if sent == 0 {
-                if IsWindow(hwnd) == 0 {
-                    return Ok(());
-                }
-                return Err(format!(
-                    "Cannot close settings / 无法关闭设置窗口: {}",
-                    err()
-                ));
+                return Ok(IsWindow(hwnd) == 0);
             }
             if result == 1 {
-                return Ok(());
+                return Ok(true);
             }
             if result == 2 && Instant::now() < deadline {
                 // Let a canceled native color dialog return before flushing the editor.
@@ -725,14 +725,8 @@ impl Editor {
                             })
                             .collect()
                     };
-                    let style = CBS_DROPDOWNLIST as u32
-                        | WS_TABSTOP
-                        | WS_VSCROLL
-                        | if matches!(row.field.kind, Kind::Font) {
-                            CBS_OWNERDRAWFIXED as u32 | CBS_HASSTRINGS as u32
-                        } else {
-                            0
-                        };
+                    // create() makes every combo box owner-drawn.
+                    let style = CBS_DROPDOWNLIST as u32 | WS_TABSTOP | WS_VSCROLL;
                     self.control(&mut row, index, 0, "COMBOBOX", "", style)?;
                     if matches!(row.field.kind, Kind::Font) {
                         unsafe {
@@ -1368,7 +1362,10 @@ impl Editor {
                         })
                         .collect::<Result<_, _>>()?;
                     if *format == ColorChannels::Rgba {
-                        draft[section]["opacity"] = value(i64::from(channels[3]));
+                        config::assign(
+                            &mut draft[section]["opacity"],
+                            value(i64::from(channels[3])),
+                        );
                     }
                     value(format!(
                         "#{:02X}{:02X}{:02X}",
@@ -1419,18 +1416,18 @@ impl Editor {
                                     if item.as_str().is_some_and(|v| {
                                         config::command_name(v) == config::command_name(key)
                                     }) {
-                                        *item = value(&name);
+                                        config::assign(item, value(&name));
                                     }
                                 }
                             }
                         }
                     }
-                    draft[section][&name] = value(text);
+                    config::assign(&mut draft[section][&name], value(text));
                     continue;
                 }
                 _ => continue,
             };
-            draft[section][key] = replacement;
+            config::assign(&mut draft[section][key], replacement);
         }
         Ok(draft)
     }
@@ -1454,7 +1451,16 @@ impl Editor {
                 self.selected = Some(caption(row.c(3)).trim().to_owned());
             }
         }
-        let saved = config::save_settings(&self.path, &self.original, &draft)?;
+        let saved = match config::save_settings(&self.path, &self.original, &draft) {
+            Ok(saved) => saved,
+            Err(error) => {
+                // The edits themselves are valid, so the file is busy, read-only or was
+                // changed meanwhile. Nothing else would try again: retry until it works
+                // instead of leaving the edits unsaved once the message fades.
+                self.pending = Some(Instant::now() + Duration::from_secs(2));
+                return Err(error);
+            }
+        };
         self.doc = saved.parse::<DocumentMut>().map_err(|e| e.to_string())?;
         self.original = saved;
         let cfg = Config::parse(&self.doc)?;
@@ -1477,8 +1483,20 @@ impl Editor {
                 }
             }
         }
+        let startup = self.dirty.iter().any(|i| {
+            self.rows.get(*i).is_some_and(|r| {
+                r.field.section == "general"
+                    && matches!(r.field.key.as_str(), "autostart" | "elevate")
+            })
+        });
         self.dirty.clear();
-        self.status(self.cfg.tr("Saved", "已保存"));
+        match startup
+            .then(|| crate::logon::elevation_warning(&self.cfg))
+            .flatten()
+        {
+            Some(warning) => self.status(&warning),
+            None => self.status(self.cfg.tr("Saved", "已保存")),
+        }
         self.invalidate_pages();
         if rebuild {
             self.rebuild()?;
@@ -1533,12 +1551,6 @@ impl Editor {
                 "shortcuts",
                 "center_button",
                 gestures && checked("shortcuts", "center_enabled"),
-            ),
-            // The hold delay has nothing to wait for once both modifiers are off.
-            (
-                "general",
-                "alt_hold_ms",
-                gestures || choice("shortcuts", "alt", "left") != "off",
             ),
             // Only the window tip expands this format; the time format also serves a command.
             (
@@ -1805,6 +1817,9 @@ impl Editor {
         let row = self.rows.get(index).ok_or("Setting")?;
         let section = row.field.section.clone();
         let key = row.field.key.clone();
+        // The row is going away: its own unsaved, possibly invalid, edits must neither
+        // block the deletion nor rename the entry that is about to be removed.
+        self.dirty.remove(&index);
         self.save()?;
         let mut draft = self.doc.clone();
         draft[&section].as_table_mut().unwrap().remove(&key);
@@ -1815,7 +1830,7 @@ impl Editor {
                         .as_str()
                         .is_some_and(|n| config::command_name(n) == config::command_name(&key))
                     {
-                        *item = value("");
+                        config::assign(item, value(""));
                     }
                 }
             }
@@ -1943,6 +1958,12 @@ impl Editor {
             return Ok(());
         }
         let kind = row.field.kind.clone();
+        if matches!(event, EN_KILLFOCUS | EDIT_COMMIT) {
+            if self.dirty.contains(&index) {
+                self.pending = Some(Instant::now());
+            }
+            return Ok(());
+        }
         match kind {
             Kind::OpenConfig if event == BN_CLICKED => {
                 self.save()?;
@@ -2001,7 +2022,12 @@ impl Editor {
         };
         if changed {
             self.dirty.insert(index);
-            self.pending = Some(Instant::now() + Duration::from_millis(450));
+            // Typed text is saved when its field loses focus or Enter is pressed, so a
+            // half-typed number or name never reaches the file. Switches and lists are
+            // complete as soon as they change.
+            if event != EN_CHANGE {
+                self.pending = Some(Instant::now() + Duration::from_millis(450));
+            }
             self.update_enabled_controls();
             if let Ok(draft) = self.collect()
                 && let Ok(cfg) = Config::parse(&draft)
@@ -2342,7 +2368,28 @@ unsafe extern "system" fn control_proc(
             send(hwnd, EM_SETRECT, 0, (&rect as *const RECT) as isize);
             return result;
         }
+        if class.eq_ignore_ascii_case("edit") && message == WM_GETDLGCODE {
+            // Every edit is multiline (for vertical centering) and would therefore claim
+            // all keys: Tab could not leave the field and Esc would close its parent
+            // pane. Leave navigation to the dialog manager and keep only Enter, which
+            // commits the field.
+            let mut code = DefSubclassProc(hwnd, message, wp, lp) & !(DLGC_WANTALLKEYS as isize);
+            if lp != 0 {
+                // SAFETY: a nonzero parameter is the message being routed.
+                let routed = &*(lp as *const MSG);
+                if routed.wParam == 13 && matches!(routed.message, WM_KEYDOWN | WM_CHAR) {
+                    code |= DLGC_WANTMESSAGE as isize;
+                }
+            }
+            return code;
+        }
         if class.eq_ignore_ascii_case("edit") && message == WM_CHAR && wp == 13 {
+            PostMessageW(
+                GetParent(hwnd),
+                WM_COMMAND,
+                (GetDlgCtrlID(hwnd) as usize & 0xffff) | ((EDIT_COMMIT as usize) << 16),
+                hwnd as isize,
+            );
             return 0;
         }
         if class.eq_ignore_ascii_case("edit")
@@ -2446,6 +2493,8 @@ unsafe extern "system" fn pane_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: LP
                 0
             }
             WM_DRAWITEM | WM_MEASUREITEM => SendMessageW(root, message, wp, lp),
+            // Only the main window closes; a pane must outlive its controls.
+            WM_CLOSE => 0,
             WM_VSCROLL => {
                 PostMessageW(root, WM_VSCROLL, wp, hwnd as isize);
                 0
@@ -2693,13 +2742,43 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
             1
         }
         WM_CLOSE => {
+            let mut question = None;
             with_editor(|e| {
-                e.save()?;
-                unsafe {
-                    PostQuitMessage(0);
+                match e.save() {
+                    Ok(()) => unsafe { PostQuitMessage(0) },
+                    Err(error) => {
+                        question = Some(format!(
+                            "{error}\n\n{}",
+                            e.cfg.tr(
+                                "Close and discard the unsaved changes?",
+                                "是否放弃未保存的修改并关闭？"
+                            )
+                        ))
+                    }
                 }
                 Ok(())
             });
+            // The editor is no longer borrowed here: the message box pumps messages.
+            if let Some(question) = question
+                && unsafe {
+                    MessageBoxW(
+                        hwnd,
+                        wide(&question).as_ptr(),
+                        w!("WinSizeP"),
+                        MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
+                    )
+                } == IDYES
+            {
+                unsafe {
+                    PostQuitMessage(0);
+                }
+            }
+            0
+        }
+        WM_ENDSESSION => {
+            if wp != 0 {
+                with_editor(|e| e.save());
+            }
             0
         }
         APP_EXIT => {
@@ -2742,6 +2821,13 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
                         PostMessageW(popup, WM_COMMAND, IDCANCEL as usize, 0);
                         return 2;
                     }
+                }
+            }
+            if handled && !accepted {
+                // The caller refuses to exit; show where the unsaved field is.
+                unsafe {
+                    ShowWindowAsync(hwnd, SW_RESTORE);
+                    SetForegroundWindow(hwnd);
                 }
             }
             isize::from(accepted)
@@ -3785,6 +3871,15 @@ mod tests {
                 send(fps, EM_SETSEL, 0, -1);
                 send(fps, EM_REPLACESEL, 1, w!("2000") as isize);
                 std::thread::sleep(Duration::from_millis(800));
+                let typed = config::read_settings(&output.join("config.toml"))?
+                    .parse::<DocumentMut>()
+                    .map_err(|e| e.to_string())?;
+                if typed["crosshair"]["fps"].as_integer() == Some(1000) {
+                    return Err("Typed text was saved before the field was committed".into());
+                }
+                // Enter commits the field; so does moving the focus away.
+                send(fps, WM_CHAR, 13, 0);
+                std::thread::sleep(Duration::from_millis(500));
                 let doc = config::read_settings(&output.join("config.toml"))?
                     .parse::<DocumentMut>()
                     .map_err(|e| e.to_string())?;
@@ -3794,13 +3889,14 @@ mod tests {
                         caption(unsafe { GetDlgItem(hwnd, 600) })
                     ));
                 }
-                // Changing the same setting in the file while the edit debounce is pending wins.
+                // Changing the same setting in the file before the edit is committed wins.
                 send(fps, EM_SETSEL, 0, -1);
                 send(fps, EM_REPLACESEL, 1, w!("50") as isize);
                 let mut external = doc.clone();
                 external["crosshair"]["fps"] = value(75);
                 std::fs::write(output.join("config.toml"), external.to_string())
                     .map_err(|e| e.to_string())?;
+                send(fps, WM_CHAR, 13, 0);
                 std::thread::sleep(Duration::from_millis(800));
                 let merged = config::read_settings(&output.join("config.toml"))?
                     .parse::<DocumentMut>()
@@ -3984,6 +4080,7 @@ mod tests {
                 let name = unsafe { GetDlgItem(pane, BASE + row as i32 * STRIDE + 3) };
                 send(name, EM_SETSEL, 0, -1);
                 send(name, EM_REPLACESEL, 1, w!("F12") as isize);
+                send(name, WM_CHAR, 13, 0);
                 std::thread::sleep(Duration::from_millis(800));
                 if unsafe { GetDlgItem(pane, BASE + row as i32 * STRIDE) } != combo {
                     return Err("Renaming a mapping recreated its control".into());
@@ -4001,6 +4098,7 @@ mod tests {
                 let width = unsafe { GetDlgItem(pane, BASE + 2 * STRIDE) };
                 send(width, EM_SETSEL, 0, -1);
                 send(width, EM_REPLACESEL, 1, w!("3") as isize);
+                send(width, WM_CHAR, 13, 0);
                 std::thread::sleep(Duration::from_millis(800));
                 let saved = config::read_settings(&output.join("config.toml"))?
                     .parse::<DocumentMut>()
@@ -4025,6 +4123,7 @@ mod tests {
                 let vertical_width = unsafe { GetDlgItem(pane, BASE + 2 * STRIDE) };
                 send(vertical_width, EM_SETSEL, 0, -1);
                 send(vertical_width, EM_REPLACESEL, 1, w!("7") as isize);
+                send(vertical_width, WM_CHAR, 13, 0);
                 std::thread::sleep(Duration::from_millis(800));
                 let custom = config::read_settings(&output.join("config.toml"))?
                     .parse::<DocumentMut>()

@@ -48,11 +48,13 @@ pub enum ResidentExit {
 
 /// Keep this process available until a restart has been accepted. In particular,
 /// denied UAC must return to a functioning resident instead of terminating it.
+/// `problem` reports a handoff that already failed before the first run.
 fn supervise_resident(
+    problem: Option<String>,
     mut run: impl FnMut(Option<&str>) -> Result<ResidentExit, String>,
     mut restart: impl FnMut(Option<bool>) -> Result<(), String>,
 ) -> Result<(), String> {
-    let mut recovery = None;
+    let mut recovery = problem;
     loop {
         match run(recovery.as_deref())? {
             ResidentExit::Quit => return Ok(()),
@@ -110,8 +112,9 @@ pub fn elevated_helper(parameters: &str) -> Result<(), String> {
         }
         let waited = wait_process(info.hProcess, std::time::Duration::from_secs(30));
         if let Err(error) = waited {
-            // Only terminate the helper we just created; prevent a timed-out task
-            // update from committing after a later user edit.
+            // The handle of an elevated helper usually lacks the right to terminate it.
+            // The helper therefore ends itself before this wait expires (see the
+            // --sync-logon-task arm); this call only covers same-level helpers.
             TerminateProcess(info.hProcess, 1);
             CloseHandle(info.hProcess);
             return Err(error);
@@ -208,19 +211,22 @@ fn launch_unelevated_token(parameters: &str) -> Result<(), String> {
         }
         let mut elevation = TOKEN_ELEVATION::default();
         let mut length = 0;
-        if GetTokenInformation(
+        let queried = GetTokenInformation(
             token,
             TokenElevation,
             (&mut elevation as *mut TOKEN_ELEVATION).cast(),
             size_of::<TOKEN_ELEVATION>() as u32,
             &mut length,
-        ) == 0
-            || elevation.TokenIsElevated != 0
-        {
-            let error = desktop::err();
+        );
+        if queried == 0 || elevation.TokenIsElevated != 0 {
+            let reason = if queried == 0 {
+                desktop::err()
+            } else {
+                "it is elevated / 它以管理员权限运行".into()
+            };
             CloseHandle(token);
             return Err(format!(
-                "Desktop shell has no usable normal token / 桌面外壳没有可用的普通权限令牌: {error}"
+                "Desktop shell has no usable normal token / 桌面外壳没有可用的普通权限令牌: {reason}"
             ));
         }
         let mut primary = null_mut();
@@ -272,19 +278,25 @@ fn launch(elevate: bool) -> Result<(), String> {
         return Ok(());
     }
     let exe = std::env::current_exe().map_err(|err| err.to_string())?;
-    if elevate && unsafe { IsUserAnAdmin() } == 0 {
-        let result = unsafe {
-            ShellExecuteW(
+    if elevate && !security::elevated() {
+        let (result, error) = unsafe {
+            let result = ShellExecuteW(
                 null_mut(),
                 w!("runas"),
                 desktop::wide(exe).as_ptr(),
                 w!("--resident"),
                 null(),
                 SW_HIDE,
-            )
+            );
+            (result as isize, desktop::err())
         };
-        if result as isize <= 32 {
-            return Err(format!("UAC: {}", desktop::err()));
+        if result <= 32 {
+            // The return value is the authoritative code; the thread error only adds detail.
+            return Err(if result == SE_ERR_ACCESSDENIED as isize {
+                "UAC: canceled or denied / 已取消或被拒绝".into()
+            } else {
+                format!("UAC ({result}): {error}")
+            });
         }
     } else {
         Command::new(exe)
@@ -327,14 +339,43 @@ fn run() -> Result<(), String> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     let explicit_stdin = args.iter().any(|arg| arg.eq_ignore_ascii_case("--stdin"));
     let redirected = unsafe {
+        use windows_sys::Win32::Storage::FileSystem::*;
         let handle = windows_sys::Win32::System::Console::GetStdHandle(
             windows_sys::Win32::System::Console::STD_INPUT_HANDLE,
         );
-        matches!(
-            windows_sys::Win32::Storage::FileSystem::GetFileType(handle),
-            windows_sys::Win32::Storage::FileSystem::FILE_TYPE_PIPE
-                | windows_sys::Win32::Storage::FileSystem::FILE_TYPE_DISK
-        )
+        match GetFileType(handle) {
+            FILE_TYPE_DISK => true,
+            // Terminals such as mintty and IDE run buttons hand every child an open,
+            // silent pipe. Without arguments that is a request to start the resident,
+            // not a pipeline: only a pipe that delivers input promptly counts. A slow
+            // producer can pass --stdin.
+            FILE_TYPE_PIPE => {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+                loop {
+                    let mut available = 0;
+                    if windows_sys::Win32::System::Pipes::PeekNamedPipe(
+                        handle,
+                        null_mut(),
+                        0,
+                        null_mut(),
+                        &mut available,
+                        null_mut(),
+                    ) == 0
+                    {
+                        // The writer already finished: an empty pipeline, not a launch.
+                        break GetLastError() == ERROR_BROKEN_PIPE;
+                    }
+                    if available > 0 {
+                        break true;
+                    }
+                    if !args.is_empty() || std::time::Instant::now() >= deadline {
+                        break false;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+            _ => false,
+        }
     };
     if explicit_stdin || (args.is_empty() && redirected) {
         #[cfg(not(debug_assertions))]
@@ -403,6 +444,12 @@ fn execute(args: &[String]) -> Result<(), String> {
         ["--sync-logon-task", enabled, elevated, owner]
             if matches!(*enabled, "0" | "1") && matches!(*elevated, "0" | "1") =>
         {
+            // The parent gives up after 30 seconds and may then act on a newer edit.
+            // A stalled update must not commit after that, so this helper ends first.
+            std::thread::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_secs(25));
+                std::process::exit(1);
+            });
             if let Err(error) = logon::sync_direct(*enabled == "1", *elevated == "1", owner) {
                 eprintln!("{error}");
                 // Private helper protocol: the parent may request consent only for
@@ -432,25 +479,54 @@ fn execute(args: &[String]) -> Result<(), String> {
         }
         [] => return launch(false),
         ["--resident"] | ["--resident", "--reopen-settings"] => {
-            if config::requested_elevation(&path)? && unsafe { IsUserAnAdmin() } == 0 {
-                return launch(true);
+            let requested = config::requested_elevation(&path)?;
+            let reopen = values.contains(&"--reopen-settings");
+            let mut problem = None;
+            if requested && !security::elevated() {
+                // A canceled prompt must not leave the user without a resident.
+                match launch(true) {
+                    Ok(()) => return Ok(()),
+                    Err(error) => {
+                        security::raise_declined(true);
+                        problem = Some(format!(
+                            "Elevation failed; running with normal permissions / 提权失败，以普通权限运行: {error}"
+                        ))
+                    }
+                }
+            } else if !requested && security::elevated() && security::can_lower() {
+                // Started elevated by hand, by an installer or by an outdated task. The
+                // configuration decides: staying elevated would also register a task that
+                // a normal start can no longer update without asking for consent.
+                match launch_unelevated(reopen) {
+                    Ok(()) => return Ok(()),
+                    Err(_) => security::lowering_failed(),
+                }
             }
             unsafe {
                 RegisterApplicationRestart(w!("--resident"), 0);
             }
-            let reopen_settings = std::cell::Cell::new(values.contains(&"--reopen-settings"));
+            let reopen_settings = std::cell::Cell::new(reopen);
             return supervise_resident(
+                problem,
                 |recovery| resident::run(&path, recovery, reopen_settings.replace(false)),
                 |elevation| {
-                    if elevation == Some(false) && unsafe { IsUserAnAdmin() } != 0 {
+                    // A plain restart keeps the configured permissions. Resolving them here
+                    // keeps a canceled prompt inside this still-running process.
+                    let elevation = elevation.unwrap_or_else(|| {
+                        config::requested_elevation(&path).unwrap_or(security::elevated())
+                    });
+                    if !elevation && security::elevated() && security::can_lower() {
                         let reopen = settings::close_for_restart()?;
                         let result = launch_unelevated(reopen);
                         if result.is_err() {
+                            security::lowering_failed();
                             reopen_settings.set(reopen);
                         }
                         result
                     } else {
-                        launch(elevation.unwrap_or(false))
+                        let result = launch(elevation);
+                        security::raise_declined(elevation && result.is_err());
+                        result
                     }
                 },
             );
@@ -497,6 +573,7 @@ mod tests {
         let mut runs = 0;
         let mut requests = 0;
         super::supervise_resident(
+            None,
             |recovery| {
                 runs += 1;
                 if runs == 1 {

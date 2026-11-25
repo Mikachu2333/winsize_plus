@@ -112,16 +112,20 @@ pub fn parse(args: &[String]) -> Result<Request, String> {
             }
             "--hwnd" => {
                 let text = args.pop_front().ok_or_else(bad)?;
-                req.target.hwnd.get_or_insert(
-                        if let Some(hex) =
-                            text.strip_prefix("0x").or_else(|| text.strip_prefix("0X"))
-                        {
-                            usize::from_str_radix(hex, 16)
-                        } else {
-                            text.parse()
-                        }
-                        .map_err(|_| bad())?,
-                    );
+                let handle = if let Some(hex) =
+                    text.strip_prefix("0x").or_else(|| text.strip_prefix("0X"))
+                {
+                    usize::from_str_radix(hex, 16)
+                } else {
+                    text.parse()
+                }
+                .map_err(|_| bad())?;
+                // Zero is not a window. Internally it selects the foreground window,
+                // which a failed lookup in a script must never do by accident.
+                if handle == 0 {
+                    return Err(bad());
+                }
+                req.target.hwnd.get_or_insert(handle);
             }
             "--x" | "-x" => {
                 req.x = Some(

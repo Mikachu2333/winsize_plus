@@ -74,6 +74,155 @@ pub fn process_elevated(process: HANDLE) -> Result<bool, String> {
         Ok(elevation.TokenIsElevated != 0)
     }
 }
+static LOWERING_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this process runs with an elevated token. Membership of the Administrators
+/// group says nothing about that, so the token is asked directly.
+pub fn elevated() -> bool {
+    process_elevated(unsafe { GetCurrentProcess() }).unwrap_or(false)
+}
+
+/// Whether a normal instance can be started in place of this elevated one. Only a
+/// split token has a normal half: with UAC disabled or the built-in Administrator
+/// account every process is elevated, and asking to "lower" could never succeed.
+pub fn can_lower() -> bool {
+    if LOWERING_FAILED.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    unsafe {
+        let mut token = null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return false;
+        }
+        let mut kind = 0;
+        let mut size = 0;
+        let ok = GetTokenInformation(
+            token,
+            TokenElevationType,
+            (&mut kind as *mut TOKEN_ELEVATION_TYPE).cast(),
+            size_of::<TOKEN_ELEVATION_TYPE>() as u32,
+            &mut size,
+        );
+        CloseHandle(token);
+        ok != 0 && kind == TokenElevationTypeFull
+    }
+}
+
+/// A desktop shell that is itself elevated offers no normal token either. Remember
+/// the failed attempt so every later configuration change does not repeat it.
+pub fn lowering_failed() {
+    LOWERING_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+static RAISE_DECLINED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Record whether the last consent prompt was refused, so that automatic reloads do
+/// not ask again after every edit. An explicit reload or restart still retries.
+pub fn raise_declined(declined: bool) {
+    RAISE_DECLINED.store(declined, std::sync::atomic::Ordering::Relaxed);
+}
+pub fn raise_was_declined() -> bool {
+    RAISE_DECLINED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether a process without administrator rights could replace `exe` or plant files
+/// beside it. Such a program must not be started elevated without a prompt.
+pub fn replaceable_without_elevation(exe: &std::path::Path) -> Result<bool, String> {
+    use windows_sys::Win32::Storage::FileSystem::*;
+    struct Token(HANDLE);
+    impl Drop for Token {
+        fn drop(&mut self) {
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+    // SAFETY: every buffer outlives its synchronous call; handles and the descriptor
+    // are released by the guards above.
+    unsafe {
+        let mut process = null_mut();
+        if OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_QUERY | TOKEN_DUPLICATE,
+            &mut process,
+        ) == 0
+        {
+            return Err(err());
+        }
+        let process = Token(process);
+        // Judge with the normal half of a split token; AccessCheck needs an
+        // impersonation token, which the linked token already is.
+        let mut linked = TOKEN_LINKED_TOKEN::default();
+        let mut size = 0;
+        let token = if elevated()
+            && GetTokenInformation(
+                process.0,
+                TokenLinkedToken,
+                (&mut linked as *mut TOKEN_LINKED_TOKEN).cast(),
+                size_of::<TOKEN_LINKED_TOKEN>() as u32,
+                &mut size,
+            ) != 0
+        {
+            Token(linked.LinkedToken)
+        } else if elevated() {
+            // No normal token exists (UAC disabled): everything this user runs is elevated.
+            return Ok(false);
+        } else {
+            let mut copy = null_mut();
+            if DuplicateToken(process.0, SecurityIdentification, &mut copy) == 0 {
+                return Err(err());
+            }
+            Token(copy)
+        };
+        let granted = |path: &std::path::Path| -> Result<u32, String> {
+            let mut descriptor = null_mut();
+            let status = GetNamedSecurityInfoW(
+                wide(path).as_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                &mut descriptor,
+            );
+            if status != 0 {
+                return Err(format!("{}: {status}", path.display()));
+            }
+            let _descriptor = LocalMemory(descriptor);
+            let mapping = GENERIC_MAPPING {
+                GenericRead: FILE_GENERIC_READ,
+                GenericWrite: FILE_GENERIC_WRITE,
+                GenericExecute: FILE_GENERIC_EXECUTE,
+                GenericAll: FILE_ALL_ACCESS,
+            };
+            let mut privileges = [0u32; 16];
+            let mut length = size_of_val(&privileges) as u32;
+            let mut access = 0;
+            let mut allowed = 0;
+            const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
+            if AccessCheck(
+                descriptor,
+                token.0,
+                MAXIMUM_ALLOWED,
+                &mapping,
+                privileges.as_mut_ptr().cast(),
+                &mut length,
+                &mut access,
+                &mut allowed,
+            ) == 0
+            {
+                return Err(err());
+            }
+            Ok(if allowed != 0 { access } else { 0 })
+        };
+        let control = WRITE_DAC | WRITE_OWNER;
+        let folder = exe.parent().ok_or("Executable folder")?;
+        Ok(
+            granted(exe)? & (FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE | control) != 0
+                || granted(folder)? & (FILE_ADD_FILE | FILE_DELETE_CHILD | control) != 0,
+        )
+    }
+}
 pub fn can_control_window(hwnd: windows_sys::Win32::Foundation::HWND) -> bool {
     thread_local! {static CURRENT:std::cell::Cell<Option<u32>>=const {std::cell::Cell::new(None)};}
     let current = CURRENT.with(|cached| {
@@ -182,6 +331,15 @@ pub fn config_mutex() -> Result<HANDLE, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_folders_writable_without_elevation_are_reported() {
+        // Cargo's target folder belongs to the user; System32 does not.
+        assert!(replaceable_without_elevation(&std::env::current_exe().unwrap()).unwrap());
+        let system = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32")
+            .join("kernel32.dll");
+        assert!(!replaceable_without_elevation(&system).unwrap());
+    }
     #[test]
     fn configuration_mutex_can_be_reopened_with_only_required_rights() {
         let first = config_mutex().unwrap();

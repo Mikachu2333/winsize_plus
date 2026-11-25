@@ -127,9 +127,36 @@ fn paint_tip_scrollbar_outline(hwnd: HWND) {
     }
 }
 
+/// Only these broadcasts change what the overlays draw. Environment, locale and policy
+/// notifications arrive as the same message and must not reset a visible preview.
+fn setting_affects_display(wp: WPARAM, lp: LPARAM) -> bool {
+    if matches!(
+        wp as u32,
+        SPI_SETWORKAREA | SPI_SETNONCLIENTMETRICS | SPI_SETICONTITLELOGFONT | SPI_SETHIGHCONTRAST
+    ) {
+        return true;
+    }
+    if lp == 0 {
+        return false;
+    }
+    // SAFETY: the system marshals this parameter as a NUL-terminated area name.
+    let name = unsafe {
+        let text = lp as *const u16;
+        let mut length = 0;
+        while length < 64 && *text.add(length) != 0 {
+            length += 1;
+        }
+        String::from_utf16_lossy(std::slice::from_raw_parts(text, length))
+    };
+    matches!(name.as_str(), "ImmersiveColorSet" | "WindowMetrics")
+}
+
 unsafe extern "system" fn paint(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
         match msg {
+            WM_SETTINGCHANGE if !setting_affects_display(wp, lp) => {
+                DefWindowProcW(hwnd, msg, wp, lp)
+            }
             WM_DISPLAYCHANGE | WM_SETTINGCHANGE | WM_DPICHANGED => {
                 crate::input::display_changed();
                 DefWindowProcW(hwnd, msg, wp, lp)
@@ -424,6 +451,9 @@ impl Overlay {
                 lpfnWndProc: Some(paint),
                 hInstance: instance,
                 hIcon: LoadIconW(instance, APP_ICON),
+                // A scrollable tip is hit-testable; without a class cursor it would keep
+                // whatever shape the window underneath set last.
+                hCursor: LoadCursorW(null_mut(), IDC_ARROW),
                 lpszClassName: CLASS,
                 ..Default::default()
             };

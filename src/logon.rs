@@ -36,7 +36,7 @@ fn definition(account: &str, elevated: bool) -> Result<String, String> {
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <Triggers><LogonTrigger><UserId>{account}</UserId></LogonTrigger></Triggers>
   <Principals><Principal id="Owner"><UserId>{account}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>{level}</RunLevel></Principal></Principals>
-  <Settings><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><ExecutionTimeLimit>PT0S</ExecutionTimeLimit></Settings>
+  <Settings><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><Priority>4</Priority></Settings>
   <Actions Context="Owner"><Exec><Command>{exe}</Command><Arguments>--resident</Arguments></Exec></Actions>
 </Task>"#
     ))
@@ -95,25 +95,37 @@ fn sync_task(name: BSTR, task: Option<String>) -> windows::core::Result<()> {
     update()
 }
 
-pub fn prepare(enabled: bool, elevated: bool, current_elevation: bool) -> Result<(), String> {
-    // Updating RunLevel does not remove an administrator-owned task's protected ACL.
-    // Delete while still elevated; the new resident recreates it with its normal token.
-    sync(enabled && !(current_elevation && !elevated), elevated)
+/// Starting an elevated program that anyone can replace hands out administrator
+/// rights. Portable use is common, so this only warns.
+pub fn elevation_warning(cfg: &crate::config::Config) -> Option<String> {
+    if !(cfg.autostart && cfg.elevate) {
+        return None;
+    }
+    let exe = std::env::current_exe().ok()?;
+    crate::security::replaceable_without_elevation(&exe)
+        .ok()?
+        .then(|| {
+            cfg.tr(
+                "Warning: WinSizeP starts with administrator rights from a folder that can be changed without them. Any program could replace it to gain those rights; consider a protected folder.",
+                "警告：WinSizeP 将以管理员权限自启动，但其所在文件夹无需管理员权限即可修改，其他程序可替换它来获得管理员权限。建议移到受保护的文件夹。",
+            )
+            .to_owned()
+        })
 }
 
-pub fn sync(enabled: bool, elevated: bool) -> Result<(), String> {
+/// Run the task update in a child at this process's own level: (exit code, message).
+fn update(enabled: bool, elevated: bool, owner: &str) -> Result<(Option<i32>, String), String> {
     use std::{
         io::Read,
         os::windows::{io::AsRawHandle, process::CommandExt},
         process::{Command, Stdio},
     };
-    let owner = account()?;
     let mut child = Command::new(std::env::current_exe().map_err(|e| e.to_string())?)
         .args([
             "--sync-logon-task",
             if enabled { "1" } else { "0" },
             if elevated { "1" } else { "0" },
-            &owner,
+            owner,
         ])
         .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
         .stdin(Stdio::null())
@@ -133,17 +145,37 @@ pub fn sync(enabled: bool, elevated: bool) -> Result<(), String> {
     if let Some(mut stderr) = child.stderr.take() {
         let _ = stderr.read_to_string(&mut error);
     }
-    match status.code() {
-        Some(0) => Ok(()),
-        Some(5) if unsafe { windows_sys::Win32::UI::Shell::IsUserAnAdmin() } == 0 => {
-            crate::elevated_helper(&format!(
-                "--sync-logon-task {} {} {}",
-                u8::from(enabled),
-                u8::from(elevated),
-                crate::quote_argument(&owner)
-            ))
+    Ok((status.code(), format!("{} ({status})", error.trim())))
+}
+
+pub fn sync(enabled: bool, elevated: bool) -> Result<(), String> {
+    let owner = account()?;
+    let failed = |message: String| Err(format!("Autostart / 自动启动: {message}"));
+    let helper = |enabled: bool, elevated: bool| {
+        crate::elevated_helper(&format!(
+            "--sync-logon-task {} {} {}",
+            u8::from(enabled),
+            u8::from(elevated),
+            crate::quote_argument(&owner)
+        ))
+    };
+    match update(enabled, elevated, &owner)? {
+        (Some(0), _) => Ok(()),
+        (Some(5), _) if !crate::security::elevated() && elevated => helper(enabled, true),
+        (Some(5), _) if !crate::security::elevated() => {
+            // An administrator registered the existing task, and updating it would keep
+            // its protected ACL: every later normal start would ask for consent again.
+            // Ask once to delete it, then register the replacement without elevation.
+            helper(false, false)?;
+            if !enabled {
+                return Ok(());
+            }
+            match update(true, false, &owner)? {
+                (Some(0), _) => Ok(()),
+                (_, message) => failed(message),
+            }
         }
-        _ => Err(format!("Autostart / 自动启动: {} ({status})", error.trim())),
+        (_, message) => failed(message),
     }
 }
 
@@ -203,6 +235,7 @@ mod tests {
             })
             .unwrap()
         );
+        assert!(!crate::security::elevated() && !crate::security::can_lower());
         let result = sync_task(temporary_name(), None);
         std::fs::write(probe_path("deletion"), format!("{result:?}")).unwrap();
     }
@@ -228,6 +261,17 @@ mod tests {
             })
             .unwrap(),
             "Run this test from an elevated process"
+        );
+        assert!(crate::security::elevated());
+        println!("split token (can lower): {}", crate::security::can_lower());
+        // The normal half of the token decides what counts as replaceable.
+        let system = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32")
+            .join("kernel32.dll");
+        assert!(!crate::security::replaceable_without_elevation(&system).unwrap());
+        assert!(
+            crate::security::replaceable_without_elevation(&std::env::current_exe().unwrap())
+                .unwrap()
         );
         struct Cleanup;
         impl Drop for Cleanup {

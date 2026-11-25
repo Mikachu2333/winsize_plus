@@ -1,4 +1,4 @@
-use crate::desktop::{check, err};
+use crate::desktop::err;
 use std::{
     ptr::null,
     time::{Duration, Instant},
@@ -60,7 +60,11 @@ impl FrameClock {
             .and_then(|when| when.checked_duration_since(Instant::now()))
         {
             let ticks = -(delay.as_nanos().div_ceil(100).max(1) as i64);
-            check(unsafe { SetWaitableTimer(self.timer, &ticks, 0, None, null(), 0) })?;
+            if unsafe { SetWaitableTimer(self.timer, &ticks, 0, None, null(), 0) } == 0 {
+                // No timer will fire: leaving the point pending would drop every later move.
+                self.pending = None;
+                return Err(err());
+            }
             Ok(None)
         } else {
             Ok(self.tick())

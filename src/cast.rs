@@ -103,6 +103,9 @@ struct Badge {
     label: Label,
     image: label_text::Image,
     padding: i32,
+    /// Position, opacity and color last sent to the windows. A badge is static for its
+    /// whole linger period, so identical frames are not redrawn.
+    drawn: std::cell::Cell<Option<(i32, i32, u8, u32)>>,
 }
 impl Badge {
     fn new(text: &str, display: &Display, style: &CastStyle) -> Result<Self, String> {
@@ -113,10 +116,16 @@ impl Badge {
             label: Label::new()?,
             image: label_text::annotation(text, width, display.dpi, style)?,
             padding,
+            drawn: std::cell::Cell::new(None),
         })
     }
     fn height(&self) -> i32 {
         self.image.height + 2 * self.padding
+    }
+    fn hide(&self) {
+        self.background.hide();
+        self.label.hide();
+        self.drawn.set(None);
     }
     fn draw(
         &self,
@@ -131,7 +140,14 @@ impl Badge {
         let area = display.work;
         let x = x.clamp(area.x, (area.x + area.width - width).max(area.x));
         let y = y.clamp(area.y, (area.y + area.height - height).max(area.y));
-        self.background.round(width, height, self.padding * 2)?;
+        let state = (x, y, alpha, style.background);
+        if self.drawn.get() == Some(state) {
+            return Ok(());
+        }
+        if self.drawn.get().is_none() {
+            // The size never changes after creation; the region is set once.
+            self.background.round(width, height, self.padding * 2)?;
+        }
         self.background.style(style.background, alpha);
         self.background.show(Rect {
             x,
@@ -140,7 +156,9 @@ impl Badge {
             height,
         });
         self.label
-            .image(&self.image, x + self.padding, y + self.padding, alpha)
+            .image(&self.image, x + self.padding, y + self.padding, alpha)?;
+        self.drawn.set(Some(state));
+        Ok(())
     }
 }
 
@@ -292,8 +310,7 @@ impl Visuals {
                     edge -= h;
                 }
                 if edge < area.y || edge + h > area.y + area.height {
-                    entry.badge.background.hide();
-                    entry.badge.label.hide();
+                    entry.badge.hide();
                     continue;
                 }
                 let x = if right {
@@ -312,7 +329,15 @@ impl Visuals {
             }
         }
         self.mouse.tick(&cfg.mousecast)?;
-        self.next = (!self.keys.is_empty()).then(|| now + Duration::from_millis(16));
+        // Nothing moves or fades until the oldest badge finishes lingering; animate
+        // frame by frame only from then on.
+        let linger = Duration::from_millis(cfg.keycast.duration.into());
+        self.next = self
+            .keys
+            .iter()
+            .map(|entry| entry.started + linger)
+            .min()
+            .map(|fade| fade.max(now + Duration::from_millis(16)));
         Ok(())
     }
     pub fn preview(&mut self, mouse: bool, point: POINT, cfg: &Config) -> Result<(), String> {
