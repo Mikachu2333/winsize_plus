@@ -223,6 +223,7 @@ struct Editor {
     tabs: Vec<HWND>,
     status: HWND,
     status_until: Cell<Option<Instant>>,
+    layout_size: Option<(i32, i32)>,
     pending_status: RefCell<Option<(Instant, String, bool)>>,
     save_error: Cell<bool>,
     last_error: RefCell<Option<String>>,
@@ -1103,7 +1104,25 @@ impl Editor {
         }
         Ok(())
     }
+    fn resize(&mut self) -> Result<(), String> {
+        let mut client = RECT::default();
+        unsafe {
+            GetClientRect(self.window.0, &mut client);
+        }
+        if self.layout_size == Some((client.right, client.bottom)) {
+            unsafe {
+                RemovePropW(self.window.0, w!("ResizeQueued"));
+            }
+            return Ok(());
+        }
+        self.layout()
+    }
     fn layout(&mut self) -> Result<(), String> {
+        #[cfg(test)]
+        unsafe {
+            let count = GetPropW(self.window.0, w!("LayoutCount")) as usize;
+            SetPropW(self.window.0, w!("LayoutCount"), (count + 1) as HANDLE);
+        }
         unsafe {
             RemovePropW(self.window.0, w!("ResizeQueued"));
         }
@@ -1111,6 +1130,7 @@ impl Editor {
         unsafe {
             GetClientRect(self.window.0, &mut client);
         }
+        self.layout_size = Some((client.right, client.bottom));
         let height = client.bottom.max(1);
         let left = self.sidebar_width(client.right);
         place(self.panes[0], 0, 0, left, height);
@@ -2810,12 +2830,15 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
                 .unwrap_or(-1)
         }),
         WM_SIZE => {
+            if wp == SIZE_MINIMIZED as usize {
+                return 0;
+            }
             unsafe {
                 if GetPropW(hwnd, w!("ResizeQueued")).is_null() {
                     SetPropW(hwnd, w!("ResizeQueued"), 1usize as HANDLE);
                 }
             }
-            with_editor(|e| e.layout());
+            with_editor(|e| e.resize());
             // Nested resize callbacks cannot borrow Editor; finish them after the
             // current operation. Ordinary live resizing is laid out synchronously.
             if !unsafe { GetPropW(hwnd, w!("ResizeQueued")) }.is_null() {
@@ -2827,19 +2850,30 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
         }
         RESIZE => {
             if !unsafe { GetPropW(hwnd, w!("ResizeQueued")) }.is_null() {
-                with_editor(|e| e.layout());
+                with_editor(|e| e.resize());
             }
             0
         }
         WM_EXITSIZEMOVE => {
-            with_editor(|e| e.layout());
+            with_editor(|e| e.resize());
             0
         }
         WM_WINDOWPOSCHANGING => unsafe {
-            if lp != 0 && (*(lp as *const WINDOWPOS)).flags & SWP_NOSIZE == 0 {
-                (*(lp as *mut WINDOWPOS)).flags |= SWP_NOCOPYBITS;
+            let result = DefWindowProcW(hwnd, message, wp, lp);
+            if lp != 0 {
+                let position = &mut *(lp as *mut WINDOWPOS);
+                let mut current = RECT::default();
+                // MoveWindow and some drag paths pass the unchanged size without
+                // SWP_NOSIZE. Retain pixels unless the dimensions actually change.
+                if position.flags & SWP_NOSIZE == 0
+                    && GetWindowRect(hwnd, &mut current) != 0
+                    && (position.cx, position.cy)
+                        != (current.right - current.left, current.bottom - current.top)
+                {
+                    position.flags |= SWP_NOCOPYBITS;
+                }
             }
-            DefWindowProcW(hwnd, message, wp, lp)
+            result
         },
         WM_GETMINMAXINFO => {
             unsafe {
@@ -3210,6 +3244,7 @@ pub fn run(path: &Path) -> Result<(), String> {
             tabs: Vec::new(),
             status: null_mut(),
             status_until: Cell::new(None),
+            layout_size: None,
             pending_status: RefCell::new(None),
             save_error: Cell::new(false),
             last_error: RefCell::new(None),
@@ -3404,6 +3439,7 @@ mod tests {
             tabs: Vec::new(),
             status: null_mut(),
             status_until: Cell::new(None),
+            layout_size: None,
             pending_status: RefCell::new(None),
             save_error: Cell::new(false),
             last_error: RefCell::new(None),
@@ -3897,6 +3933,144 @@ mod tests {
             }
         }
         crate::settings_theme::test_dark(None);
+    }
+
+    #[test]
+    #[ignore = "moves a temporary settings window and checks layout and child paint counts"]
+    fn moving_settings_does_not_relayout_or_repaint_controls() {
+        let _dpi = crate::test_support::Dpi::new();
+        let _hooks = input::Hooks::escape_only().unwrap();
+        let editor = test_editor(0, "settings-move-paint-test");
+        let root = editor.window.0;
+        let controls: Vec<_> = editor
+            .rows
+            .iter()
+            .flat_map(|row| row.controls)
+            .chain(std::iter::once(editor.status))
+            .filter(|hwnd| !hwnd.is_null())
+            .collect();
+        unsafe {
+            SetWindowLongPtrW(root, GWLP_WNDPROC, window_proc as *const () as isize);
+            SetWindowLongW(
+                root,
+                GWL_STYLE,
+                (GetWindowLongW(root, GWL_STYLE) as u32 | WS_CLIPCHILDREN) as i32,
+            );
+            for pane in editor.panes {
+                SetWindowLongPtrW(pane, GWLP_WNDPROC, pane_proc as *const () as isize);
+                SetWindowLongW(
+                    pane,
+                    GWL_STYLE,
+                    (WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_CLIPSIBLINGS) as i32,
+                );
+            }
+            ShowWindow(root, SW_SHOW);
+        }
+        editor.status("Saved");
+        EDITOR.with_borrow_mut(|slot| *slot = Some(editor));
+        struct Cleanup;
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                EDITOR.with_borrow_mut(|slot| {
+                    slot.take();
+                });
+            }
+        }
+        let _cleanup = Cleanup;
+        with_editor(|editor| editor.layout());
+        crate::test_support::pump();
+        unsafe {
+            RedrawWindow(
+                root,
+                null(),
+                null_mut(),
+                RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW,
+            );
+        }
+        let layouts = unsafe { GetPropW(root, w!("LayoutCount")) } as usize;
+        let counts = || {
+            controls
+                .iter()
+                .map(|&hwnd| unsafe {
+                    (
+                        GetPropW(hwnd, w!("SizeCount")) as usize,
+                        GetPropW(hwnd, w!("PaintCount")) as usize,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = counts();
+        let mut rect = RECT::default();
+        unsafe {
+            GetWindowRect(root, &mut rect);
+        }
+        let mut position = WINDOWPOS {
+            hwnd: root,
+            x: rect.left + 5,
+            y: rect.top + 5,
+            cx: rect.right - rect.left,
+            cy: rect.bottom - rect.top,
+            flags: SWP_NOACTIVATE | SWP_NOZORDER,
+            ..Default::default()
+        };
+        unsafe {
+            window_proc(
+                root,
+                WM_WINDOWPOSCHANGING,
+                0,
+                (&mut position as *mut WINDOWPOS) as isize,
+            );
+        }
+        assert_eq!(
+            position.flags & SWP_NOCOPYBITS,
+            0,
+            "same-size moves must retain client pixels"
+        );
+        for flags in [SWP_NOSIZE, 0] {
+            for step in 1..=4 {
+                unsafe {
+                    SetWindowPos(
+                        root,
+                        null_mut(),
+                        rect.left + step * 5,
+                        rect.top + step * 3,
+                        rect.right - rect.left,
+                        rect.bottom - rect.top,
+                        flags | SWP_NOACTIVATE | SWP_NOZORDER,
+                    );
+                    // Duplicate size notifications and the end of a move must also
+                    // preserve the existing layout when the client dimensions match.
+                    SendMessageW(root, WM_SIZE, SIZE_RESTORED as usize, 0);
+                    SendMessageW(root, WM_EXITSIZEMOVE, 0, 0);
+                }
+                crate::test_support::pump();
+            }
+        }
+        assert_eq!(
+            unsafe { GetPropW(root, w!("LayoutCount")) } as usize,
+            layouts
+        );
+        assert_eq!(
+            counts(),
+            before,
+            "moving the window redrew or resized a child"
+        );
+        unsafe {
+            SetWindowPos(
+                root,
+                null_mut(),
+                0,
+                0,
+                position.cx + 80,
+                position.cy + 40,
+                SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOZORDER,
+            );
+        }
+        crate::test_support::pump();
+        assert!(
+            unsafe { GetPropW(root, w!("LayoutCount")) } as usize > layouts,
+            "an actual resize must still update the layout"
+        );
     }
 
     #[test]
