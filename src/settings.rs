@@ -59,8 +59,13 @@ const AXIS_CUSTOM: i32 = 503;
 const SS_LEFT: u32 = 0;
 const SS_CENTER: u32 = 1;
 const SS_OWNERDRAW: u32 = 13;
+const SS_NOTIFY: u32 = 0x0100;
 thread_local! { static EDITOR: RefCell<Option<Editor>> = const { RefCell::new(None) }; }
 thread_local! { static UPDATING: Cell<bool> = const { Cell::new(false) }; }
+thread_local! {
+    static DISPLAY_UPDATE: Cell<bool> = const { Cell::new(false) };
+    static DPI_RECT: Cell<Option<RECT>> = const { Cell::new(None) };
+}
 thread_local! { static MEASUREMENTS: RefCell<HashMap<(usize,i32,String),i32>> = RefCell::new(HashMap::new()); }
 pub fn close_for_restart() -> Result<bool, String> {
     let window = unsafe { FindWindowW(CLASS, null()) };
@@ -214,6 +219,7 @@ struct Editor {
     tabs: Vec<HWND>,
     status: HWND,
     status_until: Cell<Option<Instant>>,
+    save_error: Cell<bool>,
     axis_controls: [HWND; 4],
     path: PathBuf,
     original: String,
@@ -456,9 +462,19 @@ impl Editor {
         }
     }
     fn status(&self, text: &str) {
+        if self.save_error.get() {
+            return;
+        }
         set_text(self.status, text);
         self.status_until
             .set(Some(Instant::now() + Duration::from_secs(3)));
+        self.layout_status();
+    }
+    fn error(&self, text: &str) {
+        self.save_error.set(false);
+        self.status(text);
+        self.save_error.set(true);
+        self.status_until.set(None);
         self.layout_status();
     }
     fn layout_status(&self) {
@@ -476,11 +492,21 @@ impl Editor {
         let width = (text_width(&text, &self.font) + self.s(12))
             .min(client.right - self.s(32))
             .max(1);
-        let height = measured(&text, &self.font, (width - self.s(12)).max(1))
-            .min(self.font.height() * 2)
-            + self.s(8);
+        let height = measured(&text, &self.font, (width - self.s(12)).max(1)).min(
+            if self.save_error.get() {
+                (client.bottom / 3).max(self.font.height() * 2)
+            } else {
+                self.font.height() * 2
+            },
+        ) + self.s(8);
         place(self.status, 0, client.bottom - height, width, height);
         unsafe {
+            // SetWindowRgn clips owner drawing and hit testing; Windows owns a successful region.
+            let diameter = self.s(10).min(width).min(height).max(1);
+            let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, diameter, diameter);
+            if !region.is_null() && SetWindowRgn(self.status, region, 1) == 0 {
+                DeleteObject(region);
+            }
             SetWindowPos(
                 self.status,
                 HWND_TOP,
@@ -581,6 +607,20 @@ impl Editor {
         Ok(())
     }
     fn rebuild(&mut self) -> Result<(), String> {
+        let focused = unsafe { GetFocus() };
+        let focus = self.rows.iter().find_map(|row| {
+            row.controls
+                .iter()
+                .position(|&handle| !handle.is_null() && handle == focused)
+                .map(|slot| {
+                    (
+                        row.field.section.clone(),
+                        row.field.key.clone(),
+                        slot,
+                        send(focused, EM_GETSEL, 0, 0),
+                    )
+                })
+        });
         let _redraw = RedrawGuard::new(self.panes[1]);
         for (_, (rows, _)) in self.pages.drain() {
             destroy_rows(rows);
@@ -933,6 +973,23 @@ impl Editor {
             }
         }
         self.render()?;
+        if let Some((section, key, slot, selection)) = focus
+            && let Some(row) = self
+                .rows
+                .iter()
+                .find(|row| row.field.section == section && row.field.key == key)
+            && !row.c(slot).is_null()
+        {
+            unsafe {
+                SetFocus(row.c(slot));
+            }
+            send(
+                row.c(slot),
+                EM_SETSEL,
+                (selection as usize) & 0xffff,
+                (selection >> 16) & 0xffff,
+            );
+        }
         #[cfg(test)]
         unsafe {
             SetPropW(self.window.0, w!("ReadyTab"), (self.tab + 1) as HANDLE);
@@ -1457,7 +1514,9 @@ impl Editor {
                 // The edits themselves are valid, so the file is busy, read-only or was
                 // changed meanwhile. Nothing else would try again: retry until it works
                 // instead of leaving the edits unsaved once the message fades.
-                self.pending = Some(Instant::now() + Duration::from_secs(2));
+                if !error.contains("Concurrent configuration edit preserved") {
+                    self.pending = Some(Instant::now() + Duration::from_secs(2));
+                }
                 return Err(error);
             }
         };
@@ -1483,24 +1542,17 @@ impl Editor {
                 }
             }
         }
-        let startup = self.dirty.iter().any(|i| {
-            self.rows.get(*i).is_some_and(|r| {
-                r.field.section == "general"
-                    && matches!(r.field.key.as_str(), "autostart" | "elevate")
-            })
-        });
         self.dirty.clear();
-        match startup
-            .then(|| crate::logon::elevation_warning(&self.cfg))
-            .flatten()
-        {
-            Some(warning) => self.status(&warning),
+        self.save_error.set(false);
+        match crate::logon::elevation_warning(&self.cfg) {
+            Some(warning) => self.error(&warning),
             None => self.status(self.cfg.tr("Saved", "已保存")),
         }
         self.invalidate_pages();
-        if rebuild {
+        if rebuild || self.rows_changed() {
             self.rebuild()?;
         } else {
+            self.refresh_mapping_options();
             self.update_values();
             if preview_changed && self.tab != 0 && self.tab != 4 {
                 self.render()?;
@@ -1674,6 +1726,36 @@ impl Editor {
         }
         self.update_enabled_controls();
     }
+    fn rows_changed(&self) -> bool {
+        let expected = schema::fields(self.tab, self.axis, &self.cfg, &self.doc);
+        expected.len() != self.rows.len()
+            || expected.iter().zip(&self.rows).any(|(a, b)| {
+                a.section != b.field.section
+                    || a.key != b.field.key
+                    || a.label != b.field.label
+                    || a.hint != b.field.hint
+            })
+    }
+
+    fn refresh_mapping_options(&mut self) {
+        let height = self.font.height() + self.s(14);
+        for row in &mut self.rows {
+            if !matches!(row.field.kind, Kind::Mapping) || row.field.section == "presets" {
+                continue;
+            }
+            let options = schema::actions(&self.cfg, row.field.section == "grid");
+            if row.options != options {
+                let selected = self
+                    .doc
+                    .get(&row.field.section)
+                    .and_then(|table| table.get(&row.field.key))
+                    .and_then(Item::as_str)
+                    .unwrap_or("");
+                row.options = options;
+                populate(row.c(0), &row.options, selected, height);
+            }
+        }
+    }
     fn render(&mut self) -> Result<(), String> {
         self.cast.clear();
         self.cast_next = None;
@@ -1749,15 +1831,11 @@ impl Editor {
         self.apply_config(Config::parse(&self.doc)?);
         self.dirty.clear();
         self.pending = None;
+        self.save_error.set(false);
         self.status(self.cfg.tr("Saved", "已保存"));
-        let expected = schema::fields(self.tab, self.axis, &self.cfg, &self.doc);
-        if expected.len() == self.rows.len()
-            && expected
-                .iter()
-                .zip(&self.rows)
-                .all(|(a, b)| a.section == b.field.section && a.key == b.field.key)
-        {
+        if !self.rows_changed() {
             self.invalidate_pages();
+            self.refresh_mapping_options();
             self.update_values();
             self.render()
         } else {
@@ -1967,20 +2045,7 @@ impl Editor {
         match kind {
             Kind::OpenConfig if event == BN_CLICKED => {
                 self.save()?;
-                return Command::new("notepad.exe")
-                    .arg(&self.path)
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn()
-                    .map(|_| ())
-                    .map_err(|error| {
-                        format!(
-                            "{}: {error}",
-                            self.cfg
-                                .tr("Could not open configuration file", "无法打开配置文件")
-                        )
-                    });
+                return crate::config_access::open(&self.path);
             }
             Kind::OpenConfig => return Ok(()),
             Kind::Preview if event == BN_CLICKED => {
@@ -2045,7 +2110,74 @@ impl Editor {
         }
         Ok(())
     }
+    fn refresh_display(&mut self) -> Result<(), String> {
+        DISPLAY_UPDATE.with(|flag| flag.set(false));
+        self.dpi = unsafe { GetDpiForWindow(self.window.0) }.max(96) as i32;
+        // Keep pending (even temporarily invalid) edits in their controls.
+        // Old fonts remain alive until every control has its replacement.
+        let font = Font::new("SystemFont", 0, self.dpi, false, false)?;
+        let hint = Font::new("SystemFont", 9, self.dpi, false, false)?;
+        let _old_font = std::mem::replace(&mut self.font, font);
+        let _old_hint = std::mem::replace(&mut self.hint_font, hint);
+        crate::settings_paint::reset_fonts();
+        MEASUREMENTS.with_borrow_mut(HashMap::clear);
+        for handle in self
+            .tabs
+            .iter()
+            .chain(self.axis_controls.iter())
+            .chain(std::iter::once(&self.status))
+        {
+            send(*handle, WM_SETFONT, self.font.0 as usize, 1);
+        }
+        for row in self
+            .rows
+            .iter()
+            .chain(self.pages.values().flat_map(|(rows, _)| rows))
+        {
+            for (slot, handle) in row.controls.iter().enumerate() {
+                if !handle.is_null() {
+                    send(
+                        *handle,
+                        WM_SETFONT,
+                        if slot == 2 {
+                            self.hint_font.0
+                        } else {
+                            self.font.0
+                        } as usize,
+                        1,
+                    );
+                    let mut class = [0u16; 32];
+                    let len =
+                        unsafe { GetClassNameW(*handle, class.as_mut_ptr(), class.len() as i32) };
+                    if String::from_utf16_lossy(&class[..len.max(0) as usize])
+                        .eq_ignore_ascii_case("COMBOBOX")
+                    {
+                        send(
+                            *handle,
+                            CB_SETITEMHEIGHT,
+                            0,
+                            (self.font.height() + self.s(14)) as isize,
+                        );
+                    }
+                }
+            }
+        }
+        if let Some(rect) = DPI_RECT.with(|rect| rect.take()) {
+            place(
+                self.window.0,
+                rect.left,
+                rect.top,
+                rect.right - rect.left,
+                rect.bottom - rect.top,
+            );
+        }
+        self.layout()?;
+        self.render()
+    }
     fn tick(&mut self) -> Result<(), String> {
+        if DISPLAY_UPDATE.with(Cell::get) {
+            self.refresh_display()?;
+        }
         if !unsafe { RemovePropW(self.window.0, w!("PreviewActivationPending")) }.is_null() {
             self.render()?;
         }
@@ -2084,6 +2216,10 @@ impl Editor {
                 self.original = loaded.text;
                 self.doc = loaded.document;
                 self.apply_config(loaded.config);
+                self.save_error.set(false);
+                if let Some(error) = loaded.write_error {
+                    self.error(&error);
+                }
                 if self.cfg.warnings.is_empty() {
                     self.status(
                         self.cfg
@@ -2099,17 +2235,11 @@ impl Editor {
                         self.cfg.warnings.join(", ")
                     ));
                 }
-                let expected = schema::fields(self.tab, self.axis, &self.cfg, &self.doc);
-                if expected.len() != self.rows.len()
-                    || expected.iter().zip(&self.rows).any(|(a, b)| {
-                        a.section != b.field.section
-                            || a.key != b.field.key
-                            || a.label != b.field.label
-                    })
-                {
+                if self.rows_changed() {
                     self.rebuild()?;
                 } else {
                     self.invalidate_pages();
+                    self.refresh_mapping_options();
                     self.update_values();
                     self.render()?;
                 }
@@ -2213,6 +2343,7 @@ impl Editor {
 }
 fn populate(hwnd: HWND, options: &[(String, String)], selected: &str, height: i32) {
     send(hwnd, WM_SETREDRAW, 0, 0);
+    send(hwnd, CB_RESETCONTENT, 0, 0);
     for (i, (value, label)) in options.iter().enumerate() {
         send(hwnd, CB_ADDSTRING, 0, wide(label).as_ptr() as isize);
         if value.eq_ignore_ascii_case(selected) {
@@ -2264,7 +2395,7 @@ fn with_editor(action: impl FnOnce(&mut Editor) -> Result<(), String>) {
         {
             UPDATING.with(|flag| flag.set(true));
             if let Err(error) = action(editor) {
-                editor.status(&error);
+                editor.error(&error);
             }
             UPDATING.with(|flag| flag.set(false));
         }
@@ -2617,73 +2748,27 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
                 );
             }
             input::display_changed();
-            with_editor(|e| {
-                if matches!(message, WM_THEMECHANGED | WM_SYSCOLORCHANGE) {
-                    return e.render();
-                }
-                e.dpi = unsafe { GetDpiForWindow(hwnd) }.max(96) as i32;
-                // Keep pending (even temporarily invalid) edits in their controls.
-                // Old fonts remain alive until every control has its replacement.
-                let font = Font::new("SystemFont", 0, e.dpi, false, false)?;
-                let hint = Font::new("SystemFont", 9, e.dpi, false, false)?;
-                let _old_font = std::mem::replace(&mut e.font, font);
-                let _old_hint = std::mem::replace(&mut e.hint_font, hint);
-                crate::settings_paint::reset_fonts();
-                MEASUREMENTS.with_borrow_mut(HashMap::clear);
-                for handle in e
-                    .tabs
-                    .iter()
-                    .chain(e.axis_controls.iter())
-                    .chain(std::iter::once(&e.status))
-                {
-                    send(*handle, WM_SETFONT, e.font.0 as usize, 1);
-                }
-                for row in e
-                    .rows
-                    .iter()
-                    .chain(e.pages.values().flat_map(|(rows, _)| rows))
-                {
-                    for (slot, handle) in row.controls.iter().enumerate() {
-                        if !handle.is_null() {
-                            send(
-                                *handle,
-                                WM_SETFONT,
-                                if slot == 2 { e.hint_font.0 } else { e.font.0 } as usize,
-                                1,
-                            );
-                            let mut class = [0u16; 32];
-                            let len = unsafe {
-                                GetClassNameW(*handle, class.as_mut_ptr(), class.len() as i32)
-                            };
-                            if String::from_utf16_lossy(&class[..len.max(0) as usize])
-                                .eq_ignore_ascii_case("COMBOBOX")
-                            {
-                                send(
-                                    *handle,
-                                    CB_SETITEMHEIGHT,
-                                    0,
-                                    (e.font.height() + e.s(14)) as isize,
-                                );
-                            }
-                        }
-                    }
-                }
-                if message == WM_DPICHANGED {
-                    let rect = unsafe { &*(lp as *const RECT) };
-                    place(
-                        hwnd,
-                        rect.left,
-                        rect.top,
-                        rect.right - rect.left,
-                        rect.bottom - rect.top,
-                    );
-                }
-                e.layout()?;
-                e.render()
-            });
+            // Modal dialogs can reenter while Editor is borrowed. Copy the suggested
+            // rectangle now: lParam is only valid during this callback.
+            DISPLAY_UPDATE.with(|flag| flag.set(true));
+            if message == WM_DPICHANGED && lp != 0 {
+                DPI_RECT.with(|rect| rect.set(Some(unsafe { *(lp as *const RECT) })));
+            }
+            with_editor(|e| e.refresh_display());
             0
         }
         WM_COMMAND => {
+            if (wp & 0xffff) == 600 && (wp >> 16) == STN_CLICKED as usize {
+                unsafe {
+                    MessageBoxW(
+                        hwnd,
+                        wide(caption(GetDlgItem(hwnd, 600))).as_ptr(),
+                        w!("WinSizeP"),
+                        MB_OK | MB_ICONINFORMATION,
+                    );
+                }
+                return 0;
+            }
             with_editor(|e| e.command((wp & 0xffff) as i32, (wp >> 16) as u32, lp as HWND));
             0
         }
@@ -2877,6 +2962,7 @@ pub fn run(path: &Path) -> Result<(), String> {
             return Ok(());
         }
         let loaded = config::load_snapshot(path, None)?;
+        let write_error = loaded.write_error;
         let original = loaded.text;
         let doc = loaded.document;
         let cfg = loaded.config;
@@ -2978,6 +3064,7 @@ pub fn run(path: &Path) -> Result<(), String> {
             tabs: Vec::new(),
             status: null_mut(),
             status_until: Cell::new(None),
+            save_error: Cell::new(false),
             axis_controls: [null_mut(); 4],
             path: path.into(),
             original,
@@ -3015,7 +3102,7 @@ pub fn run(path: &Path) -> Result<(), String> {
         }
         let divider = editor.create(panes[0], "STATIC", "", SS_OWNERDRAW, 99)?;
         SetPropW(divider, w!("Separator"), 1usize as HANDLE);
-        editor.status = editor.create(hwnd, "STATIC", "", SS_OWNERDRAW, 600)?;
+        editor.status = editor.create(hwnd, "STATIC", "", SS_OWNERDRAW | SS_NOTIFY, 600)?;
         editor.axis_controls[0] = editor.create(
             panes[1],
             "BUTTON",
@@ -3051,6 +3138,12 @@ pub fn run(path: &Path) -> Result<(), String> {
         let timer = editor.clock.handle();
         EDITOR.with_borrow_mut(|slot| *slot = Some(editor));
         with_editor(|e| e.rebuild());
+        if let Some(error) = write_error {
+            with_editor(|e| {
+                e.error(&error);
+                Ok(())
+            });
+        }
         SetTimer(hwnd, 1, 100, None);
         ShowWindow(hwnd, SW_SHOW);
         SetForegroundWindow(hwnd);
@@ -3127,16 +3220,13 @@ fn message_loop(hwnd: HWND, timer: HANDLE) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    #[ignore = "shows a keyboard sample and writes only target/settings-preview-test/config.toml"]
-    fn saving_preserves_preview_unless_merged_settings_change() {
-        let _hooks = input::Hooks::escape_only().unwrap();
+    fn test_editor(tab: usize, name: &str) -> Editor {
         let cfg = crate::test_support::cfg();
         let original = config::help().to_owned();
         let doc = original.parse::<DocumentMut>().unwrap();
         let folder = std::env::current_dir()
             .unwrap()
-            .join("target/settings-preview-test");
+            .join(format!("target/{name}"));
         std::fs::create_dir_all(&folder).unwrap();
         let path = folder.join("config.toml");
         std::fs::write(&path, &original).unwrap();
@@ -3166,13 +3256,14 @@ mod tests {
             tabs: Vec::new(),
             status: null_mut(),
             status_until: Cell::new(None),
+            save_error: Cell::new(false),
             axis_controls: [null_mut(); 4],
             path,
             original,
             doc,
             clock: FrameClock::new(cfg.fps).unwrap(),
             cfg,
-            tab: 8,
+            tab,
             axis: 0,
             rows: Vec::new(),
             pages: HashMap::new(),
@@ -3193,21 +3284,27 @@ mod tests {
             active_combo: None,
         };
         editor.status = editor.create(hwnd, "STATIC", "", 0, 600).unwrap();
-        let field = schema::fields(8, 0, &editor.cfg, &editor.doc)
-            .into_iter()
-            .find(|field| field.section == "keycast" && field.key == "duration_ms")
+        editor.panes = [
+            editor.create(hwnd, "STATIC", "", 0, 10).unwrap(),
+            editor.create(hwnd, "STATIC", "", 0, 11).unwrap(),
+        ];
+        editor.rebuild().unwrap();
+        editor
+    }
+    #[test]
+    #[ignore = "shows a keyboard sample and writes only target/settings-preview-test/config.toml"]
+    fn saving_preserves_preview_unless_merged_settings_change() {
+        let _hooks = input::Hooks::escape_only().unwrap();
+        let mut editor = test_editor(8, "settings-preview-test");
+        let index = editor
+            .rows
+            .iter()
+            .position(|row| row.field.section == "keycast" && row.field.key == "duration_ms")
             .unwrap();
-        let edit = editor
-            .create(hwnd, "EDIT", "1600", ES_AUTOHSCROLL as u32, BASE)
-            .unwrap();
-        let mut controls = [null_mut(); 16];
-        controls[0] = edit;
-        editor.rows.push(Row {
-            field,
-            controls,
-            options: Vec::new(),
-        });
-        editor.command(BASE, EN_CHANGE, edit).unwrap();
+        let edit = editor.rows[index].c(0);
+        let id = BASE + index as i32 * STRIDE;
+        set_text(edit, "1600");
+        editor.command(id, EN_CHANGE, edit).unwrap();
         let first = editor.cast_next.unwrap();
         editor.save().unwrap();
         assert_eq!(editor.cfg.keycast.duration, 1600);
@@ -3215,7 +3312,7 @@ mod tests {
         assert!(editor.pending.is_none());
 
         set_text(edit, "1700");
-        editor.command(BASE, EN_CHANGE, edit).unwrap();
+        editor.command(id, EN_CHANGE, edit).unwrap();
         let before_merge = editor.cast_next.unwrap();
         let mut disk = editor.doc.clone();
         disk["keycast"]["duration_ms"] = value(1800);
@@ -3225,7 +3322,7 @@ mod tests {
         assert!(editor.cast_next.unwrap() > before_merge);
         editor.cast.clear();
         unsafe {
-            KillTimer(hwnd, 1);
+            KillTimer(editor.window.0, 1);
         }
     }
     #[test]
@@ -3242,6 +3339,129 @@ mod tests {
         }
         let ordinary = super::minimum_window_size(96, (1920, 1040));
         assert_eq!((ordinary.x, ordinary.y), (780, 540));
+    }
+    #[test]
+    #[ignore = "uses temporary settings controls and isolated configuration files"]
+    fn merged_documents_refresh_rows_options_and_preserve_focus() {
+        let _hooks = input::Hooks::escape_only().unwrap();
+        let mut editor = test_editor(2, "settings-merge-test");
+        let index = editor
+            .rows
+            .iter()
+            .position(|row| row.field.section == "presets" && row.field.key == "Center")
+            .unwrap();
+        let focused = editor.rows[index].c(0);
+        set_text(focused, "20sw|20sh|60sw|60sh");
+        editor.dirty.insert(index);
+        unsafe {
+            ShowWindow(editor.window.0, SW_SHOW);
+            SetFocus(focused);
+        }
+        send(focused, EM_SETSEL, 2, 5);
+        let mut disk = editor.doc.clone();
+        disk["presets"].as_table_mut().unwrap().remove("LeftTop");
+        std::fs::write(&editor.path, disk.to_string()).unwrap();
+        editor.save().unwrap();
+        assert!(
+            !editor
+                .rows
+                .iter()
+                .any(|row| row.field.section == "presets" && row.field.key == "LeftTop")
+        );
+        let center = editor
+            .rows
+            .iter()
+            .find(|row| row.field.section == "presets" && row.field.key == "Center")
+            .unwrap();
+        assert_eq!(unsafe { GetFocus() }, center.c(0));
+        assert_eq!(send(center.c(0), EM_GETSEL, 0, 0), 2 | (5 << 16));
+        assert_eq!(caption(center.c(0)), "20sw|20sh|60sw|60sh");
+
+        editor.tab = 4;
+        editor.rebuild().unwrap();
+        let index = editor
+            .rows
+            .iter()
+            .position(|row| row.field.section == "keys")
+            .unwrap();
+        let combo = editor.rows[index].c(0);
+        let before = send(combo, CB_GETCOUNT, 0, 0);
+        editor.dirty.insert(index);
+        let mut disk = editor.doc.clone();
+        disk["presets"]["ExternalRegion"] = value("0|0|25sw|25sh");
+        std::fs::write(&editor.path, disk.to_string()).unwrap();
+        editor.save().unwrap();
+        assert_eq!(editor.rows[index].c(0), combo);
+        assert_eq!(send(combo, CB_GETCOUNT, 0, 0), before + 1);
+        assert!(
+            editor.rows[index]
+                .options
+                .iter()
+                .any(|option| option.0 == "ExternalRegion")
+        );
+        editor.dirty.insert(index);
+        editor.save().unwrap();
+        assert_eq!(send(combo, CB_GETCOUNT, 0, 0), before + 1);
+    }
+
+    #[test]
+    #[ignore = "uses temporary settings controls to exercise modal callbacks and status clipping"]
+    fn modal_display_updates_and_save_errors_remain_visible() {
+        let _hooks = input::Hooks::escape_only().unwrap();
+        let mut editor = test_editor(0, "settings-modal-test");
+        let hwnd = editor.window.0;
+        editor.error("Save failed: full detailed error");
+        editor.status("Saved");
+        assert_eq!(caption(editor.status), "Save failed: full detailed error");
+        assert!(editor.status_until.get().is_none());
+        let region = unsafe { CreateRectRgn(0, 0, 0, 0) };
+        assert_ne!(unsafe { GetWindowRgn(editor.status, region) }, ERROR);
+        assert_eq!(unsafe { PtInRegion(region, 0, 0) }, 0);
+        unsafe {
+            DeleteObject(region);
+        }
+        let index = editor
+            .rows
+            .iter()
+            .position(|row| matches!(row.field.kind, Kind::Number))
+            .unwrap();
+        let control = editor.rows[index].c(0);
+        set_text(control, "");
+        editor.dirty.insert(index);
+        EDITOR.with_borrow_mut(|slot| *slot = Some(editor));
+        EDITOR.with_borrow_mut(|slot| {
+            let editor = slot.as_mut().unwrap();
+            let mut suggested = RECT {
+                left: 120,
+                top: 100,
+                right: 1020,
+                bottom: 800,
+            };
+            unsafe {
+                window_proc(
+                    hwnd,
+                    WM_DPICHANGED,
+                    144,
+                    (&mut suggested as *mut RECT) as isize,
+                );
+            }
+            assert!(DISPLAY_UPDATE.with(Cell::get));
+            assert_eq!(DPI_RECT.with(Cell::get).unwrap().left, 120);
+            assert_eq!(caption(control), "");
+            editor.tick().unwrap();
+            assert!(!DISPLAY_UPDATE.with(Cell::get));
+            assert!(DPI_RECT.with(Cell::get).is_none());
+            let mut actual = RECT::default();
+            unsafe {
+                GetWindowRect(hwnd, &mut actual);
+            }
+            assert_eq!((actual.left, actual.top), (120, 100));
+            assert_eq!(caption(control), "");
+            assert!(editor.dirty.contains(&index));
+        });
+        EDITOR.with_borrow_mut(|slot| {
+            slot.take();
+        });
     }
     use super::*;
     #[test]
