@@ -33,6 +33,10 @@ Run `winsizep.exe` and open Settings from the tray menu. Left Alt is the default
 
 Customize shortcuts, mouse actions, regions, and annotations in Settings. See tray Help for more actions. Run WinSizeP as administrator to control elevated windows.
 
+The configuration file, `winsizep_config.toml`, stays beside the executable. Reading, saving, and opening it always use ordinary user permissions. Access failures identify the file and error; click the error message at the bottom left of Settings to read the full details. Concurrent save conflicts preserve a `.conflict.toml` file for reviewing external changes.
+
+Administrator autostart requires an executable and parent directories that ordinary users cannot replace. If this check fails, WinSizeP refuses registration and attempts to remove the previous startup task. You can continue using the application with administrator autostart disabled.
+
 ## Command line
 
 ```powershell
