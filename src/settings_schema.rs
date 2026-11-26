@@ -471,9 +471,9 @@ pub fn fields(tab: usize, axis: usize, cfg: &Config, doc: &DocumentMut) -> Vec<F
     let sections: &[&str] = match tab {
         0 => &["general", "topmost_marker"],
         1 => &["tip"],
-        2 => &["presets", "regions"],
+        2 => &["regions", "presets"],
         3 => &["outline"],
-        4 => &["shortcuts", "keys", "commands"],
+        4 => &["shortcuts", "general", "keys", "commands"],
         5 if cfg.crosshair_unified || axis != 1 => &["crosshair", "horizontal"],
         5 => &["crosshair", "vertical"],
         7 => &["mousecast"],
@@ -506,21 +506,18 @@ pub fn fields(tab: usize, axis: usize, cfg: &Config, doc: &DocumentMut) -> Vec<F
         };
         let mapping = matches!(*section, "presets" | "keys" | "commands" | "grid");
         let mut entries: Vec<_> = table.iter().collect();
-        if *section == "shortcuts" {
-            let order = [
-                "move_enabled",
-                "move_button",
-                "resize_enabled",
-                "resize_button",
-                "center_enabled",
-                "center_button",
-                "gesture",
-                "alt",
-            ];
+        if !mapping {
+            let order = field_order(section);
             entries
                 .sort_by_key(|(key, _)| order.iter().position(|v| v == key).unwrap_or(order.len()));
         }
         for (key, item) in entries {
+            if *section == "general" {
+                let activation = matches!(key, "alt_hold_ms" | "preview" | "target_marker");
+                if activation != (tab == 4) {
+                    continue;
+                }
+            }
             if *section == "crosshair" && key == "mode" {
                 continue;
             }
@@ -632,16 +629,97 @@ pub fn fields(tab: usize, axis: usize, cfg: &Config, doc: &DocumentMut) -> Vec<F
     }
     if tab == 4 {
         fields.push(Field { section: String::new(), key: String::new(), label: cfg.tr("Built-in command aliases", "内置命令别名").into(), hint: "Version = Ver; Help = H; Quit = Exit; Restart = Reboot; Top = Pin; Ignore = Exclude; Monitor = Screen".into(), kind: Kind::Note });
+        fields.sort_by_key(|field| match group(field).0 {
+            "keyboard-activation" => 0,
+            "mouse-actions" => 1,
+            "activation-feedback" => 2,
+            "keys" => 3,
+            "commands" => 4,
+            _ => 5,
+        });
     }
     fields
 }
 
+fn field_order(section: &str) -> &'static [&'static str] {
+    match section {
+        "general" => &[
+            "language",
+            "autostart",
+            "elevate",
+            "alt_hold_ms",
+            "preview",
+            "target_marker",
+        ],
+        "topmost_marker" => &["enabled", "size", "position"],
+        "shortcuts" => &[
+            "alt",
+            "gesture",
+            "move_enabled",
+            "move_button",
+            "resize_enabled",
+            "resize_button",
+            "center_enabled",
+            "center_button",
+        ],
+        "tip" => &[
+            "show",
+            "duration_ms",
+            "window_format",
+            "time_format",
+            "theme",
+            "background",
+            "foreground",
+            "dark_background",
+            "dark_foreground",
+            "font",
+            "font_size",
+            "font_bold",
+            "font_italic",
+            "font_fallbacks",
+        ],
+        "regions" => &[
+            "font",
+            "font_size",
+            "font_bold",
+            "font_italic",
+            "font_fallbacks",
+        ],
+        "outline" => &["width", "color", "dark_color", "opacity", "fill_opacity"],
+        "crosshair" => &["fps", "mode"],
+        "horizontal" | "vertical" => &["width", "gap", "color", "opacity"],
+        "mousecast" => &["enabled", "swap_side_buttons", "radius", "opacity"],
+        "keycast" => &[
+            "enabled",
+            "duration_ms",
+            "history",
+            "position",
+            "background",
+            "foreground",
+            "opacity",
+            "font",
+            "font_size",
+        ],
+        _ => &[],
+    }
+}
+
 pub fn group(field: &Field) -> (&str, u8) {
+    if matches!(field.kind, Kind::Mapping | Kind::Add) {
+        return (&field.section, 0);
+    }
+    match (field.section.as_str(), field.key.as_str()) {
+        ("general", "alt_hold_ms") | ("shortcuts", "alt") => return ("keyboard-activation", 0),
+        ("general", "preview" | "target_marker") => return ("activation-feedback", 0),
+        ("shortcuts", _) => return ("mouse-actions", 0),
+        ("general", "autostart" | "elevate") => return ("general", 1),
+        ("mousecast", "radius" | "opacity") => return ("mousecast", 1),
+        _ => {}
+    }
     let part = match field.key.as_str() {
         "font" | "font_fallbacks" | "font_size" | "font_bold" | "font_italic" => 2,
         "color" | "dark_color" | "background" | "foreground" | "dark_background"
-        | "dark_foreground" | "opacity" | "fill_opacity" => 1,
-        "alt" => 3,
+        | "dark_foreground" | "opacity" | "fill_opacity" | "theme" => 1,
         _ => 0,
     };
     (&field.section, part)
@@ -667,6 +745,100 @@ pub fn actions(cfg: &Config, presets_only: bool) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn fixed_settings_stay_grouped_when_the_document_is_reordered() {
+        let mut doc = config::help().parse::<DocumentMut>().unwrap();
+        let cfg = Config::parse(&doc).unwrap();
+        let expected: Vec<_> = (0..TABS.len())
+            .map(|tab| fields(tab, 0, &cfg, &doc))
+            .collect();
+        for section in [
+            "general",
+            "topmost_marker",
+            "shortcuts",
+            "tip",
+            "regions",
+            "outline",
+            "crosshair",
+            "horizontal",
+            "vertical",
+            "mousecast",
+            "keycast",
+        ] {
+            let table = doc[section].as_table_mut().unwrap();
+            let keys: Vec<_> = table.iter().map(|(key, _)| key.to_owned()).collect();
+            for key in keys.into_iter().rev() {
+                let item = table.remove(&key).unwrap();
+                table.insert(&key, item);
+            }
+        }
+        for (tab, expected) in expected.iter().enumerate() {
+            let actual = fields(tab, 0, &cfg, &doc);
+            let identities = |fields: &[Field]| {
+                fields
+                    .iter()
+                    .map(|field| (field.section.clone(), field.key.clone()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(identities(&actual), identities(expected), "tab {tab}");
+            let mut seen = std::collections::HashSet::new();
+            let mut previous = None;
+            for field in &actual {
+                if matches!(field.kind, Kind::Note | Kind::Preview | Kind::OpenConfig) {
+                    continue;
+                }
+                let next = group(field);
+                if previous != Some(next) {
+                    assert!(seen.insert(next), "split group {next:?} in tab {tab}");
+                    previous = Some(next);
+                }
+            }
+        }
+        for key in ["alt_hold_ms", "preview", "target_marker"] {
+            assert!(
+                !expected[0]
+                    .iter()
+                    .any(|field| field.section == "general" && field.key == key)
+            );
+            assert!(
+                expected[4]
+                    .iter()
+                    .any(|field| field.section == "general" && field.key == key)
+            );
+        }
+    }
+
+    #[test]
+    fn custom_mappings_keep_their_authored_order_and_one_group() {
+        let mut doc = config::help().parse::<DocumentMut>().unwrap();
+        doc["presets"]["font"] = toml_edit::value("0|0|50sw|50sh");
+        doc["presets"]["color"] = toml_edit::value("0|0|50sw|50sh");
+        let cfg = Config::parse(&doc).unwrap();
+        for (tab, section) in [(2, "presets"), (4, "keys"), (4, "commands"), (6, "grid")] {
+            let actual = fields(tab, 0, &cfg, &doc);
+            let names: Vec<_> = actual
+                .iter()
+                .filter(|field| field.section == section && matches!(field.kind, Kind::Mapping))
+                .map(|field| field.key.as_str())
+                .collect();
+            assert_eq!(
+                names,
+                doc[section]
+                    .as_table()
+                    .unwrap()
+                    .iter()
+                    .map(|(key, _)| key)
+                    .collect::<Vec<_>>()
+            );
+            assert!(
+                actual
+                    .iter()
+                    .filter(|field| field.section == section)
+                    .all(|field| group(field) == (section, 0))
+            );
+        }
+    }
+
     #[test]
     fn color_fields_expose_only_supported_channels_and_known_options() {
         let mut doc = config::help().parse::<DocumentMut>().unwrap();
