@@ -6,7 +6,9 @@ use windows_sys::{
         Foundation::*,
         Graphics::Gdi::*,
         UI::{
-            Controls::*, HiDpi::GetDpiForWindow, Input::KeyboardAndMouse::IsWindowEnabled,
+            Controls::*,
+            HiDpi::GetDpiForWindow,
+            Input::KeyboardAndMouse::{GetFocus, IsWindowEnabled},
             WindowsAndMessaging::*,
         },
     },
@@ -30,7 +32,18 @@ pub fn draw(root: HWND, draw: &DRAWITEMSTRUCT) {
         let old = SelectObject(dc, font);
         let saved = SaveDC(dc);
         SetBkMode(dc, TRANSPARENT as i32);
-        if draw.CtlID == 600 {
+        if draw.CtlID == 703 {
+            FillRect(dc, &rect, crate::settings_theme::control());
+            FrameRect(
+                dc,
+                &rect,
+                if GetFocus() == GetDlgItem(root, 700) {
+                    GetSysColorBrush(COLOR_HIGHLIGHT)
+                } else {
+                    crate::settings_theme::edge()
+                },
+            );
+        } else if draw.CtlID == 600 {
             // Owner drawing can run while the window's resize region is changing.
             // Clip this paint to its current bounds as well as the window region.
             let diameter = scale(10)

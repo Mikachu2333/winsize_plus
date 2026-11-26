@@ -47,6 +47,13 @@ const APP_EXIT: u32 = WM_APP + 85;
 /// Private WM_COMMAND notification: Enter was pressed in an edit field.
 const EDIT_COMMIT: u32 = 0x7f00;
 const ACTIVATE_PREVIEW: u32 = WM_APP + 86;
+const SEARCH_KEY: u32 = WM_APP + 87;
+const SEARCH_FOCUS: u32 = WM_APP + 88;
+const SEARCH_EDIT: i32 = 700;
+const SEARCH_RESULTS: i32 = 701;
+const SEARCH_CLEAR: i32 = 702;
+const SEARCH_FRAME: i32 = 703;
+const SEARCH_TIMER: usize = 3;
 #[cfg(test)]
 const PREVIEW_STATE: u32 = WM_APP + 99;
 #[cfg(test)]
@@ -94,6 +101,7 @@ pub fn open() -> Result<(), String> {
         if !existing.is_null() {
             ShowWindowAsync(existing, SW_RESTORE);
             SetForegroundWindow(existing);
+            PostMessageW(existing, SEARCH_FOCUS, 0, 0);
             return Ok(());
         }
     }
@@ -216,6 +224,7 @@ impl Row {
     }
 }
 struct Editor {
+    search: Search,
     cast: crate::cast::Visuals,
     cast_next: Option<Instant>,
     window: Window,
@@ -252,6 +261,22 @@ struct Editor {
     clock: FrameClock,
     tooltip: HoverTip,
     active_combo: Option<HWND>,
+}
+#[derive(Default)]
+struct Search {
+    frame: HWND,
+    edit: HWND,
+    list: HWND,
+    clear: HWND,
+    index: crate::settings_search::Index,
+    matches: Vec<usize>,
+    selected: usize,
+    query: String,
+    stale: bool,
+    visible: bool,
+    dismissed: bool,
+    composing: bool,
+    highlight: Option<crate::settings_search::Target>,
 }
 fn text_width(text: &str, font: &Font) -> i32 {
     unsafe {
@@ -374,6 +399,14 @@ fn measured(text: &str, font: &Font, width: i32) -> i32 {
 }
 impl Editor {
     fn apply_config(&mut self, cfg: Config) {
+        if self.cfg != cfg {
+            self.search.stale = true;
+            if unsafe { GetFocus() } == self.search.edit && !self.search.query.is_empty() {
+                unsafe {
+                    SetTimer(self.window.0, SEARCH_TIMER, 150, None);
+                }
+            }
+        }
         if self.cfg.fps != cfg.fps {
             self.clock.reset(cfg.fps);
         }
@@ -457,6 +490,457 @@ impl Editor {
     }
     fn s(&self, n: i32) -> i32 {
         (n * self.dpi + 48) / 96
+    }
+    fn init_search(&mut self) -> Result<(), String> {
+        self.search.frame = self.create(
+            self.window.0,
+            "STATIC",
+            "",
+            SS_OWNERDRAW | SS_NOTIFY | WS_CLIPSIBLINGS,
+            SEARCH_FRAME,
+        )?;
+        self.search.edit = self.create(
+            self.window.0,
+            "EDIT",
+            "",
+            WS_TABSTOP | ES_AUTOHSCROLL as u32,
+            SEARCH_EDIT,
+        )?;
+        self.search.list = self.create(
+            self.window.0,
+            "LISTBOX",
+            "",
+            WS_BORDER
+                | WS_VSCROLL
+                | WS_TABSTOP
+                | LBS_NOTIFY as u32
+                | LBS_OWNERDRAWFIXED as u32
+                | LBS_HASSTRINGS as u32
+                | LBS_NOINTEGRALHEIGHT as u32,
+            SEARCH_RESULTS,
+        )?;
+        self.search.clear = self.create(
+            self.window.0,
+            "BUTTON",
+            "×",
+            BS_PUSHBUTTON as u32 | WS_TABSTOP,
+            SEARCH_CLEAR,
+        )?;
+        send(self.search.edit, EM_SETLIMITTEXT, 160, 0);
+        self.search.stale = true;
+        unsafe {
+            ShowWindow(self.search.list, SW_HIDE);
+        }
+        Ok(())
+    }
+    fn layout_search(&self, left: i32, right: i32, height: i32) -> i32 {
+        if self.search.edit.is_null() {
+            return 0;
+        }
+        let padding = self.s(16);
+        let h = self.font.height() + self.s(10);
+        let x = left + padding;
+        let width = (right - left - padding * 2).max(1);
+        let clear = self.s(30).min(width / 3);
+        let input_width = (width - clear - self.s(4)).max(1);
+        place(self.search.frame, x, padding, input_width, h);
+        place(
+            self.search.edit,
+            x + self.s(8),
+            padding + (h - self.font.height()) / 2,
+            (input_width - self.s(16)).max(1),
+            self.font.height(),
+        );
+        place(
+            self.search.clear,
+            x + width - clear,
+            padding,
+            clear.max(1),
+            h,
+        );
+        send(
+            self.search.edit,
+            EM_SETCUEBANNER,
+            1,
+            wide(self.cfg.tr("Search settings…", "搜索设置…")).as_ptr() as isize,
+        );
+        unsafe {
+            EnableWindow(
+                self.search.clear,
+                i32::from(!caption(self.search.edit).is_empty()),
+            );
+        }
+        if self.search.visible {
+            let row = self.font.height() + self.s(12);
+            let rows = self.search.matches.len().clamp(1, 6) as i32;
+            let list_height = (rows * row + self.s(4)).min((height / 3).max(row));
+            send(self.search.list, LB_SETITEMHEIGHT, 0, row as isize);
+            place(
+                self.search.list,
+                x,
+                padding + h + self.s(4),
+                width,
+                list_height,
+            );
+            unsafe {
+                ShowWindow(self.search.list, SW_SHOWNOACTIVATE);
+            }
+            if !self.search.matches.is_empty() {
+                send(self.search.list, LB_SETCURSEL, self.search.selected, 0);
+                let top = send(self.search.list, LB_GETTOPINDEX, 0, 0);
+                if top > self.search.selected as isize
+                    || self.search.selected as isize >= top + rows as isize
+                {
+                    send(self.search.list, LB_SETTOPINDEX, self.search.selected, 0);
+                }
+            }
+            padding * 2 + h + self.s(4) + list_height
+        } else {
+            unsafe {
+                ShowWindow(self.search.list, SW_HIDE);
+            }
+            padding * 2 + h
+        }
+    }
+    fn refresh_search_index(&mut self) -> Result<(), String> {
+        if self.search.stale {
+            let draft = self.collect().unwrap_or_else(|_| self.doc.clone());
+            self.search.index = crate::settings_search::Index::build(&draft, &self.families)
+                .or_else(|_| crate::settings_search::Index::build(&self.doc, &self.families))?;
+            self.search.stale = false;
+        }
+        Ok(())
+    }
+    fn fill_search_results(&self) {
+        send(self.search.list, WM_SETREDRAW, 0, 0);
+        send(self.search.list, LB_RESETCONTENT, 0, 0);
+        if self.search.matches.is_empty() {
+            send(
+                self.search.list,
+                LB_ADDSTRING,
+                0,
+                wide(self.cfg.tr("No matching settings", "未找到匹配的设置项")).as_ptr() as isize,
+            );
+        } else {
+            for &at in &self.search.matches {
+                send(
+                    self.search.list,
+                    LB_ADDSTRING,
+                    0,
+                    wide(&self.search.index.entries[at].label).as_ptr() as isize,
+                );
+            }
+            send(self.search.list, LB_SETCURSEL, self.search.selected, 0);
+        }
+        send(self.search.list, WM_SETREDRAW, 1, 0);
+        unsafe {
+            InvalidateRect(self.search.list, null(), 1);
+        }
+    }
+    fn run_search(&mut self) -> Result<(), String> {
+        if self.search.composing {
+            return Ok(());
+        }
+        let query = caption(self.search.edit);
+        if query.trim().is_empty() {
+            return self.close_search(true);
+        }
+        let previous = if query == self.search.query {
+            self.search
+                .matches
+                .get(self.search.selected)
+                .map(|&at| self.search.index.entries[at].target.clone())
+        } else {
+            None
+        };
+        self.search.query = query;
+        self.refresh_search_index()?;
+        self.search.matches = self.search.index.find(&self.search.query);
+        self.search.selected = previous
+            .and_then(|target| {
+                self.search
+                    .matches
+                    .iter()
+                    .position(|&at| self.search.index.entries[at].target == target)
+            })
+            .unwrap_or(0);
+        self.search.visible = true;
+        self.search.dismissed = false;
+        self.fill_search_results();
+        self.layout()?;
+        if self.search.matches.is_empty() {
+            self.search.highlight = None;
+            self.update_search_highlight();
+            unsafe {
+                RedrawWindow(
+                    self.panes[1],
+                    null(),
+                    null_mut(),
+                    RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN,
+                );
+            }
+            return Ok(());
+        }
+        self.navigate_search(false)
+    }
+    fn search_row(&self, target: &crate::settings_search::Target) -> Option<usize> {
+        let crate::settings_search::Target::Field {
+            tab,
+            axis,
+            section,
+            key,
+            occurrence,
+        } = target
+        else {
+            return None;
+        };
+        if *tab != self.tab || (*tab == 5 && *axis != self.axis) {
+            return None;
+        }
+        self.rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.field.section == *section && row.field.key == *key)
+            .nth(*occurrence)
+            .map(|(at, _)| at)
+    }
+    fn search_control(&self, target: &crate::settings_search::Target) -> HWND {
+        match target {
+            crate::settings_search::Target::Axis(at) => {
+                let control = self.axis_controls[*at];
+                if unsafe { IsWindowEnabled(control) } == 0 {
+                    self.axis_controls[3]
+                } else {
+                    control
+                }
+            }
+            _ => self
+                .search_row(target)
+                .map(|at| {
+                    let row = &self.rows[at];
+                    if !row.c(0).is_null() {
+                        row.c(0)
+                    } else {
+                        row.c(1)
+                    }
+                })
+                .unwrap_or(null_mut()),
+        }
+    }
+    fn navigate_search(&mut self, focus: bool) -> Result<(), String> {
+        let Some(&at) = self.search.matches.get(self.search.selected) else {
+            return Ok(());
+        };
+        let target = self.search.index.entries[at].target.clone();
+        self.save()?;
+        if self.search.stale {
+            self.refresh_search_index()?;
+            self.search.matches = self.search.index.find(&self.search.query);
+            let Some(selected) = self
+                .search
+                .matches
+                .iter()
+                .position(|&at| self.search.index.entries[at].target == target)
+            else {
+                self.search.highlight = None;
+                self.search.selected = 0;
+                self.fill_search_results();
+                return self.layout();
+            };
+            self.search.selected = selected;
+            self.fill_search_results();
+        }
+        let (tab, mut axis) = target.page();
+        if tab == 5 && self.cfg.crosshair_unified {
+            axis = 0;
+        }
+        self.switch_page(tab, axis)?;
+        self.search.highlight = Some(target.clone());
+        if !focus {
+            self.overlay.hide_tip();
+            self.preview.hide();
+            self.cast.clear();
+            self.cast_next = None;
+            input::annotation_preview(false)?;
+            input::track_preview(false)?;
+        }
+        if focus {
+            self.search.visible = false;
+            self.search.dismissed = true;
+            self.layout()?;
+        }
+        let control = self.search_control(&target);
+        if control.is_null() {
+            return Ok(());
+        }
+        let anchor = self
+            .search_row(&target)
+            .map(|at| {
+                let row = &self.rows[at];
+                if !row.c(1).is_null() {
+                    row.c(1)
+                } else {
+                    control
+                }
+            })
+            .unwrap_or(control);
+        let mut rect = RECT::default();
+        unsafe {
+            GetWindowRect(anchor, &mut rect);
+            MapWindowPoints(
+                null_mut(),
+                self.panes[1],
+                (&mut rect as *mut RECT).cast(),
+                2,
+            );
+        }
+        self.scroll_by(1, u16::MAX, rect.top - self.s(16))?;
+        self.update_search_highlight();
+        let mut focus_control = control;
+        if focus
+            && unsafe { IsWindowEnabled(control) } == 0
+            && let crate::settings_search::Target::Field { section, key, .. } = &target
+        {
+            let enabler = match (section.as_str(), key.as_str()) {
+                ("topmost_marker", _) => Some(("topmost_marker", "enabled")),
+                ("shortcuts", "move_button") => Some(("shortcuts", "move_enabled")),
+                ("shortcuts", "resize_button") => Some(("shortcuts", "resize_enabled")),
+                ("shortcuts", "center_button") => Some(("shortcuts", "center_enabled")),
+                ("tip", "window_format") => Some(("tip", "show")),
+                _ => None,
+            };
+            focus_control = enabler
+                .and_then(|(section, key)| {
+                    self.rows
+                        .iter()
+                        .find(|row| row.field.section == section && row.field.key == key)
+                })
+                .map(|row| row.c(0))
+                .unwrap_or(anchor);
+        }
+        unsafe {
+            RedrawWindow(
+                self.panes[1],
+                null(),
+                null_mut(),
+                RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN,
+            );
+            SetFocus(if focus {
+                focus_control
+            } else {
+                self.search.edit
+            });
+        }
+        Ok(())
+    }
+    fn update_search_highlight(&self) {
+        let pane = self.panes[1];
+        unsafe {
+            RemovePropW(pane, w!("SearchMatch"));
+        }
+        let Some(target) = &self.search.highlight else {
+            return;
+        };
+        if target.page().0 != self.tab {
+            return;
+        }
+        let controls: Vec<_> = if let Some(at) = self.search_row(target) {
+            self.rows[at]
+                .controls
+                .iter()
+                .enumerate()
+                .filter_map(|(slot, &hwnd)| (slot != 11 && !hwnd.is_null()).then_some(hwnd))
+                .collect()
+        } else if matches!(target, crate::settings_search::Target::Axis(_)) {
+            vec![self.search_control(target)]
+        } else {
+            return;
+        };
+        let mut bounds = None;
+        for hwnd in controls {
+            if unsafe { IsWindowVisible(hwnd) } == 0 {
+                continue;
+            }
+            let mut rect = RECT::default();
+            unsafe {
+                GetWindowRect(hwnd, &mut rect);
+                MapWindowPoints(null_mut(), pane, (&mut rect as *mut RECT).cast(), 2);
+            }
+            bounds = Some(if let Some(old) = bounds {
+                let mut joined = RECT::default();
+                unsafe {
+                    UnionRect(&mut joined, &old, &rect);
+                }
+                joined
+            } else {
+                rect
+            });
+        }
+        if let Some(rect) = bounds {
+            let pad = self.s(6);
+            unsafe {
+                for (name, value) in [
+                    (w!("SearchLeft"), rect.left - pad),
+                    (w!("SearchTop"), rect.top - pad),
+                    (w!("SearchRight"), rect.right + pad),
+                    (w!("SearchBottom"), rect.bottom + pad),
+                ] {
+                    SetPropW(pane, name, value as usize as HANDLE);
+                }
+                SetPropW(pane, w!("SearchMatch"), 1usize as HANDLE);
+            }
+        }
+    }
+    fn close_search(&mut self, clear: bool) -> Result<(), String> {
+        unsafe {
+            KillTimer(self.window.0, SEARCH_TIMER);
+        }
+        self.search.visible = false;
+        self.search.dismissed = true;
+        if clear {
+            self.search.query.clear();
+            self.search.matches.clear();
+            self.search.highlight = None;
+            set_text(self.search.edit, "");
+        }
+        self.layout()
+    }
+    fn search_key(&mut self, key: u32) -> Result<(), String> {
+        if self.search.composing {
+            return Ok(());
+        }
+        if matches!(key, 13 | 38 | 40)
+            && self.search.query != caption(self.search.edit)
+            && !self.search.composing
+        {
+            unsafe {
+                KillTimer(self.window.0, SEARCH_TIMER);
+            }
+            self.run_search()?;
+        }
+        match key {
+            27 => {
+                self.close_search(!self.search.visible)?;
+                unsafe {
+                    SetFocus(self.search.edit);
+                }
+            }
+            13 => self.navigate_search(true)?,
+            38 | 40 if !self.search.matches.is_empty() => {
+                self.search.selected = if key == 38 {
+                    self.search.selected.saturating_sub(1)
+                } else {
+                    (self.search.selected + 1).min(self.search.matches.len() - 1)
+                };
+                self.search.visible = true;
+                self.search.dismissed = false;
+                send(self.search.list, LB_SETCURSEL, self.search.selected, 0);
+                self.layout()?;
+                self.navigate_search(false)?;
+            }
+            _ => {}
+        }
+        Ok(())
     }
     fn update_axis_controls(&self) {
         for (i, control) in self.axis_controls.iter().enumerate() {
@@ -639,7 +1123,7 @@ impl Editor {
         let is_edit = class == "EDIT";
         let is_combo = class == "COMBOBOX";
         let class = wide(class);
-        let style = if is_edit {
+        let style = if is_edit && id != SEARCH_EDIT {
             style | ES_MULTILINE as u32 | ES_AUTOVSCROLL as u32
         } else if is_combo {
             style | CBS_OWNERDRAWFIXED as u32 | CBS_HASSTRINGS as u32
@@ -1134,7 +1618,14 @@ impl Editor {
         let height = client.bottom.max(1);
         let left = self.sidebar_width(client.right);
         place(self.panes[0], 0, 0, left, height);
-        place(self.panes[1], left, 0, client.right - left, height);
+        let header = self.layout_search(left, client.right, height);
+        place(
+            self.panes[1],
+            left,
+            header,
+            client.right - left,
+            (height - header).max(1),
+        );
         self.layout_status();
         let padding = self.s(16);
         let gap = self.s(4);
@@ -1382,15 +1873,20 @@ impl Editor {
         self.extent[1] = y + padding;
         let mut adjusted = false;
         for pane in 0..2 {
+            let viewport = if pane == 0 {
+                height
+            } else {
+                (height - header).max(1)
+            };
             let old = self.scroll[pane];
-            self.scroll[pane] = old.clamp(0, (self.extent[pane] - height).max(0));
+            self.scroll[pane] = old.clamp(0, (self.extent[pane] - viewport).max(0));
             adjusted |= old != self.scroll[pane];
             let info = SCROLLINFO {
                 cbSize: size_of::<SCROLLINFO>() as u32,
                 fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
                 nMin: 0,
                 nMax: self.extent[pane] - 1,
-                nPage: height as u32,
+                nPage: viewport as u32,
                 nPos: self.scroll[pane],
                 ..Default::default()
             };
@@ -1419,6 +1915,7 @@ impl Editor {
         if adjusted || rect.right != initial_right_width {
             self.layout()?;
         }
+        self.update_search_highlight();
         // Complete this resize before Windows draws the next drag frame. This also
         // erases newly exposed text and the background behind rounded status corners.
         unsafe {
@@ -1514,6 +2011,7 @@ impl Editor {
                 SetScrollPos(self.panes[pane], SB_VERT, self.scroll[pane], 1);
             }
         }
+        self.update_search_highlight();
         Ok(())
     }
     fn selected_value(row: &Row, slot: usize) -> String {
@@ -1668,6 +2166,7 @@ impl Editor {
         };
         self.doc = saved.parse::<DocumentMut>().map_err(|e| e.to_string())?;
         self.original = saved;
+        self.search.stale = true;
         let cfg = Config::parse(&self.doc)?;
         // The edit already updated the live preview. Saving only restarts it
         // when merging concurrent file changes alters the effective settings.
@@ -1984,6 +2483,7 @@ impl Editor {
     fn commit_document(&mut self, draft: DocumentMut) -> Result<(), String> {
         Config::parse(&draft)?;
         self.original = config::save_settings(&self.path, &self.original, &draft)?;
+        self.search.stale = true;
         self.doc = self
             .original
             .parse::<DocumentMut>()
@@ -2153,6 +2653,45 @@ impl Editor {
         Ok(())
     }
     fn command(&mut self, id: i32, event: u32, sender: HWND) -> Result<(), String> {
+        if id == SEARCH_FRAME && event == STN_CLICKED {
+            unsafe {
+                SetFocus(self.search.edit);
+            }
+            return Ok(());
+        }
+        if id == SEARCH_EDIT && sender == self.search.edit {
+            if event == EN_CHANGE && !self.search.composing {
+                self.search.dismissed = false;
+                unsafe {
+                    SetTimer(self.window.0, SEARCH_TIMER, 150, None);
+                }
+            } else if event == EN_SETFOCUS
+                && !self.search.dismissed
+                && !self.search.query.is_empty()
+                && !self.search.visible
+            {
+                self.search.visible = true;
+                self.layout()?;
+            }
+            return Ok(());
+        }
+        if id == SEARCH_RESULTS && sender == self.search.list {
+            if matches!(event, LBN_SELCHANGE | LBN_DBLCLK) {
+                let selected = send(sender, LB_GETCURSEL, 0, 0);
+                if selected >= 0 && (selected as usize) < self.search.matches.len() {
+                    self.search.selected = selected as usize;
+                    self.navigate_search(event == LBN_DBLCLK)?;
+                }
+            }
+            return Ok(());
+        }
+        if id == SEARCH_CLEAR && event == BN_CLICKED {
+            self.close_search(true)?;
+            unsafe {
+                SetFocus(self.search.edit);
+            }
+            return Ok(());
+        }
         if matches!(event, BN_CLICKED | CBN_SELCHANGE | EN_CHANGE | EDIT_COMMIT) {
             // A new user action can report the same problem again; background
             // retries without another edit keep the original ten-second deadline.
@@ -2167,6 +2706,10 @@ impl Editor {
         }
         if (TAB_BASE..TAB_BASE + TABS.len() as i32).contains(&id) && event == BN_CLICKED {
             self.save()?;
+            if !self.search.edit.is_null() {
+                self.close_search(false)?;
+            }
+            self.search.highlight = None;
             return self.switch_page((id - TAB_BASE) as usize, self.axis);
         }
         if matches!(id, AXIS_H | AXIS_V | AXIS_BOTH | AXIS_CUSTOM) && event == BN_CLICKED {
@@ -2291,6 +2834,8 @@ impl Editor {
             .iter()
             .chain(self.axis_controls.iter())
             .chain(std::iter::once(&self.status))
+            .chain([&self.search.edit, &self.search.list, &self.search.clear])
+            .chain(std::iter::once(&self.search.frame))
         {
             send(*handle, WM_SETFONT, self.font.0 as usize, 1);
         }
@@ -2371,6 +2916,7 @@ impl Editor {
             if disk != self.original {
                 let loaded = config::load_snapshot(&self.path, None)?;
                 self.original = loaded.text;
+                self.search.stale = true;
                 self.doc = loaded.document;
                 self.apply_config(loaded.config);
                 self.save_error.set(false);
@@ -2475,6 +3021,13 @@ impl Editor {
         }
     }
     fn escape(&mut self) -> Result<(), String> {
+        let focus = unsafe { GetFocus() };
+        if !self.search.edit.is_null()
+            && (focus == self.search.edit || focus == self.search.list)
+            && (self.search.visible || !caption(self.search.edit).is_empty())
+        {
+            return self.search_key(27);
+        }
         input::annotation_preview(false)?;
         self.cast.clear();
         self.cast_next = None;
@@ -2662,7 +3215,69 @@ unsafe extern "system" fn control_proc(
         let mut class = [0u16; 32];
         let length = GetClassNameW(hwnd, class.as_mut_ptr(), 32);
         let class = String::from_utf16_lossy(&class[..length as usize]);
-        if class.eq_ignore_ascii_case("edit") && matches!(message, WM_SIZE | EDIT_LAYOUT) {
+        let id = GetDlgCtrlID(hwnd);
+        if id == SEARCH_EDIT && matches!(message, WM_SETFOCUS | WM_KILLFOCUS) {
+            InvalidateRect(GetDlgItem(root as HWND, SEARCH_FRAME), null(), 0);
+        }
+        if matches!(id, SEARCH_EDIT | SEARCH_RESULTS) {
+            if message == WM_GETDLGCODE {
+                let mut flags =
+                    DefSubclassProc(hwnd, message, wp, lp) & !(DLGC_WANTALLKEYS as isize);
+                flags |= DLGC_WANTARROWS as isize;
+                if lp != 0 && matches!((*(lp as *const MSG)).wParam, 13 | 27 | 38 | 40) {
+                    flags |= DLGC_WANTMESSAGE as isize;
+                }
+                return flags;
+            }
+            if message == WM_KEYDOWN && matches!(wp, 13 | 27 | 38 | 40) {
+                let composing = id == SEARCH_EDIT
+                    && EDITOR.with(|slot| {
+                        slot.try_borrow()
+                            .ok()
+                            .and_then(|e| e.as_ref().map(|e| e.search.composing))
+                            .unwrap_or(false)
+                    });
+                if composing {
+                    return DefSubclassProc(hwnd, message, wp, lp);
+                }
+                PostMessageW(root as HWND, SEARCH_KEY, wp, 0);
+                return 0;
+            }
+            if message == WM_CHAR && matches!(wp, 13 | 27) {
+                return 0;
+            }
+            if id == SEARCH_EDIT && message == WM_IME_STARTCOMPOSITION {
+                with_editor(|e| {
+                    e.search.composing = true;
+                    KillTimer(e.window.0, SEARCH_TIMER);
+                    Ok(())
+                });
+            }
+            if id == SEARCH_EDIT && message == WM_IME_ENDCOMPOSITION {
+                let result = DefSubclassProc(hwnd, message, wp, lp);
+                with_editor(|e| {
+                    e.search.composing = false;
+                    SetTimer(e.window.0, SEARCH_TIMER, 150, None);
+                    Ok(())
+                });
+                return result;
+            }
+        }
+        if class.eq_ignore_ascii_case("button")
+            && message == WM_GETDLGCODE
+            && lp != 0
+            && (*(lp as *const MSG)).wParam == 13
+        {
+            return DefSubclassProc(hwnd, message, wp, lp) | DLGC_WANTMESSAGE as isize;
+        }
+        if class.eq_ignore_ascii_case("button") && message == WM_KEYDOWN && wp == 13 {
+            PostMessageW(hwnd, BM_CLICK, 0, 0);
+            return 0;
+        }
+        if class.eq_ignore_ascii_case("edit")
+            && id != SEARCH_EDIT
+            && matches!(message, WM_SIZE | EDIT_LAYOUT)
+        {
             let result = DefSubclassProc(hwnd, message, wp, lp);
             let dc = GetDC(hwnd);
             let old = SelectObject(dc, send(hwnd, WM_GETFONT, 0, 0) as HFONT);
@@ -2845,6 +3460,23 @@ unsafe extern "system" fn pane_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: LP
                 let mut rect = RECT::default();
                 GetClientRect(hwnd, &mut rect);
                 FillRect(wp as HDC, &rect, crate::settings_theme::surface());
+                if !GetPropW(hwnd, w!("SearchMatch")).is_null() {
+                    let coord = |name| GetPropW(hwnd, name) as usize as i32;
+                    let region = CreateRoundRectRgn(
+                        coord(w!("SearchLeft")),
+                        coord(w!("SearchTop")),
+                        coord(w!("SearchRight")),
+                        coord(w!("SearchBottom")),
+                        8,
+                        8,
+                    );
+                    if !region.is_null() {
+                        SetDCBrushColor(wp as HDC, GetSysColor(COLOR_HIGHLIGHT));
+                        let width = (2 * GetDpiForWindow(hwnd).max(96) / 96) as i32;
+                        FrameRgn(wp as HDC, region, GetStockObject(DC_BRUSH), width, width);
+                        DeleteObject(region);
+                    }
+                }
                 1
             }
             _ => DefWindowProcW(hwnd, message, wp, lp),
@@ -3021,8 +3653,13 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
             });
             0
         }
-        WM_CTLCOLORSTATIC => unsafe {
-            crate::settings_theme::color(wp as HDC, false, GetDlgCtrlID(lp as HWND) == 600)
+        WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORBTN => unsafe {
+            crate::settings_theme::color(
+                wp as HDC,
+                false,
+                GetDlgCtrlID(lp as HWND) == 600
+                    || matches!(message, WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX),
+            )
         },
         WM_ERASEBKGND => unsafe {
             let mut rect = RECT::default();
@@ -3032,12 +3669,30 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
         },
         WM_TIMER => {
             with_editor(|e| {
-                if wp == SAVE_STATUS_TIMER {
+                if wp == SEARCH_TIMER {
+                    unsafe {
+                        KillTimer(hwnd, SEARCH_TIMER);
+                    }
+                    e.run_search()
+                } else if wp == SAVE_STATUS_TIMER {
                     e.show_pending_status(Instant::now());
                     Ok(())
                 } else {
                     e.tick()
                 }
+            });
+            0
+        }
+        SEARCH_KEY => {
+            with_editor(|e| e.search_key(wp as u32));
+            0
+        }
+        SEARCH_FOCUS => {
+            with_editor(|e| {
+                unsafe {
+                    SetFocus(e.search.edit);
+                }
+                Ok(())
             });
             0
         }
@@ -3203,6 +3858,7 @@ pub fn run(path: &Path) -> Result<(), String> {
             if !hwnd.is_null() {
                 ShowWindow(hwnd, SW_RESTORE);
                 SetForegroundWindow(hwnd);
+                PostMessageW(hwnd, SEARCH_FOCUS, 0, 0);
             }
             return Ok(());
         }
@@ -3302,6 +3958,7 @@ pub fn run(path: &Path) -> Result<(), String> {
             crate::settings_theme::apply(*pane);
         }
         let mut editor = Editor {
+            search: Search::default(),
             cast: crate::cast::Visuals::new(),
             cast_next: None,
             window,
@@ -3351,6 +4008,7 @@ pub fn run(path: &Path) -> Result<(), String> {
         let divider = editor.create(panes[0], "STATIC", "", SS_OWNERDRAW, 99)?;
         SetPropW(divider, w!("Separator"), 1usize as HANDLE);
         editor.status = editor.create(hwnd, "STATIC", "", SS_OWNERDRAW | SS_NOTIFY, 600)?;
+        editor.init_search()?;
         editor.axis_controls[0] = editor.create(
             panes[1],
             "BUTTON",
@@ -3395,8 +4053,13 @@ pub fn run(path: &Path) -> Result<(), String> {
         SetTimer(hwnd, 1, 100, None);
         ShowWindow(hwnd, SW_SHOW);
         SetForegroundWindow(hwnd);
+        with_editor(|editor| {
+            SetFocus(editor.search.edit);
+            Ok(())
+        });
         let result = message_loop(hwnd, timer);
         KillTimer(hwnd, 1);
+        KillTimer(hwnd, SEARCH_TIMER);
         EDITOR.with_borrow_mut(|slot| {
             slot.take();
         });
@@ -3468,6 +4131,182 @@ fn message_loop(hwnd: HWND, timer: HANDLE) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "uses a temporary settings window to verify search focus, keyboard input and navigation"]
+    fn search_navigation_preserves_focus_values_and_fixed_header() {
+        let _dpi = crate::test_support::Dpi::new();
+        let _hooks = input::Hooks::escape_only().unwrap();
+        let editor = test_editor(0, "settings-search-ui-test");
+        let original = editor.original.clone();
+        let hwnd = editor.window.0;
+        unsafe {
+            SetWindowLongPtrW(hwnd, GWLP_WNDPROC, window_proc as *const () as isize);
+        }
+        EDITOR.with_borrow_mut(|slot| *slot = Some(editor));
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                EDITOR.with_borrow_mut(|slot| {
+                    slot.take();
+                });
+            }
+        }
+        let _reset = Reset;
+        with_editor(|e| {
+            e.init_search()?;
+            e.layout()
+        });
+        let edit = EDITOR.with_borrow(|slot| slot.as_ref().unwrap().search.edit);
+        let list = EDITOR.with_borrow(|slot| slot.as_ref().unwrap().search.list);
+        unsafe {
+            ShowWindow(hwnd, SW_SHOW);
+            SetForegroundWindow(hwnd);
+            PostMessageW(hwnd, SEARCH_FOCUS, 0, 0);
+        }
+        crate::test_support::pump();
+        assert_eq!(unsafe { GetFocus() }, edit);
+        let frame = EDITOR.with_borrow(|slot| slot.as_ref().unwrap().search.frame);
+        let mut outer = RECT::default();
+        let mut inner = RECT::default();
+        unsafe {
+            GetWindowRect(frame, &mut outer);
+            GetWindowRect(edit, &mut inner);
+        }
+        assert!(((outer.top + outer.bottom) - (inner.top + inner.bottom)).abs() <= 1);
+        fn wait(query: &str) {
+            let until = Instant::now() + Duration::from_secs(3);
+            loop {
+                crate::test_support::pump();
+                let ready = EDITOR.with_borrow(|slot| {
+                    slot.as_ref()
+                        .is_some_and(|e| e.search.query == query && e.search.visible)
+                });
+                if ready {
+                    return;
+                }
+                assert!(Instant::now() < until, "Search timer did not run: {query}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        set_text(edit, "q");
+        std::thread::sleep(Duration::from_millis(40));
+        crate::test_support::pump();
+        EDITOR.with_borrow(|slot| assert!(slot.as_ref().unwrap().search.query.is_empty()));
+        wait("q");
+        EDITOR.with_borrow(|slot| {
+            let e = slot.as_ref().unwrap();
+            assert_eq!(e.tab, 4);
+            assert!(matches!(e.search.highlight, Some(crate::settings_search::Target::Field { ref section, ref key, .. }) if section == "keys" && key == "Q"));
+            assert!(!unsafe { GetPropW(e.panes[1], w!("SearchMatch")) }.is_null());
+        });
+        assert_eq!(unsafe { GetFocus() }, edit);
+        unsafe {
+            SendMessageW(edit, WM_KEYDOWN, 40, 0);
+        }
+        crate::test_support::pump();
+        EDITOR.with_borrow(|slot| assert_eq!(slot.as_ref().unwrap().search.selected, 1));
+        unsafe {
+            SetFocus(list);
+            SendMessageW(list, WM_KEYDOWN, 38, 0);
+        }
+        crate::test_support::pump();
+        EDITOR.with_borrow(|slot| assert_eq!(slot.as_ref().unwrap().search.selected, 0));
+        unsafe {
+            SendMessageW(edit, WM_KEYDOWN, 13, 0);
+        }
+        crate::test_support::pump();
+        EDITOR.with_borrow(|slot| {
+            let e = slot.as_ref().unwrap();
+            assert!(!e.search.visible);
+            assert_eq!(
+                unsafe { GetFocus() },
+                e.search_control(e.search.highlight.as_ref().unwrap())
+            );
+            assert_eq!(e.original, original);
+            assert!(e.dirty.is_empty());
+        });
+        let mut before = RECT::default();
+        unsafe {
+            GetWindowRect(edit, &mut before);
+        }
+        with_editor(|e| e.scroll_by(1, u16::MAX, 500));
+        let mut after = RECT::default();
+        unsafe {
+            GetWindowRect(edit, &mut after);
+        }
+        assert_eq!(
+            (before.left, before.top, before.right, before.bottom),
+            (after.left, after.top, after.right, after.bottom)
+        );
+        unsafe {
+            SetFocus(edit);
+            SendMessageW(edit, WM_KEYDOWN, 40, 0);
+        }
+        crate::test_support::pump();
+        unsafe {
+            SetFocus(list);
+            SendMessageW(list, WM_KEYDOWN, 27, 0);
+        }
+        crate::test_support::pump();
+        assert_eq!(unsafe { GetFocus() }, edit);
+        EDITOR.with_borrow(|slot| assert!(!slot.as_ref().unwrap().search.visible));
+        assert_eq!(caption(edit), "q");
+        unsafe {
+            SendMessageW(edit, WM_KEYDOWN, 27, 0);
+        }
+        crate::test_support::pump();
+        assert!(caption(edit).is_empty());
+        unsafe {
+            SendMessageW(edit, WM_IME_STARTCOMPOSITION, 0, 0);
+        }
+        set_text(edit, "准星");
+        std::thread::sleep(Duration::from_millis(200));
+        crate::test_support::pump();
+        EDITOR.with_borrow(|slot| assert!(slot.as_ref().unwrap().search.query.is_empty()));
+        unsafe {
+            SendMessageW(edit, WM_IME_ENDCOMPOSITION, 0, 0);
+        }
+        wait("准星");
+        EDITOR.with_borrow(|slot| assert_eq!(slot.as_ref().unwrap().tab, 5));
+        set_text(edit, "不存在的设置关键词");
+        wait("不存在的设置关键词");
+        EDITOR.with_borrow(|slot| {
+            let e = slot.as_ref().unwrap();
+            assert!(e.search.matches.is_empty());
+            assert_eq!(e.original, original);
+        });
+        with_editor(|e| {
+            e.close_search(true)?;
+            e.switch_page(0, 0)?;
+            let at = e
+                .rows
+                .iter()
+                .position(|row| row.field.section == "topmost_marker" && row.field.key == "enabled")
+                .unwrap();
+            let control = e.rows[at].c(0);
+            send(control, BM_SETCHECK, 0, 0);
+            e.command(BASE + at as i32 * STRIDE, BN_CLICKED, control)?;
+            e.save()
+        });
+        set_text(edit, "32");
+        wait("32");
+        unsafe {
+            SendMessageW(edit, WM_KEYDOWN, 13, 0);
+        }
+        crate::test_support::pump();
+        EDITOR.with_borrow(|slot| {
+            let e = slot.as_ref().unwrap();
+            assert!(!e.cfg.topmost_marker.enabled);
+            let enabler = e
+                .rows
+                .iter()
+                .find(|row| row.field.section == "topmost_marker" && row.field.key == "enabled")
+                .unwrap()
+                .c(0);
+            assert_eq!(unsafe { GetFocus() }, enabler);
+        });
+    }
+
     #[test]
     #[ignore = "uses hidden settings controls and an isolated configuration file"]
     fn topmost_marker_choices_save_as_numbers_and_follow_the_enable_switch() {
@@ -3620,6 +4459,7 @@ mod tests {
         };
         assert!(!hwnd.is_null());
         let mut editor = Editor {
+            search: Search::default(),
             cast: crate::cast::Visuals::new(),
             cast_next: None,
             window: Window(hwnd),
@@ -4566,6 +5406,38 @@ mod tests {
             };
             let checks = (|| -> Result<(), String> {
                 std::thread::sleep(Duration::from_millis(600));
+                let search = unsafe { GetDlgItem(hwnd, SEARCH_EDIT) };
+                let list = unsafe { GetDlgItem(hwnd, SEARCH_RESULTS) };
+                let mut focus = GUITHREADINFO {
+                    cbSize: size_of::<GUITHREADINFO>() as u32,
+                    ..Default::default()
+                };
+                unsafe {
+                    GetGUIThreadInfo(GetWindowThreadProcessId(hwnd, null_mut()), &mut focus);
+                }
+                if focus.hwndFocus != search {
+                    return Err("Search did not receive initial focus".into());
+                }
+                set_text(search, "准星");
+                let until = Instant::now() + Duration::from_secs(5);
+                while unsafe { IsWindowVisible(list) } == 0
+                    || unsafe { GetPropW(hwnd, w!("ReadyTab")) } as usize != 6
+                {
+                    if Instant::now() > until {
+                        return Err("Search did not navigate to crosshair".into());
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                snapshot(hwnd, &output.join("search.bmp"));
+                unsafe {
+                    SendMessageW(list, WM_KEYDOWN, 27, 0);
+                }
+                std::thread::sleep(Duration::from_millis(100));
+                if unsafe { IsWindowVisible(list) } != 0 {
+                    return Err("Escape did not dismiss search results".into());
+                }
+                set_text(search, "");
+                std::thread::sleep(Duration::from_millis(200));
                 unsafe {
                     let mut window = RECT::default();
                     GetWindowRect(hwnd, &mut window);
