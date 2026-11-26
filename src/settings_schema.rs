@@ -212,6 +212,24 @@ fn describe(section: &str, key: &str) -> (&'static str, &'static str, &'static s
         };
     }
     match (section, key) {
+        ("topmost_marker", "enabled") => (
+            "Show always-on-top marker",
+            "显示置顶标识",
+            "Yellow square with the configured always-on-top shortcut letter.",
+            "黄底黑字方框，显示当前设置的置顶快捷键字母。",
+        ),
+        ("topmost_marker", "size") => (
+            "Marker size",
+            "标识大小",
+            "16, 20, 24 or 32 pixels; default 20.",
+            "16、20、24 或 32 像素，默认 20。",
+        ),
+        ("topmost_marker", "position") => (
+            "Marker position",
+            "标识位置",
+            "Top left, bottom left or bottom right inside the window.",
+            "窗口内侧的左上、左下或右下角，默认左上。",
+        ),
         ("shortcuts", "center_enabled") => (
             "Enable window centering",
             "启用窗口居中",
@@ -451,7 +469,7 @@ pub fn fields(tab: usize, axis: usize, cfg: &Config, doc: &DocumentMut) -> Vec<F
     });
     let mut fields = Vec::new();
     let sections: &[&str] = match tab {
-        0 => &["general"],
+        0 => &["general", "topmost_marker"],
         1 => &["tip"],
         2 => &["presets", "regions"],
         3 => &["outline"],
@@ -542,6 +560,8 @@ pub fn fields(tab: usize, axis: usize, cfg: &Config, doc: &DocumentMut) -> Vec<F
                 });
             } else {
                 let values: &[&str] = match (*section, key) {
+                    ("topmost_marker", "size") => &["16", "20", "24", "32"],
+                    ("topmost_marker", "position") => &["top-left", "bottom-left", "bottom-right"],
                     ("general", "language") => &["auto", "zh-CN", "en"],
                     ("shortcuts", "alt") => &["left", "right", "both"],
                     ("shortcuts", "gesture") => &["left", "right", "both", "off"],
@@ -561,7 +581,7 @@ pub fn fields(tab: usize, axis: usize, cfg: &Config, doc: &DocumentMut) -> Vec<F
                         ("shortcuts", "alt" | "gesture") => ChoiceContext::AltSide,
                         ("shortcuts", _) => ChoiceContext::MouseButton,
                         ("tip", "show") => ChoiceContext::TipContent,
-                        ("keycast", "position") => ChoiceContext::Position,
+                        ("keycast" | "topmost_marker", "position") => ChoiceContext::Position,
                         _ => ChoiceContext::Theme,
                     };
                     kind = choices(cfg, context, values);

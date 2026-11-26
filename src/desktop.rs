@@ -335,6 +335,7 @@ fn eligible(hwnd: HWND) -> bool {
                 | "Shell_SecondaryTrayWnd"
                 | "NotifyIconOverflowWindow"
                 | "WinSizeP.Overlay"
+                | "WinSizeP.TopmostMarker"
         )
     }
 }
@@ -816,6 +817,7 @@ pub fn apply(
     }
     if let Some(mode) = req.top {
         set_topmost(hwnd, mode)?;
+        crate::topmost_marker::record(hwnd, topmost(hwnd)?)?;
     }
     if let (Some(mode), Some(id)) = (req.ignore, id) {
         if id.name.is_empty() {

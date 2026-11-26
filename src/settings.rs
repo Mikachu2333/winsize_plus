@@ -1545,6 +1545,11 @@ impl Editor {
                     value(n)
                 }
                 Kind::Text => value(caption(row.c(0))),
+                Kind::Choice(_) if self.doc[section][key].is_integer() => value(
+                    Self::selected_value(row, 0)
+                        .parse::<i64>()
+                        .map_err(|error| error.to_string())?,
+                ),
                 Kind::Font | Kind::Choice(_) => value(Self::selected_value(row, 0)),
                 Kind::Color(format) => {
                     let channels: Vec<u8> = (3..3 + format.count())
@@ -1727,6 +1732,16 @@ impl Editor {
         let gestures = choice("shortcuts", "gesture", "left") != "off";
         for (section, key, active) in [
             (
+                "topmost_marker",
+                "size",
+                checked("topmost_marker", "enabled"),
+            ),
+            (
+                "topmost_marker",
+                "position",
+                checked("topmost_marker", "enabled"),
+            ),
+            (
                 "shortcuts",
                 "move_button",
                 gestures && checked("shortcuts", "move_enabled"),
@@ -1818,9 +1833,16 @@ impl Editor {
                     }
                 }
                 Kind::Choice(_) | Kind::Font => {
-                    if let Some(v) = item.and_then(Item::as_str)
-                        && let Some(i) =
-                            row.options.iter().position(|o| o.0.eq_ignore_ascii_case(v))
+                    let selected = item.and_then(|item| {
+                        item.as_str()
+                            .map(str::to_owned)
+                            .or_else(|| item.as_integer().map(|number| number.to_string()))
+                    });
+                    if let Some(v) = selected
+                        && let Some(i) = row
+                            .options
+                            .iter()
+                            .position(|o| o.0.eq_ignore_ascii_case(&v))
                     {
                         send(row.c(0), CB_SETCURSEL, i, 0);
                     }
@@ -3445,6 +3467,75 @@ fn message_loop(hwnd: HWND, timer: HANDLE) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "uses hidden settings controls and an isolated configuration file"]
+    fn topmost_marker_choices_save_as_numbers_and_follow_the_enable_switch() {
+        let mut editor = test_editor(0, "settings-topmost-marker-test");
+        let row = |editor: &Editor, key: &str| {
+            editor
+                .rows
+                .iter()
+                .position(|row| row.field.section == "topmost_marker" && row.field.key == key)
+                .unwrap()
+        };
+        let size = row(&editor, "size");
+        let position = row(&editor, "position");
+        let enabled = row(&editor, "enabled");
+        assert_eq!(
+            editor.rows[size]
+                .options
+                .iter()
+                .map(|option| option.0.as_str())
+                .collect::<Vec<_>>(),
+            ["16", "20", "24", "32"]
+        );
+        assert_eq!(
+            editor.rows[position]
+                .options
+                .iter()
+                .map(|option| option.0.as_str())
+                .collect::<Vec<_>>(),
+            ["top-left", "bottom-left", "bottom-right"]
+        );
+        assert_eq!(Editor::selected_value(&editor.rows[size], 0), "20");
+        assert_eq!(
+            Editor::selected_value(&editor.rows[position], 0),
+            "top-left"
+        );
+        for (index, choice) in [(size, 3), (position, 2)] {
+            let control = editor.rows[index].c(0);
+            send(control, CB_SETCURSEL, choice, 0);
+            editor
+                .command(BASE + index as i32 * STRIDE, CBN_SELCHANGE, control)
+                .unwrap();
+        }
+        editor.save().unwrap();
+        assert_eq!(editor.doc["topmost_marker"]["size"].as_integer(), Some(32));
+        assert_eq!(editor.cfg.topmost_marker.size, 32);
+        assert_eq!(editor.cfg.topmost_marker.position, "bottom-right");
+        for active in [false, true] {
+            let control = editor.rows[enabled].c(0);
+            send(control, BM_SETCHECK, usize::from(active), 0);
+            editor
+                .command(BASE + enabled as i32 * STRIDE, BN_CLICKED, control)
+                .unwrap();
+            assert_eq!(
+                unsafe { IsWindowEnabled(editor.rows[size].c(0)) != 0 },
+                active
+            );
+            assert_eq!(
+                unsafe { IsWindowEnabled(editor.rows[position].c(0)) != 0 },
+                active
+            );
+            editor.save().unwrap();
+            assert_eq!(editor.cfg.topmost_marker.enabled, active);
+            assert_eq!(editor.cfg.topmost_marker.size, 32);
+        }
+        editor.doc["topmost_marker"]["size"] = value(16);
+        editor.update_values();
+        assert_eq!(Editor::selected_value(&editor.rows[size], 0), "16");
+    }
+
     #[test]
     #[ignore = "uses hidden settings controls and an isolated configuration file"]
     fn administrator_confirmation_only_applies_to_user_enablement() {

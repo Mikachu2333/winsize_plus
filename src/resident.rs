@@ -42,6 +42,7 @@ fn later(ms: u32) -> Instant {
 }
 struct App {
     marker: crate::target_marker::TargetMarker,
+    topmost: crate::topmost_marker::Markers,
     paused: bool,
     cast: crate::cast::Visuals,
     mousecast: bool,
@@ -190,6 +191,7 @@ impl App {
         input::set_casting(self.mousecast, self.keycast)?;
         self.frames.reset(cfg.fps);
         self.overlay.guides(self.overlay.mode(), &cfg)?;
+        self.topmost.configure(&cfg)?;
         self.cfg = cfg;
         self.close_preview()?;
         self.snapshot = Some(snapshot);
@@ -485,6 +487,7 @@ impl App {
                     self.close_preview()?;
                 }
                 let cast = &mut self.cast;
+                let topmost = &mut self.topmost;
                 let hide = &mut self.hide;
                 let overlay = &self.overlay;
                 let cfg = &self.cfg;
@@ -521,6 +524,7 @@ impl App {
                         let _ = cast.follow_mouse(point, cfg);
                     }
                     let _ = cast.tick(cfg);
+                    let _ = topmost.poll();
                 })? {
                     self.act(action)?;
                 }
@@ -670,6 +674,7 @@ impl App {
         self.overlay.follow(point, &self.cfg)
     }
     fn deadlines(&mut self) -> Result<(), String> {
+        self.topmost.poll()?;
         let now = Instant::now();
         if self.cast.deadline().is_some_and(|when| now >= when) {
             self.cast.tick(&self.cfg)?;
@@ -785,6 +790,7 @@ pub fn run(
         input::set_casting(cfg.mousecast.enabled, cfg.keycast.enabled)?;
         let mut app = App {
             marker: crate::target_marker::TargetMarker::default(),
+            topmost: crate::topmost_marker::Markers::new(&cfg)?,
             paused: false,
             cast: crate::cast::Visuals::new(),
             mousecast: cfg.mousecast.enabled,
@@ -952,6 +958,7 @@ mod tests {
         let cfg = crate::test_support::cfg();
         App {
             marker: crate::target_marker::TargetMarker::default(),
+            topmost: crate::topmost_marker::Markers::default(),
             paused: false,
             cast: crate::cast::Visuals::new(),
             mousecast: false,
@@ -1077,6 +1084,7 @@ mod tests {
         let _hooks = input::Hooks::start(&cfg).unwrap();
         let mut app = App {
             marker: crate::target_marker::TargetMarker::default(),
+            topmost: crate::topmost_marker::Markers::default(),
             paused: false,
             cast: crate::cast::Visuals::new(),
             mousecast: false,
@@ -1146,6 +1154,7 @@ mod tests {
         let _hooks = input::Hooks::start(&cfg).unwrap();
         let mut app = App {
             marker: crate::target_marker::TargetMarker::default(),
+            topmost: crate::topmost_marker::Markers::default(),
             paused: false,
             cast: crate::cast::Visuals::new(),
             mousecast: false,
@@ -1232,6 +1241,7 @@ mod tests {
         let overlay = Overlay::new().unwrap();
         let mut app = App {
             marker: crate::target_marker::TargetMarker::default(),
+            topmost: crate::topmost_marker::Markers::default(),
             paused: false,
             cast: crate::cast::Visuals::new(),
             mousecast: false,
@@ -1503,6 +1513,7 @@ mod tests {
         let _hooks = input::Hooks::start(&cfg).unwrap();
         let mut app = App {
             marker: crate::target_marker::TargetMarker::default(),
+            topmost: crate::topmost_marker::Markers::default(),
             paused: false,
             cast: crate::cast::Visuals::new(),
             mousecast: false,

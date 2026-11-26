@@ -66,6 +66,7 @@ pub struct MouseStyle {
 }
 #[derive(PartialEq)]
 pub struct Config {
+    pub topmost_marker: TopmostStyle,
     pub mousecast: MouseStyle,
     pub keycast: CastStyle,
     pub zh: bool,
@@ -109,6 +110,12 @@ pub struct Config {
     pub commands: HashMap<String, String>,
     pub grid: HashMap<u32, String>,
     pub exclusions: Vec<Identity>,
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TopmostStyle {
+    pub enabled: bool,
+    pub size: i32,
+    pub position: String,
 }
 pub fn vk(text: &str) -> Option<u32> {
     let text = text.trim().to_ascii_lowercase();
@@ -869,6 +876,19 @@ impl Config {
             return Err("shortcuts.center_button: right click is reserved for the grid / 右键点击已用于九宫格".into());
         }
         Ok(Self {
+            topmost_marker: TopmostStyle {
+                enabled: boolean("topmost_marker", "enabled")?,
+                size: number("topmost_marker", "size", 16, 32)?
+                    .try_into()
+                    .ok()
+                    .filter(|size| [16, 20, 24, 32].contains(size))
+                    .ok_or("topmost_marker.size: choose 16, 20, 24 or 32")?,
+                position: choice(
+                    "topmost_marker",
+                    "position",
+                    &["top-left", "bottom-left", "bottom-right"],
+                )?,
+            },
             mousecast: MouseStyle {
                 enabled: boolean("mousecast", "enabled")?,
                 swap_side_buttons: boolean("mousecast", "swap_side_buttons")?,
@@ -1740,6 +1760,45 @@ fn load_snapshot_inner(path: &Path, edit: Option<(&Identity, Switch)>) -> Result
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn topmost_marker_defaults_preserve_old_configs_and_validate_choices() {
+        let mut doc = help().parse::<DocumentMut>().unwrap();
+        doc.as_table_mut().remove("topmost_marker");
+        let cfg = recover(&mut doc).unwrap();
+        assert!(cfg.topmost_marker.enabled);
+        assert_eq!(cfg.topmost_marker.size, 20);
+        assert_eq!(cfg.topmost_marker.position, "top-left");
+        assert!(cfg.warnings.is_empty());
+        for size in [16, 20, 24, 32] {
+            for position in ["top-left", "bottom-left", "bottom-right"] {
+                doc["topmost_marker"]["enabled"] = value(false);
+                doc["topmost_marker"]["size"] = value(size);
+                doc["topmost_marker"]["position"] = value(position);
+                let cfg = recover(&mut doc).unwrap();
+                assert!(!cfg.topmost_marker.enabled);
+                assert_eq!(cfg.topmost_marker.size, size as i32);
+                assert_eq!(cfg.topmost_marker.position, position);
+                assert!(cfg.warnings.is_empty());
+            }
+        }
+        doc["topmost_marker"]["size"] = value(21);
+        assert!(
+            Config::parse(&doc)
+                .err()
+                .unwrap()
+                .starts_with("topmost_marker.size")
+        );
+        let cfg = recover(&mut doc).unwrap();
+        assert_eq!(cfg.topmost_marker.size, 20);
+        assert!(!cfg.topmost_marker.enabled);
+        assert_eq!(cfg.warnings, ["topmost_marker.size"]);
+        doc["topmost_marker"]["position"] = value("top-right");
+        assert_eq!(
+            recover(&mut doc).unwrap().topmost_marker.position,
+            "top-left"
+        );
+    }
+
     #[test]
     fn replacement_keeps_intervening_and_still_open_edits_recoverable() {
         use std::os::windows::fs::OpenOptionsExt;

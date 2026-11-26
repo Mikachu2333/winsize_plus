@@ -25,6 +25,7 @@ mod settings_schema;
 mod settings_theme;
 mod settings_tooltip;
 mod target_marker;
+mod topmost_marker;
 mod tray;
 
 use std::{
