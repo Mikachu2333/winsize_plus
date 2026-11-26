@@ -1,7 +1,7 @@
 use crate::desktop::err;
 use windows::{
     Win32::System::{Com::*, TaskScheduler::*, Variant::VARIANT},
-    core::BSTR,
+    core::{BSTR, Interface},
 };
 use windows_sys::Win32::Security::Authentication::Identity::{GetUserNameExW, NameSamCompatible};
 
@@ -167,8 +167,30 @@ fn task_matches(
     actual: &ITaskDefinition,
     expected: &ITaskDefinition,
 ) -> windows::core::Result<bool> {
-    // Ignore registration metadata when comparing the in-memory task definitions.
+    // Normalize account names to SIDs and ignore registration metadata.
     unsafe {
+        let principal = actual.Principal()?;
+        let mut user = BSTR::new();
+        principal.UserId(&mut user)?;
+        let normalize = |user: &BSTR| -> windows::core::Result<BSTR> {
+            let text = user.to_string();
+            if text.is_empty() || text.starts_with("S-1-") {
+                return Ok(user.clone());
+            }
+            account_sid(&text).map(BSTR::from).map_err(|message| {
+                windows::core::Error::new(windows::core::HRESULT(0x80004005u32 as i32), message)
+            })
+        };
+        principal.SetUserId(&normalize(&user)?)?;
+        let triggers = actual.Triggers()?;
+        let mut count = 0;
+        triggers.Count(&mut count)?;
+        for index in 1..=count {
+            if let Ok(logon) = triggers.get_Item(index)?.cast::<ILogonTrigger>() {
+                logon.UserId(&mut user)?;
+                logon.SetUserId(&normalize(&user)?)?;
+            }
+        }
         actual.SetRegistrationInfo(&expected.RegistrationInfo()?)?;
         let mut actual_xml = BSTR::new();
         let mut expected_xml = BSTR::new();
@@ -260,6 +282,17 @@ mod tests {
             for (text, matches) in [
                 (xml.clone(), true),
                 (
+                    xml.replacen(
+                        &format!(
+                            "<UserId>{}</UserId>",
+                            account_sid(&account().unwrap()).unwrap()
+                        ),
+                        &format!("<UserId>{}</UserId>", super::xml(&account().unwrap())),
+                        1,
+                    ),
+                    true,
+                ),
+                (
                     xml.replace(
                         "<Triggers>",
                         "<RegistrationInfo><URI>\\WinSizeP.Test</URI></RegistrationInfo><Triggers>",
@@ -296,7 +329,12 @@ mod tests {
             }
         }
         let _cleanup = Cleanup(name.clone());
-        let xml = temporary_definition(crate::security::elevated());
+        let xml = definition(
+            &account_sid(&account().unwrap()).unwrap(),
+            crate::security::elevated(),
+        )
+        .unwrap()
+        .replace("<Settings>", "<Settings><Enabled>false</Enabled>");
         sync_task(name.clone(), Some(xml.clone())).unwrap();
         unsafe {
             CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().unwrap();
