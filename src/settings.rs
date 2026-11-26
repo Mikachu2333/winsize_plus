@@ -605,8 +605,8 @@ impl Editor {
     fn refresh_search_index(&mut self) -> Result<(), String> {
         if self.search.stale {
             let draft = self.collect().unwrap_or_else(|_| self.doc.clone());
-            self.search.index = crate::settings_search::Index::build(&draft, &self.families)
-                .or_else(|_| crate::settings_search::Index::build(&self.doc, &self.families))?;
+            self.search.index = crate::settings_search::Index::build(&draft)
+                .or_else(|_| crate::settings_search::Index::build(&self.doc))?;
             self.search.stale = false;
         }
         Ok(())
@@ -3179,6 +3179,26 @@ fn size_dropdown(root: HWND, combo: HWND, position: &mut WINDOWPOS) {
         position.flags &= !(SWP_NOSIZE | SWP_NOMOVE);
     }
 }
+fn forward_search_wheel(root: HWND, wp: WPARAM, lp: LPARAM) -> bool {
+    // SAFETY: the UI thread owns the list; Windows supplies signed screen coordinates.
+    unsafe {
+        let list = GetDlgItem(root, SEARCH_RESULTS);
+        let point = POINT {
+            x: lp as u16 as i16 as i32,
+            y: (lp >> 16) as u16 as i16 as i32,
+        };
+        let mut rect = RECT::default();
+        if !list.is_null()
+            && IsWindowVisible(list) != 0
+            && GetWindowRect(list, &mut rect) != 0
+            && PtInRect(&rect, point) != 0
+        {
+            SendMessageW(list, WM_MOUSEWHEEL, wp, lp);
+            return true;
+        }
+    }
+    false
+}
 unsafe extern "system" fn control_proc(
     hwnd: HWND,
     message: u32,
@@ -3364,6 +3384,9 @@ unsafe extern "system" fn control_proc(
             PostMessageW(root as HWND, HOVER, 0, 0);
         }
         if message == WM_MOUSEWHEEL {
+            if id == SEARCH_RESULTS {
+                return DefSubclassProc(hwnd, message, wp, lp);
+            }
             let owner = GetPropW(hwnd, w!("OwnerCombo"));
             let combo = if class.eq_ignore_ascii_case("combobox") {
                 hwnd
@@ -3387,6 +3410,9 @@ unsafe extern "system" fn control_proc(
                 );
                 return 0;
             }
+            if forward_search_wheel(root as HWND, wp, lp) {
+                return 0;
+            }
             PostMessageW(
                 root as HWND,
                 SCROLL,
@@ -3395,7 +3421,9 @@ unsafe extern "system" fn control_proc(
             );
             return 0;
         }
-        if (class == "ListBox" || class == "LISTBOX") && GetPropW(hwnd, w!("OwnerCombo")).is_null()
+        if id != SEARCH_RESULTS
+            && class.eq_ignore_ascii_case("listbox")
+            && GetPropW(hwnd, w!("OwnerCombo")).is_null()
         {
             if message == WM_LBUTTONDOWN {
                 let item = send(hwnd, LB_ITEMFROMPOINT, 0, lp);
@@ -3439,6 +3467,9 @@ unsafe extern "system" fn pane_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: LP
                 0
             }
             WM_MOUSEWHEEL => {
+                if forward_search_wheel(root, wp, lp) {
+                    return 0;
+                }
                 PostMessageW(
                     root,
                     SCROLL,
@@ -3485,6 +3516,7 @@ unsafe extern "system" fn pane_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: LP
 }
 unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match message {
+        WM_MOUSEWHEEL if forward_search_wheel(hwnd, wp, lp) => 0,
         #[cfg(test)]
         TEST_THEME => {
             crate::settings_theme::test_dark(match wp {
@@ -4268,6 +4300,47 @@ mod tests {
         }
         wait("准星");
         EDITOR.with_borrow(|slot| assert_eq!(slot.as_ref().unwrap().tab, 5));
+        assert!(send(list, LB_GETCOUNT, 0, 0) > 6);
+        let selection = send(list, LB_GETCURSEL, 0, 0);
+        let scroll = EDITOR.with_borrow(|slot| slot.as_ref().unwrap().scroll);
+        let top = send(list, LB_GETTOPINDEX, 0, 0);
+        send(list, WM_MOUSEWHEEL, (-120i16 as u16 as usize) << 16, 0);
+        crate::test_support::pump();
+        assert!(send(list, LB_GETTOPINDEX, 0, 0) > top);
+        assert_eq!(send(list, LB_GETCURSEL, 0, 0), selection);
+        assert_eq!(unsafe { GetFocus() }, edit);
+        EDITOR.with_borrow(|slot| {
+            let e = slot.as_ref().unwrap();
+            assert_eq!(e.tab, 5);
+            assert_eq!(e.scroll, scroll);
+            assert_eq!(e.original, original);
+            assert!(e.dirty.is_empty());
+        });
+        send(list, WM_MOUSEWHEEL, (120usize) << 16, 0);
+        assert_eq!(send(list, LB_GETTOPINDEX, 0, 0), top);
+        let mut list_rect = RECT::default();
+        unsafe {
+            GetWindowRect(list, &mut list_rect);
+        }
+        let point =
+            (((list_rect.top + 10) as u16 as usize) << 16) | (list_rect.left + 10) as u16 as usize;
+        send(
+            edit,
+            WM_MOUSEWHEEL,
+            (-120i16 as u16 as usize) << 16,
+            point as isize,
+        );
+        crate::test_support::pump();
+        assert!(send(list, LB_GETTOPINDEX, 0, 0) > top);
+        assert_eq!(send(list, LB_GETCURSEL, 0, 0), selection);
+        assert_eq!(unsafe { GetFocus() }, edit);
+        EDITOR.with_borrow(|slot| assert_eq!(slot.as_ref().unwrap().scroll, scroll));
+        send(hwnd, WM_MOUSEWHEEL, (120usize) << 16, point as isize);
+        assert_eq!(send(list, LB_GETTOPINDEX, 0, 0), top);
+        send(list, WM_LBUTTONDOWN, 1, (10 << 16) | 10);
+        assert!(unsafe { GetPropW(list, w!("DragIndex")) }.is_null());
+        send(list, WM_LBUTTONUP, 0, (10 << 16) | 10);
+        crate::test_support::pump();
         set_text(edit, "不存在的设置关键词");
         wait("不存在的设置关键词");
         EDITOR.with_borrow(|slot| {
@@ -4275,6 +4348,14 @@ mod tests {
             assert!(e.search.matches.is_empty());
             assert_eq!(e.original, original);
         });
+        send(
+            edit,
+            WM_MOUSEWHEEL,
+            (-120i16 as u16 as usize) << 16,
+            point as isize,
+        );
+        crate::test_support::pump();
+        assert_eq!(send(list, LB_GETTOPINDEX, 0, 0), 0);
         with_editor(|e| {
             e.close_search(true)?;
             e.switch_page(0, 0)?;
@@ -4288,8 +4369,8 @@ mod tests {
             e.command(BASE + at as i32 * STRIDE, BN_CLICKED, control)?;
             e.save()
         });
-        set_text(edit, "32");
-        wait("32");
+        set_text(edit, "20");
+        wait("20");
         unsafe {
             SendMessageW(edit, WM_KEYDOWN, 13, 0);
         }

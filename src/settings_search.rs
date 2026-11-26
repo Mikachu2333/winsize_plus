@@ -53,7 +53,7 @@ pub struct Index {
     pub entries: Vec<Entry>,
 }
 impl Index {
-    pub fn build(doc: &DocumentMut, families: &[String]) -> Result<Self, String> {
+    pub fn build(doc: &DocumentMut) -> Result<Self, String> {
         let mut cfg = Config::parse(doc)?;
         let display_zh = cfg.zh;
         let mut result = Self::default();
@@ -114,7 +114,7 @@ impl Index {
                             });
                             result.entries.len() - 1
                         });
-                        result.entries[at].add(&field, tab, &cfg, doc, families);
+                        result.entries[at].add(&field, tab, &cfg, doc);
                     }
                 }
             }
@@ -184,14 +184,7 @@ impl Index {
     }
 }
 impl Entry {
-    fn add(
-        &mut self,
-        field: &Field,
-        tab: usize,
-        cfg: &Config,
-        doc: &DocumentMut,
-        families: &[String],
-    ) {
+    fn add(&mut self, field: &Field, tab: usize, cfg: &Config, doc: &DocumentMut) {
         self.term(if field.section == "keys" { 120 } else { 100 }, &field.key);
         self.term(100, &field.label);
         self.term(30, &field.hint);
@@ -239,27 +232,36 @@ impl Entry {
         }
         match &field.kind {
             Kind::Choice(options) => {
-                for (value, label) in options {
-                    self.term(70, value);
-                    self.term(70, label);
+                let current = doc
+                    .get(&field.section)
+                    .and_then(|table| table.get(&field.key))
+                    .and_then(|item| {
+                        item.as_str()
+                            .map(str::to_owned)
+                            .or_else(|| item.as_integer().map(|value| value.to_string()))
+                    });
+                // Search only the selected choice and its translated label.
+                if let Some((_, label)) = options.iter().find(|(value, _)| {
+                    current
+                        .as_ref()
+                        .is_some_and(|current| value.eq_ignore_ascii_case(current))
+                }) {
+                    self.term(85, label);
                 }
             }
-            Kind::Font | Kind::Fallbacks => {
-                for family in families {
-                    self.term(30, family);
+            Kind::Font => {
+                if let Some(current) = doc
+                    .get(&field.section)
+                    .and_then(|table| table.get(&field.key))
+                    .and_then(|item| item.as_str())
+                {
+                    self.term(
+                        85,
+                        schema::option(cfg, schema::ChoiceContext::Font, current),
+                    );
                 }
             }
             Kind::Mapping if field.section == "presets" => self.region(110, &field.key, cfg),
-            Kind::Mapping => {
-                for (value, label) in schema::actions(cfg, field.section == "grid") {
-                    self.term(30, &value);
-                    self.term(30, label);
-                    self.region(30, &value, cfg);
-                    for alias in action_aliases(&cfg.action(&value)) {
-                        self.term(30, alias);
-                    }
-                }
-            }
             Kind::Color(schema::ColorChannels::Rgba) => {
                 for alias in aliases(tab, &field.section, "opacity") {
                     self.term(75, alias);
@@ -546,7 +548,7 @@ mod tests {
                 );
             }
         }
-        let index = Index::build(&doc, &[]).unwrap();
+        let index = Index::build(&doc).unwrap();
         for (query, tab, section, key) in [
             ("间隔", 5, "horizontal", "gap"),
             ("间断", 5, "horizontal", "gap"),
@@ -580,17 +582,17 @@ mod tests {
         index.find(query).iter().any(|&i| matches!(&index.entries[i].target, Target::Field { tab: t, section: s, key: k, .. } if *t == tab && s == section && k == key))
     }
     #[test]
-    fn search_matches_labels_hints_choices_bindings_and_hidden_aliases() {
+    fn search_matches_labels_hints_current_values_bindings_and_hidden_aliases() {
         let doc = config::help().parse::<DocumentMut>().unwrap();
-        let index = Index::build(&doc, &["A Test Font".into()]).unwrap();
+        let index = Index::build(&doc).unwrap();
         for (query, tab, section, key) in [
             ("准星", 5, "horizontal", "width"),
             ("TIME_FORMAT", 1, "tip", "time_format"),
             ("{display_name}", 1, "tip", "window_format"),
-            ("右下", 0, "topmost_marker", "position"),
-            ("32", 0, "topmost_marker", "size"),
+            ("左上", 0, "topmost_marker", "position"),
+            ("20", 0, "topmost_marker", "size"),
             ("crshair", 5, "horizontal", "color"),
-            ("A Test Font", 1, "tip", "font"),
+            ("系统默认 UI 字体", 1, "tip", "font"),
         ] {
             assert!(matches(&index, query, tab, section, key), "{query}");
         }
@@ -606,12 +608,62 @@ mod tests {
         assert!(index.find("不存在的设置关键词").is_empty());
     }
     #[test]
+    fn unselected_candidates_do_not_match_and_value_changes_update_the_index() {
+        let mut doc = config::help().parse::<DocumentMut>().unwrap();
+        let index = Index::build(&doc).unwrap();
+        assert_eq!(doc["grid"]["6"].as_str(), Some("FullRight"));
+        for query in ["left", "LEFT", "LeftTop", "Q"] {
+            assert!(!matches(&index, query, 6, "grid", "6"), "{query}");
+        }
+        for key in ["1", "4", "7"] {
+            assert!(matches(&index, "left", 6, "grid", key), "{key}");
+        }
+        assert!(matches(&index, "FullRight", 6, "grid", "6"));
+        assert!(!matches(
+            &index,
+            "bottom-right",
+            0,
+            "topmost_marker",
+            "position"
+        ));
+        assert!(!matches(&index, "A Test Font", 1, "tip", "font"));
+        assert!(!matches(&index, "退出", 4, "keys", "Q"));
+
+        doc["grid"]["6"] = toml_edit::value("LeftTop");
+        doc["topmost_marker"]["position"] = toml_edit::value("bottom-right");
+        doc["topmost_marker"]["size"] = toml_edit::value(32);
+        doc["tip"]["font"] = toml_edit::value("A Test Font");
+        doc["tip"]["font_fallbacks"] = toml_edit::value(toml_edit::Array::from_iter([
+            "Another Font",
+            "Fallback Font",
+        ]));
+        doc["keys"]["Q"] = toml_edit::value("quit");
+        doc["keys"]["T"] = toml_edit::value("LeftTop");
+        let index = Index::build(&doc).unwrap();
+        assert!(matches(&index, "left", 6, "grid", "6"));
+        assert!(matches(&index, "T", 6, "grid", "6"));
+        assert!(!matches(&index, "Q", 6, "grid", "6"));
+        assert!(!matches(&index, "FullRight", 6, "grid", "6"));
+        assert!(matches(&index, "右下", 0, "topmost_marker", "position"));
+        assert!(!matches(
+            &index,
+            "top-left",
+            0,
+            "topmost_marker",
+            "position"
+        ));
+        assert!(matches(&index, "32", 0, "topmost_marker", "size"));
+        assert!(matches(&index, "A Test Font", 1, "tip", "font"));
+        assert!(matches(&index, "Fallback Font", 1, "tip", "font_fallbacks"));
+        assert!(matches(&index, "退出", 4, "keys", "Q"));
+    }
+    #[test]
     fn index_tracks_custom_regions_bindings_and_both_crosshair_axes() {
         let mut doc = config::help().parse::<DocumentMut>().unwrap();
         doc["presets"]["My Region"] = toml_edit::value("0|0|30sw|30sh");
         doc["keys"]["T"] = toml_edit::value("My Region");
         doc["crosshair"]["mode"] = toml_edit::value("custom");
-        let index = Index::build(&doc, &[]).unwrap();
+        let index = Index::build(&doc).unwrap();
         assert!(matches(&index, "T", 2, "presets", "My Region"));
         assert!(matches(&index, "准星", 5, "vertical", "color"));
         assert_eq!(index.entries.iter().filter(|entry| matches!(&entry.target, Target::Field { section, key, .. } if section == "crosshair" && key == "fps")).count(), 1);
