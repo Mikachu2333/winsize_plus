@@ -1174,8 +1174,9 @@ impl Editor {
         let mut y = padding;
         for row in &self.rows {
             if !row.c(11).is_null() {
+                y += self.s(2);
                 place(row.c(11), padding, y - self.scroll[1], width, 1);
-                y += self.s(12);
+                y += self.s(14);
             }
             let hint = if row.field.hint.is_empty() {
                 0
