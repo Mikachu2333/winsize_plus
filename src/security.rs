@@ -124,100 +124,6 @@ pub fn raise_was_declined() -> bool {
     RAISE_DECLINED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Whether a process without administrator rights could replace `exe` or plant files
-/// beside it. Such a program must not be started elevated without a prompt.
-pub fn replaceable_without_elevation(exe: &std::path::Path) -> Result<bool, String> {
-    crate::config_access::run(|| replaceable_as_current_user(exe))?
-}
-fn replaceable_as_current_user(exe: &std::path::Path) -> Result<bool, String> {
-    use std::os::windows::fs::MetadataExt;
-    use windows_sys::Win32::Storage::FileSystem::*;
-    // Reparse points can redirect a protected-looking path to another directory.
-    // Elevated startup requires a fixed path whose complete ancestry can be checked.
-    for path in exe.ancestors() {
-        if std::fs::symlink_metadata(path)
-            .map_err(|e| e.to_string())?
-            .file_attributes()
-            & FILE_ATTRIBUTE_REPARSE_POINT
-            != 0
-        {
-            return Ok(true);
-        }
-    }
-    struct Token(HANDLE);
-    impl Drop for Token {
-        fn drop(&mut self) {
-            unsafe {
-                CloseHandle(self.0);
-            }
-        }
-    }
-    // SAFETY: every buffer outlives its synchronous call; handles and the descriptor
-    // are released by the guards above.
-    unsafe {
-        let mut impersonation = null_mut();
-        if OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut impersonation) == 0 {
-            return Err(err());
-        }
-        let token = Token(impersonation);
-        let granted = |path: &std::path::Path| -> Result<u32, String> {
-            let mut descriptor = null_mut();
-            let status = GetNamedSecurityInfoW(
-                wide(path).as_ptr(),
-                SE_FILE_OBJECT,
-                OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-                null_mut(),
-                null_mut(),
-                null_mut(),
-                null_mut(),
-                &mut descriptor,
-            );
-            if status != 0 {
-                return Err(format!("{}: {status}", path.display()));
-            }
-            let _descriptor = LocalMemory(descriptor);
-            let mapping = GENERIC_MAPPING {
-                GenericRead: FILE_GENERIC_READ,
-                GenericWrite: FILE_GENERIC_WRITE,
-                GenericExecute: FILE_GENERIC_EXECUTE,
-                GenericAll: FILE_ALL_ACCESS,
-            };
-            let mut privileges = [0u32; 16];
-            let mut length = size_of_val(&privileges) as u32;
-            let mut access = 0;
-            let mut allowed = 0;
-            const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
-            if AccessCheck(
-                descriptor,
-                token.0,
-                MAXIMUM_ALLOWED,
-                &mapping,
-                privileges.as_mut_ptr().cast(),
-                &mut length,
-                &mut access,
-                &mut allowed,
-            ) == 0
-            {
-                return Err(err());
-            }
-            Ok(if allowed != 0 { access } else { 0 })
-        };
-        let control = WRITE_DAC | WRITE_OWNER;
-        let folder = exe.parent().ok_or("Executable folder")?;
-        if granted(exe)? & (FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE | control) != 0
-            || granted(folder)? & (FILE_ADD_FILE | FILE_DELETE_CHILD | control) != 0
-        {
-            return Ok(true);
-        }
-        // A protected immediate directory can still be renamed through a writable ancestor.
-        for ancestor in folder.ancestors() {
-            if granted(ancestor)? & (DELETE | FILE_DELETE_CHILD | control) != 0 {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-}
 pub fn can_control_window(hwnd: windows_sys::Win32::Foundation::HWND) -> bool {
     thread_local! {static CURRENT:std::cell::Cell<Option<u32>>=const {std::cell::Cell::new(None)};}
     let current = CURRENT.with(|cached| {
@@ -350,15 +256,6 @@ fn user_object(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn only_folders_writable_without_elevation_are_reported() {
-        // Cargo's target folder belongs to the user; System32 does not.
-        assert!(replaceable_without_elevation(&std::env::current_exe().unwrap()).unwrap());
-        let system = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
-            .join("System32")
-            .join("kernel32.dll");
-        assert!(!replaceable_without_elevation(&system).unwrap());
-    }
     #[test]
     fn configuration_mutex_can_be_reopened_with_only_required_rights() {
         let first = config_mutex().unwrap();

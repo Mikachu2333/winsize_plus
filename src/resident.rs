@@ -207,8 +207,6 @@ impl App {
                     "配置已应用，但无法更新配置文件"
                 )
             ))
-        } else if sync_task && let Some(warning) = crate::logon::elevation_warning(&self.cfg) {
-            self.notice(&warning)
         } else {
             self.config_notice()
         }

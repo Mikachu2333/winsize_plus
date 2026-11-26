@@ -1684,10 +1684,7 @@ impl Editor {
         }
         self.dirty.clear();
         self.save_error.set(false);
-        match crate::logon::elevation_warning(&self.cfg) {
-            Some(warning) => self.saved_status(&warning, true),
-            None => self.saved_status(self.cfg.tr("Saved", "已保存"), false),
-        }
+        self.saved_status(self.cfg.tr("Saved", "已保存"), false);
         self.invalidate_pages();
         if rebuild || self.rows_changed() {
             self.rebuild()?;
@@ -2538,6 +2535,36 @@ fn with_editor(action: impl FnOnce(&mut Editor) -> Result<(), String>) {
         }
     });
 }
+fn settings_command(id: i32, event: u32, sender: HWND, confirm: impl FnOnce(HWND, &str) -> bool) {
+    let mut question = None;
+    with_editor(|editor| {
+        if event == BN_CLICKED
+            && id >= BASE
+            && (id - BASE) % STRIDE == 0
+            && let Some(row) = editor.rows.get(((id - BASE) / STRIDE) as usize)
+            && row.c(0) == sender
+            && row.field.section == "general"
+            && row.field.key == "elevate"
+            && editor.doc["general"]["elevate"].as_bool() == Some(false)
+            && send(sender, BM_GETCHECK, 0, 0) == 1
+        {
+            send(sender, BM_SETCHECK, 0, 0);
+            question = Some((editor.window.0, editor.cfg.tr(
+                "Run WinSizeP as administrator? If ordinary users can modify the program folder, they can replace the program or its dependencies and run code as administrator, including at sign-in when autostart is enabled. Enable administrator mode and accept this risk?",
+                "是否以管理员身份运行 WinSizeP？若普通用户可修改程序目录，程序或依赖文件被替换后将以管理员权限执行；启用自启动时，登录后也会自动提权运行。是否启用管理员模式并接受此风险？",
+            ).to_owned()));
+        }
+        Ok(())
+    });
+    if let Some((owner, text)) = question {
+        // Keep the editor unborrowed and the switch off while the modal dialog runs.
+        if !confirm(owner, &text) {
+            return;
+        }
+        send(sender, BM_SETCHECK, 1, 0);
+    }
+    with_editor(|editor| editor.command(id, event, sender));
+}
 fn size_dropdown(root: HWND, combo: HWND, position: &mut WINDOWPOS) {
     // SAFETY: all handles belong to this UI thread; WINDOWPOS is live for the callback.
     unsafe {
@@ -2942,7 +2969,22 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
                 }
                 return 0;
             }
-            with_editor(|e| e.command((wp & 0xffff) as i32, (wp >> 16) as u32, lp as HWND));
+            settings_command(
+                (wp & 0xffff) as i32,
+                (wp >> 16) as u32,
+                lp as HWND,
+                |owner, text| {
+                    // SAFETY: the owner and UTF-16 text remain valid during MessageBoxW.
+                    unsafe {
+                        MessageBoxW(
+                            owner,
+                            wide(text).as_ptr(),
+                            w!("WinSizeP"),
+                            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
+                        ) == IDYES
+                    }
+                },
+            );
             0
         }
         HOVER => {
@@ -3403,6 +3445,60 @@ fn message_loop(hwnd: HWND, timer: HANDLE) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "uses hidden settings controls and an isolated configuration file"]
+    fn administrator_confirmation_only_applies_to_user_enablement() {
+        let editor = test_editor(0, "settings-elevation-confirm-test");
+        let index = editor
+            .rows
+            .iter()
+            .position(|row| row.field.section == "general" && row.field.key == "elevate")
+            .unwrap();
+        let control = editor.rows[index].c(0);
+        let id = BASE + index as i32 * STRIDE;
+        EDITOR.with_borrow_mut(|slot| *slot = Some(editor));
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                EDITOR.with_borrow_mut(|slot| {
+                    slot.take();
+                });
+            }
+        }
+        let _reset = Reset;
+        send(control, BM_SETCHECK, 1, 0);
+        settings_command(id, BN_CLICKED, control, |_, text| {
+            assert!(text.contains("管理员") || text.contains("administrator"));
+            assert_eq!(send(control, BM_GETCHECK, 0, 0), 0);
+            EDITOR.with_borrow_mut(|slot| {
+                let editor = slot.as_mut().unwrap();
+                editor.save().unwrap();
+                assert!(!editor.cfg.elevate);
+            });
+            false
+        });
+        EDITOR.with_borrow(|slot| {
+            let editor = slot.as_ref().unwrap();
+            assert!(!editor.cfg.elevate);
+            assert!(editor.dirty.is_empty());
+            assert_eq!(editor.doc["general"]["elevate"].as_bool(), Some(false));
+        });
+        assert_eq!(send(control, BM_GETCHECK, 0, 0), 0);
+        send(control, BM_SETCHECK, 1, 0);
+        settings_command(id, BN_CLICKED, control, |_, _| true);
+        EDITOR.with_borrow_mut(|slot| {
+            let editor = slot.as_mut().unwrap();
+            assert!(editor.cfg.elevate);
+            editor.save().unwrap();
+            assert_eq!(editor.doc["general"]["elevate"].as_bool(), Some(true));
+        });
+        settings_command(id, BN_CLICKED, control, |_, _| panic!("Already enabled"));
+        send(control, BM_SETCHECK, 0, 0);
+        settings_command(id, BN_CLICKED, control, |_, _| panic!("Disabling"));
+        EDITOR.with_borrow_mut(|slot| slot.as_mut().unwrap().save().unwrap());
+        settings_command(id, EN_CHANGE, control, |_, _| panic!("Not a user toggle"));
+    }
+
     fn test_editor(tab: usize, name: &str) -> Editor {
         let cfg = crate::test_support::cfg();
         let original = config::help().to_owned();

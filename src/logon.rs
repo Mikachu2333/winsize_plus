@@ -20,6 +20,57 @@ fn account() -> Result<String, String> {
     Ok(String::from_utf16_lossy(&account[..size as usize]))
 }
 
+fn account_sid(owner: &str) -> Result<String, String> {
+    use windows_sys::Win32::{
+        Foundation::LocalFree,
+        Security::{Authorization::ConvertSidToStringSidW, *},
+    };
+    let owner = crate::desktop::wide(owner);
+    let mut sid_size = 0;
+    let mut domain_size = 0;
+    let mut kind = 0;
+    // SAFETY: SID storage is pointer-aligned and all buffers outlive the Win32 calls.
+    unsafe {
+        LookupAccountNameW(
+            std::ptr::null(),
+            owner.as_ptr(),
+            std::ptr::null_mut(),
+            &mut sid_size,
+            std::ptr::null_mut(),
+            &mut domain_size,
+            &mut kind,
+        );
+        if sid_size == 0 {
+            return Err(err());
+        }
+        let mut sid = vec![0usize; (sid_size as usize).div_ceil(size_of::<usize>())];
+        let mut domain = vec![0u16; domain_size as usize];
+        if LookupAccountNameW(
+            std::ptr::null(),
+            owner.as_ptr(),
+            sid.as_mut_ptr().cast(),
+            &mut sid_size,
+            domain.as_mut_ptr(),
+            &mut domain_size,
+            &mut kind,
+        ) == 0
+        {
+            return Err(err());
+        }
+        let mut text = std::ptr::null_mut();
+        if ConvertSidToStringSidW(sid.as_mut_ptr().cast(), &mut text) == 0 {
+            return Err(err());
+        }
+        let mut length = 0;
+        while *text.add(length) != 0 {
+            length += 1;
+        }
+        let result = String::from_utf16_lossy(std::slice::from_raw_parts(text, length));
+        LocalFree(text.cast());
+        Ok(result)
+    }
+}
+
 fn definition(account: &str, elevated: bool) -> Result<String, String> {
     let account = xml(account);
     let level = if elevated {
@@ -50,19 +101,18 @@ impl Drop for Apartment {
 }
 
 pub fn sync_direct(enabled: bool, elevated: bool, owner: &str) -> Result<(), windows::core::Error> {
-    if enabled && elevated {
-        validate_elevated_startup().map_err(|error| {
-            windows::core::Error::new(windows::core::HRESULT::from_win32(5), error)
-        })?;
-    }
     let name = BSTR::from(format!(
         "WinSizeP-{}",
         owner.replace('!', "!!").replace('\\', "!")
     ));
     let task = if enabled {
-        Some(definition(owner, elevated).map_err(|message| {
-            windows::core::Error::new(windows::core::HRESULT(0x80004005u32 as i32), message)
-        })?)
+        Some(
+            account_sid(owner)
+                .and_then(|sid| definition(&sid, elevated))
+                .map_err(|message| {
+                    windows::core::Error::new(windows::core::HRESULT(0x80004005u32 as i32), message)
+                })?,
+        )
     } else {
         None
     };
@@ -80,7 +130,14 @@ fn sync_task(name: BSTR, task: Option<String>) -> windows::core::Result<()> {
             service.Connect(&empty, &empty, &empty, &empty)?;
             let folder = service.GetFolder(&BSTR::from("\\"))?;
             if let Some(xml) = task {
-                folder.RegisterTask(
+                let expected = service.NewTask(0)?;
+                expected.SetXmlText(&BSTR::from(&xml))?;
+                if let Ok(existing) = folder.GetTask(&name)
+                    && task_matches(&existing.Definition()?, &expected)?
+                {
+                    return Ok(());
+                }
+                let registered = folder.RegisterTask(
                     &name,
                     &BSTR::from(xml),
                     TASK_CREATE_OR_UPDATE.0,
@@ -89,6 +146,12 @@ fn sync_task(name: BSTR, task: Option<String>) -> windows::core::Result<()> {
                     TASK_LOGON_INTERACTIVE_TOKEN,
                     &empty,
                 )?;
+                if !task_matches(&registered.Definition()?, &expected)? {
+                    return Err(windows::core::Error::new(
+                        windows::core::HRESULT(0x80004005u32 as i32),
+                        "Autostart task verification failed / 自启动任务校验失败",
+                    ));
+                }
             } else if let Err(error) = folder.DeleteTask(&name, 0)
                 && error.code() != windows::core::HRESULT::from_win32(2)
             {
@@ -100,20 +163,19 @@ fn sync_task(name: BSTR, task: Option<String>) -> windows::core::Result<()> {
     update()
 }
 
-fn validate_elevated_startup() -> Result<(), String> {
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    if crate::security::replaceable_without_elevation(&exe)? {
-        return Err("Administrator autostart requires a protected program folder. Move WinSizeP to a folder ordinary users cannot modify, or disable administrator autostart. / 管理员自启动要求程序位于普通用户无法修改的受保护目录；请移动程序或关闭管理员自启动。".into());
+fn task_matches(
+    actual: &ITaskDefinition,
+    expected: &ITaskDefinition,
+) -> windows::core::Result<bool> {
+    // Ignore registration metadata when comparing the in-memory task definitions.
+    unsafe {
+        actual.SetRegistrationInfo(&expected.RegistrationInfo()?)?;
+        let mut actual_xml = BSTR::new();
+        let mut expected_xml = BSTR::new();
+        actual.XmlText(&mut actual_xml)?;
+        expected.XmlText(&mut expected_xml)?;
+        Ok(actual_xml == expected_xml)
     }
-    Ok(())
-}
-
-/// Explain why an elevated startup request cannot be applied.
-pub fn elevation_warning(cfg: &crate::config::Config) -> Option<String> {
-    if !(cfg.autostart && cfg.elevate) {
-        return None;
-    }
-    validate_elevated_startup().err()
 }
 
 /// Run the task update in a child at this process's own level: (exit code, message).
@@ -152,19 +214,6 @@ fn update(enabled: bool, elevated: bool, owner: &str) -> Result<(Option<i32>, St
 }
 
 pub fn sync(enabled: bool, elevated: bool) -> Result<(), String> {
-    if enabled
-        && elevated
-        && let Err(error) = validate_elevated_startup()
-    {
-        // An older release may have already registered an unsafe task. Remove it
-        // before reporting the rejected request, including its administrator ACL.
-        return Err(match sync(false, false) {
-            Ok(()) => error,
-            Err(cleanup) => format!(
-                "{error}\nCould not remove the previous startup task / 无法移除旧自启动任务: {cleanup}"
-            ),
-        });
-    }
     let owner = account()?;
     let failed = |message: String| Err(format!("Autostart / 自动启动: {message}"));
     let helper = |enabled: bool, elevated: bool| {
@@ -199,13 +248,92 @@ pub fn sync(enabled: bool, elevated: bool) -> Result<(), String> {
 mod tests {
     use super::*;
     #[test]
-    fn writable_programs_are_rejected_before_task_registration() {
-        let error = sync_direct(true, true, "WinSizeP.Audit.UnsafePath").unwrap_err();
-        assert!(
-            error.message().contains("protected program folder"),
-            "{error}"
-        );
+    fn task_comparison_detects_startup_changes_and_ignores_registration_metadata() {
+        unsafe {
+            CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().unwrap();
+            let _apartment = Apartment;
+            let service: ITaskService =
+                CoCreateInstance(&TaskScheduler, None, CLSCTX_INPROC_SERVER).unwrap();
+            let xml = definition(&account_sid(&account().unwrap()).unwrap(), true).unwrap();
+            let expected = service.NewTask(0).unwrap();
+            expected.SetXmlText(&BSTR::from(&xml)).unwrap();
+            for (text, matches) in [
+                (xml.clone(), true),
+                (
+                    xml.replace(
+                        "<Triggers>",
+                        "<RegistrationInfo><URI>\\WinSizeP.Test</URI></RegistrationInfo><Triggers>",
+                    ),
+                    true,
+                ),
+                (xml.replace("HighestAvailable", "LeastPrivilege"), false),
+                (xml.replace("--resident", "--settings"), false),
+                (xml.replace("<Command>", "<Command>C:\\Other\\"), false),
+                (
+                    xml.replace("<Settings>", "<Settings><Enabled>false</Enabled>"),
+                    false,
+                ),
+                (
+                    xml.replace("<LogonTrigger>", "<LogonTrigger><Enabled>false</Enabled>"),
+                    false,
+                ),
+            ] {
+                let actual = service.NewTask(0).unwrap();
+                actual.SetXmlText(&BSTR::from(&text)).unwrap();
+                assert_eq!(task_matches(&actual, &expected).unwrap(), matches, "{text}");
+            }
+        }
     }
+
+    #[test]
+    #[ignore = "creates and removes one disabled temporary task"]
+    fn temporary_task_round_trip_matches_and_repairs() {
+        let name = BSTR::from(format!("WinSizeP.Test.Sync.{}", std::process::id()));
+        struct Cleanup(BSTR);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = sync_task(self.0.clone(), None);
+            }
+        }
+        let _cleanup = Cleanup(name.clone());
+        let xml = temporary_definition(crate::security::elevated());
+        sync_task(name.clone(), Some(xml.clone())).unwrap();
+        unsafe {
+            CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().unwrap();
+            let _apartment = Apartment;
+            let service: ITaskService =
+                CoCreateInstance(&TaskScheduler, None, CLSCTX_INPROC_SERVER).unwrap();
+            let empty = VARIANT::default();
+            service.Connect(&empty, &empty, &empty, &empty).unwrap();
+            let folder = service.GetFolder(&BSTR::from("\\")).unwrap();
+            let expected = service.NewTask(0).unwrap();
+            expected.SetXmlText(&BSTR::from(&xml)).unwrap();
+            let actual = folder.GetTask(&name).unwrap().Definition().unwrap();
+            let matches = task_matches(&actual, &expected).unwrap();
+            let mut actual_xml = BSTR::new();
+            let mut expected_xml = BSTR::new();
+            actual.XmlText(&mut actual_xml).unwrap();
+            expected.XmlText(&mut expected_xml).unwrap();
+            assert!(matches, "actual: {actual_xml}\nexpected: {expected_xml}");
+            sync_task(name.clone(), Some(xml.replace("--resident", "--settings"))).unwrap();
+            assert!(
+                !task_matches(
+                    &folder.GetTask(&name).unwrap().Definition().unwrap(),
+                    &expected
+                )
+                .unwrap()
+            );
+            sync_task(name.clone(), Some(xml)).unwrap();
+            assert!(
+                task_matches(
+                    &folder.GetTask(&name).unwrap().Definition().unwrap(),
+                    &expected
+                )
+                .unwrap()
+            );
+        }
+    }
+
     fn temporary_name() -> BSTR {
         BSTR::from(format!(
             "WinSizeP.Test.DeElevation.{}",
@@ -222,7 +350,7 @@ mod tests {
             .with_file_name(format!("logon-{operation}-probe.txt"))
     }
     fn temporary_definition(elevated: bool) -> String {
-        let owner = account().unwrap();
+        let owner = account_sid(&account().unwrap()).unwrap();
         definition(&owner, elevated)
             .unwrap()
             .replace(
@@ -288,15 +416,6 @@ mod tests {
         );
         assert!(crate::security::elevated());
         println!("split token (can lower): {}", crate::security::can_lower());
-        // The normal half of the token decides what counts as replaceable.
-        let system = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
-            .join("System32")
-            .join("kernel32.dll");
-        assert!(!crate::security::replaceable_without_elevation(&system).unwrap());
-        assert!(
-            crate::security::replaceable_without_elevation(&std::env::current_exe().unwrap())
-                .unwrap()
-        );
         struct Cleanup;
         impl Drop for Cleanup {
             fn drop(&mut self) {
