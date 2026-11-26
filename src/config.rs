@@ -15,7 +15,7 @@ fn system_zh() -> bool {
     (unsafe { GetUserDefaultUILanguage() } & 0x3ff) == 4
 }
 pub fn help() -> &'static str {
-    include_str!("example.toml")
+    include_str!("default.toml")
 }
 pub fn path() -> Result<PathBuf, String> {
     Ok(std::env::current_exe()
