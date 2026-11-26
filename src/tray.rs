@@ -113,7 +113,7 @@ unsafe extern "system" fn taskbar_event(
     }
     if message == CALLBACK {
         let event = lp as u32 & 0xffff;
-        if matches!(event, WM_CONTEXTMENU | WM_RBUTTONUP | NIN_SELECT) || event == NIN_SELECT + 1 {
+        if matches!(event, WM_CONTEXTMENU | WM_RBUTTONUP) {
             let anchor = if event == WM_RBUTTONUP {
                 -1
             } else {
