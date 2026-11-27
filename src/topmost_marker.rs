@@ -19,8 +19,14 @@ use windows_sys::{
     core::w,
 };
 
+#[cfg(not(test))]
 const CLASS: *const u16 = w!("WinSizeP.TopmostMarker");
+#[cfg(test)]
+const CLASS: *const u16 = w!("WinSizeP.Test.TopmostMarker");
+#[cfg(not(test))]
 const MANAGED: *const u16 = w!("WinSizeP.TopmostTarget");
+#[cfg(test)]
+const MANAGED: *const u16 = w!("WinSizeP.Test.TopmostTarget");
 const LETTER: *const u16 = w!("WinSizeP.TopmostLetter");
 const FONT: *const u16 = w!("WinSizeP.TopmostFont");
 const REFRESH: u32 = WM_APP + 110;
@@ -190,6 +196,20 @@ struct Badge {
     window: Window,
     position: Option<Rect>,
     letter: u16,
+    blocked_order: Option<(HWND, HWND)>,
+}
+fn place_badge(mut place: impl FnMut(bool) -> Result<(), u32>) -> Result<bool, String> {
+    match place(false) {
+        Ok(()) => Ok(false),
+        Err(ERROR_ACCESS_DENIED) => {
+            // UIPI can reject hWndInsertAfter even when the badge and target are
+            // accessible. Retain the badge's order while updating its geometry.
+            place(true)
+                .map(|()| true)
+                .map_err(|code| std::io::Error::from_raw_os_error(code as i32).to_string())
+        }
+        Err(code) => Err(std::io::Error::from_raw_os_error(code as i32).to_string()),
+    }
 }
 impl Badge {
     fn new(font: &Font, letter: u16, size: i32) -> Result<Self, String> {
@@ -224,6 +244,7 @@ impl Badge {
                 window,
                 position: None,
                 letter,
+                blocked_order: None,
             })
         }
     }
@@ -262,21 +283,51 @@ impl Badge {
             }
             let position = position(frame, style);
             let mut anchor = GetWindow(target, GW_HWNDPREV);
-            if self.position == Some(position) && anchor == self.window.0 {
+            let order = (anchor, GetWindow(self.window.0, GW_HWNDPREV));
+            if self.position == Some(position)
+                && (anchor == self.window.0 || self.blocked_order == Some(order))
+            {
                 return Ok(true);
             }
+            let keep_order = anchor == self.window.0 || self.blocked_order == Some(order);
             if anchor == self.window.0 {
                 anchor = GetWindow(self.window.0, GW_HWNDPREV);
             }
-            desktop::check(SetWindowPos(
-                self.window.0,
-                anchor,
-                position.x,
-                position.y,
-                style.size,
-                style.size,
-                SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW | SWP_NOSENDCHANGING,
-            ))?;
+            let blocked = place_badge(|fallback| {
+                if SetWindowPos(
+                    self.window.0,
+                    if keep_order || fallback {
+                        null_mut()
+                    } else {
+                        anchor
+                    },
+                    position.x,
+                    position.y,
+                    style.size,
+                    style.size,
+                    SWP_NOACTIVATE
+                        | SWP_NOOWNERZORDER
+                        | SWP_SHOWWINDOW
+                        | SWP_NOSENDCHANGING
+                        | if keep_order || fallback {
+                            SWP_NOZORDER
+                        } else {
+                            0
+                        },
+                ) != 0
+                {
+                    Ok(())
+                } else {
+                    Err(GetLastError())
+                }
+            })?;
+            self.blocked_order =
+                (blocked || (keep_order && self.blocked_order.is_some())).then(|| {
+                    (
+                        GetWindow(target, GW_HWNDPREV),
+                        GetWindow(self.window.0, GW_HWNDPREV),
+                    )
+                });
             self.position = Some(position);
             Ok(true)
         }
@@ -474,7 +525,15 @@ impl Markers {
                 Ok(keep) => keep,
                 Err(problem) => {
                     error = Some(problem);
-                    false
+                    // Keep ownership so a later window event can retry. Hide stale
+                    // geometry until that succeeds; only a dead/unmarked target is removed.
+                    if badge.position.take().is_some() {
+                        unsafe {
+                            ShowWindow(badge.window.0, SW_HIDE);
+                        }
+                    }
+                    badge.blocked_order = None;
+                    true
                 }
             },
         );
@@ -485,6 +544,77 @@ impl Markers {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "creates temporary windows to verify geometry-only positioning beside a foreign anchor"]
+    fn geometry_only_position_keeps_order_while_following_target() {
+        let _dpi = crate::test_support::Dpi::new();
+        let cfg = crate::test_support::cfg();
+        let markers = Markers::start(&cfg).unwrap();
+        let target = Target::with_topmost(true);
+        unsafe {
+            desktop::check(SetPropW(target.hwnd, MANAGED, 1usize as HANDLE)).unwrap();
+        }
+        let mut badge = Badge::new(markers.font.as_ref().unwrap(), markers.letter, 20).unwrap();
+        badge
+            .sync(target.hwnd, markers.letter, &cfg.topmost_marker)
+            .unwrap();
+        // Any existing window directly above the target must not be passed to
+        // SetWindowPos when geometry alone changes. A normal foreign window also
+        // exercises this path without requiring elevation on the test machine.
+        let blocker = Target::with_topmost(true);
+        unsafe {
+            desktop::check(SetWindowPos(
+                blocker.hwnd,
+                badge.window.0,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            ))
+            .unwrap();
+        }
+        badge.blocked_order = Some(unsafe {
+            (
+                GetWindow(target.hwnd, GW_HWNDPREV),
+                GetWindow(badge.window.0, GW_HWNDPREV),
+            )
+        });
+        let mut style = cfg.topmost_marker.clone();
+        style.position = "bottom-right".into();
+        badge.sync(target.hwnd, markers.letter, &style).unwrap();
+        assert_eq!(
+            desktop::bounds(badge.window.0).unwrap().0,
+            position(desktop::bounds(target.hwnd).unwrap().1, &style)
+        );
+        assert_ne!(unsafe { IsWindowVisible(badge.window.0) }, 0);
+    }
+    #[test]
+    fn denied_z_order_retries_geometry_without_hiding_or_reordering() {
+        let mut requests = Vec::new();
+        assert!(
+            place_badge(|keep_order| {
+                requests.push(keep_order);
+                if keep_order {
+                    Ok(())
+                } else {
+                    Err(ERROR_ACCESS_DENIED)
+                }
+            })
+            .unwrap()
+        );
+        assert_eq!(requests, [false, true]);
+        requests.clear();
+        assert!(
+            place_badge(|keep_order| {
+                requests.push(keep_order);
+                Err(ERROR_INVALID_WINDOW_HANDLE)
+            })
+            .is_err()
+        );
+        assert_eq!(requests, [false]);
+        assert!(place_badge(|_| Err(ERROR_ACCESS_DENIED)).is_err());
+    }
     #[test]
     fn marker_letter_follows_custom_bindings_and_command_aliases() {
         let mut cfg = crate::test_support::cfg();

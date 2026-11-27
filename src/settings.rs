@@ -768,6 +768,7 @@ impl Editor {
             self.search.visible = false;
             self.search.dismissed = true;
             self.layout()?;
+            self.render()?;
         }
         let control = self.search_control(&target);
         if control.is_null() {
@@ -895,6 +896,7 @@ impl Editor {
         unsafe {
             KillTimer(self.window.0, SEARCH_TIMER);
         }
+        let was_visible = self.search.visible;
         self.search.visible = false;
         self.search.dismissed = true;
         if clear {
@@ -903,7 +905,11 @@ impl Editor {
             self.search.highlight = None;
             set_text(self.search.edit, "");
         }
-        self.layout()
+        self.layout()?;
+        if was_visible {
+            self.render()?;
+        }
+        Ok(())
     }
     fn search_key(&mut self, key: u32) -> Result<(), String> {
         if self.search.composing {
@@ -2665,6 +2671,21 @@ impl Editor {
                 unsafe {
                     SetTimer(self.window.0, SEARCH_TIMER, 150, None);
                 }
+            } else if event == EN_KILLFOCUS {
+                unsafe {
+                    KillTimer(self.window.0, SEARCH_TIMER);
+                }
+            } else if event == EN_SETFOCUS
+                && !self.search.composing
+                && (caption(self.search.edit) != self.search.query
+                    || (self.search.stale
+                        && !self.search.dismissed
+                        && !self.search.query.is_empty()))
+            {
+                self.search.dismissed = false;
+                unsafe {
+                    SetTimer(self.window.0, SEARCH_TIMER, 150, None);
+                }
             } else if event == EN_SETFOCUS
                 && !self.search.dismissed
                 && !self.search.query.is_empty()
@@ -3277,6 +3298,7 @@ unsafe extern "system" fn control_proc(
                 let result = DefSubclassProc(hwnd, message, wp, lp);
                 with_editor(|e| {
                     e.search.composing = false;
+                    e.search.dismissed = false;
                     SetTimer(e.window.0, SEARCH_TIMER, 150, None);
                     Ok(())
                 });
@@ -3410,15 +3432,7 @@ unsafe extern "system" fn control_proc(
                 );
                 return 0;
             }
-            if forward_search_wheel(root as HWND, wp, lp) {
-                return 0;
-            }
-            PostMessageW(
-                root as HWND,
-                SCROLL,
-                ((wp >> 16) as u16 as i16 as i32 * -120 / WHEEL_DELTA as i32) as usize,
-                GetParent(hwnd) as isize,
-            );
+            PostMessageW(root as HWND, WM_MOUSEWHEEL, wp, lp);
             return 0;
         }
         if id != SEARCH_RESULTS
@@ -3467,15 +3481,7 @@ unsafe extern "system" fn pane_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: LP
                 0
             }
             WM_MOUSEWHEEL => {
-                if forward_search_wheel(root, wp, lp) {
-                    return 0;
-                }
-                PostMessageW(
-                    root,
-                    SCROLL,
-                    ((wp >> 16) as u16 as i16 as i32 * -120 / WHEEL_DELTA as i32) as usize,
-                    hwnd as isize,
-                );
+                PostMessageW(root, WM_MOUSEWHEEL, wp, lp);
                 0
             }
             WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORBTN => {
@@ -3516,7 +3522,31 @@ unsafe extern "system" fn pane_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: LP
 }
 unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match message {
-        WM_MOUSEWHEEL if forward_search_wheel(hwnd, wp, lp) => 0,
+        WM_MOUSEWHEEL => {
+            if !forward_search_wheel(hwnd, wp, lp) {
+                with_editor(|e| {
+                    let mut point = POINT {
+                        x: lp as u16 as i16 as i32,
+                        y: (lp >> 16) as u16 as i16 as i32,
+                    };
+                    let mut client = RECT::default();
+                    let mut sidebar = RECT::default();
+                    // Hit-test the pointer, since the focused control may be in the search bar.
+                    unsafe {
+                        GetWindowRect(e.panes[0], &mut sidebar);
+                        let pane = usize::from(PtInRect(&sidebar, point) == 0);
+                        ScreenToClient(hwnd, &mut point);
+                        GetClientRect(hwnd, &mut client);
+                        if PtInRect(&client, point) != 0 {
+                            let delta = (wp >> 16) as u16 as i16 as i32;
+                            e.scroll_by(pane, u16::MAX, -delta * 120 / WHEEL_DELTA as i32)?;
+                        }
+                    }
+                    Ok(())
+                });
+            }
+            0
+        }
         #[cfg(test)]
         TEST_THEME => {
             crate::settings_theme::test_dark(match wp {
@@ -3705,7 +3735,12 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
                     unsafe {
                         KillTimer(hwnd, SEARCH_TIMER);
                     }
-                    e.run_search()
+                    // KillTimer cannot remove a timer message already in the queue.
+                    if !e.search.dismissed && unsafe { GetFocus() } == e.search.edit {
+                        e.run_search()
+                    } else {
+                        Ok(())
+                    }
                 } else if wp == SAVE_STATUS_TIMER {
                     e.show_pending_status(Instant::now());
                     Ok(())
@@ -4163,6 +4198,7 @@ fn message_loop(hwnd: HWND, timer: HANDLE) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    include!("settings_search_tests.rs");
     #[test]
     #[ignore = "uses a temporary settings window to verify search focus, keyboard input and navigation"]
     fn search_navigation_preserves_focus_values_and_fixed_header() {

@@ -14,6 +14,8 @@ use windows_sys::{
 
 pub const APP_ICON: *const u16 = std::ptr::without_provenance(1);
 const CALLBACK: u32 = WM_APP + 41;
+// NIN_KEYSELECT is an SDK macro not exposed by windows-sys.
+const NIN_KEYSELECT: u32 = NIN_SELECT | 1;
 pub const MENU: u32 = WM_APP + 42;
 struct MenuTick<'a> {
     tick: &'a mut dyn FnMut(),
@@ -113,7 +115,7 @@ unsafe extern "system" fn taskbar_event(
     }
     if message == CALLBACK {
         let event = lp as u32 & 0xffff;
-        if matches!(event, WM_CONTEXTMENU | WM_RBUTTONUP) {
+        if matches!(event, WM_CONTEXTMENU | WM_RBUTTONUP | NIN_KEYSELECT) {
             let anchor = if event == WM_RBUTTONUP {
                 -1
             } else {
@@ -307,6 +309,38 @@ impl Drop for Tray {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn keyboard_and_context_activation_open_menu_but_left_click_does_not() {
+        unsafe {
+            let mut message = MSG::default();
+            PeekMessageW(&mut message, null_mut(), MENU, MENU, PM_REMOVE);
+            for event in [
+                NIN_SELECT,
+                WM_LBUTTONUP,
+                NIN_KEYSELECT,
+                WM_CONTEXTMENU,
+                WM_RBUTTONUP,
+            ] {
+                let position = (40 << 16) | 30;
+                taskbar_event(null_mut(), CALLBACK, position, event as isize, 0, 0);
+                let received = PeekMessageW(&mut message, null_mut(), MENU, MENU, PM_REMOVE) != 0;
+                assert_eq!(
+                    received,
+                    matches!(event, NIN_KEYSELECT | WM_CONTEXTMENU | WM_RBUTTONUP)
+                );
+                if received {
+                    assert_eq!(
+                        message.lParam,
+                        if event == WM_RBUTTONUP {
+                            -1
+                        } else {
+                            position as isize
+                        }
+                    );
+                }
+            }
+        }
+    }
     #[test]
     #[ignore = "opens a temporary tray menu and verifies animation while the menu remains open"]
     fn mouse_release_fades_while_tray_menu_is_open() {

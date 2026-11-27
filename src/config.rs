@@ -2107,7 +2107,7 @@ mod tests {
         doc["keycast"]["font_size"] = value(32);
         doc["keycast"]["history"] = value(999);
         let cfg = recover(&mut doc).unwrap();
-        assert_eq!(cfg.mousecast.radius, 9);
+        assert_eq!(cfg.mousecast.radius, 15);
         assert_eq!(cfg.keycast.font_size, 32);
         assert_eq!(cfg.keycast.history, 4);
         assert!(cfg.warnings.iter().any(|w| w.contains("mousecast.radius")));
