@@ -169,8 +169,11 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
     // SAFETY: callback arguments are supplied by Windows on the owning thread.
     unsafe {
         if message == WM_CLOSE {
-            input::prompt_event(false);
+            input::prompt_event(hwnd, false);
             return 0;
+        }
+        if message == WM_ACTIVATE && wp & 0xffff == WA_INACTIVE as usize {
+            input::prompt_deactivated(hwnd);
         }
         if message == WM_SETFOCUS {
             SetFocus(GetDlgItem(hwnd, 1));
@@ -200,7 +203,7 @@ unsafe extern "system" fn edit_proc(
             WM_KEYDOWN | WM_SYSKEYDOWN
                 if matches!(wp, 13 | 27) && GetPropW(hwnd, w!("Composing")).is_null() =>
             {
-                input::prompt_event(wp == 13);
+                input::prompt_event(GetParent(hwnd), wp == 13);
                 return 0;
             }
             WM_CHAR if matches!(wp, 13 | 27) => return 0,

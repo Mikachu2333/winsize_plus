@@ -41,16 +41,19 @@ pub const POINTER_UP: u32 = WM_APP + 18;
 pub const CONFIRM: u32 = WM_APP + 19;
 pub const COMMAND_SUBMIT: u32 = WM_APP + 20;
 pub const COMMAND_CANCEL: u32 = WM_APP + 21;
-pub fn prompt_event(submit: bool) {
+pub fn prompt_event(window: HWND, submit: bool) {
     post(
         if submit {
             COMMAND_SUBMIT
         } else {
             COMMAND_CANCEL
         },
-        0,
+        window as usize,
         0,
     );
+}
+pub fn prompt_deactivated(window: HWND) {
+    post(COMMAND_CANCEL, window as usize, 1);
 }
 thread_local! { static DISPLAY_PENDING: Cell<bool> = const { Cell::new(false) }; }
 pub fn display_changed() {

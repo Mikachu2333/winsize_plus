@@ -589,6 +589,15 @@ impl App {
     }
     fn handle_event(&mut self, msg: MSG) -> Result<(), String> {
         let occurred = input::take_event_time();
+        if matches!(msg.message, input::COMMAND_SUBMIT | input::COMMAND_CANCEL)
+            && msg.wParam != 0
+            && self
+                .prompt
+                .as_ref()
+                .is_none_or(|prompt| prompt.window as usize != msg.wParam)
+        {
+            return Ok(());
+        }
         let selection_action = matches!(
             msg.message,
             input::CLICK
@@ -623,7 +632,11 @@ impl App {
         match msg.message {
             input::COMMAND_SUBMIT => self.submit_prompt(),
             input::COMMAND_CANCEL => {
-                self.close_prompt();
+                if msg.lParam == 1 {
+                    self.close_prompt_without_focus();
+                } else {
+                    self.close_prompt();
+                }
                 Ok(())
             }
             input::RECOVERED => {
@@ -1216,6 +1229,35 @@ mod tests {
         app.act("pause").unwrap();
         assert!(!app.paused);
         assert_eq!(app.overlay.tip_text(), "开始捕获");
+    }
+
+    #[test]
+    #[ignore = "opens a temporary native prompt to verify blur cancels without focus restoration"]
+    fn command_blur_cancels_and_stale_close_does_not_affect_new_prompt() {
+        let _hooks = input::Hooks::start(&crate::test_support::cfg()).unwrap();
+        let mut app = test_app();
+        app.window = unsafe { GetForegroundWindow() };
+        app.act("command").unwrap();
+        let old = app.prompt.as_ref().unwrap().window;
+        unsafe {
+            SendMessageW(old, WM_ACTIVATE, WA_INACTIVE as usize, 0);
+        }
+        while let Some(event) = input::next_event() {
+            app.handle_event(event).unwrap();
+        }
+        assert!(app.prompt.is_none());
+        app.act("command").unwrap();
+        let current = app.prompt.as_ref().unwrap().window;
+        // A handle from another window must never close this prompt.
+        app.handle_event(MSG {
+            message: input::COMMAND_CANCEL,
+            wParam: usize::MAX,
+            lParam: 1,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(app.prompt.as_ref().unwrap().window, current);
+        app.close_prompt_without_focus();
     }
 
     #[test]
