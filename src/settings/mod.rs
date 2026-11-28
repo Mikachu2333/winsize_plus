@@ -226,6 +226,10 @@ struct Row {
     field: Field,
     controls: [HWND; 16],
     options: Vec<(String, String)>,
+    range: Cell<(i32, i32)>,
+    positioned_scroll: Cell<i32>,
+    culled: Cell<bool>,
+    shown: Cell<u16>,
 }
 impl Row {
     fn c(&self, slot: usize) -> HWND {
@@ -772,6 +776,9 @@ impl Editor {
             axis = 0;
         }
         self.switch_page(tab, axis)?;
+        if let Some(index) = self.search_row(&target) {
+            self.reveal_row(index)?;
+        }
         self.search.highlight = Some(target.clone());
         if !focus {
             self.overlay.hide_tip();
@@ -1221,6 +1228,336 @@ impl Editor {
         )?;
         Ok(())
     }
+    fn create_row(&self, index: usize, field: Field) -> Result<Row, String> {
+        let mut row = Row {
+            field,
+            controls: [null_mut(); 16],
+            options: Vec::new(),
+            range: Cell::new((0, 0)),
+            positioned_scroll: Cell::new(0),
+            culled: Cell::new(false),
+            shown: Cell::new(0),
+        };
+        if self
+            .rows
+            .get(index.wrapping_sub(1))
+            .is_some_and(|previous| schema::group(&previous.field) != schema::group(&row.field))
+        {
+            self.control(&mut row, index, 11, "STATIC", "", SS_OWNERDRAW)?;
+            unsafe {
+                SetPropW(row.c(11), w!("Separator"), 1usize as HANDLE);
+            }
+        }
+        let item = self
+            .doc
+            .get(&row.field.section)
+            .and_then(|s| s.get(&row.field.key));
+        let text = item
+            .and_then(Item::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                item.and_then(Item::as_integer)
+                    .map(|v| v.to_string())
+                    .unwrap_or_default()
+            });
+        let kind = row.field.kind.clone();
+        let label = row.field.label.clone();
+        let hint = row.field.hint.clone();
+        if !matches!(
+            kind,
+            Kind::Bool | Kind::Preview | Kind::Add | Kind::OpenConfig
+        ) {
+            self.control(&mut row, index, 1, "STATIC", &label, SS_LEFT)?;
+        }
+        self.control(&mut row, index, 2, "STATIC", &hint, SS_LEFT)?;
+        if !matches!(
+            kind,
+            Kind::Note | Kind::Preview | Kind::Add | Kind::OpenConfig
+        ) {
+            self.control(&mut row, index, 12, "STATIC", "", SS_LEFT)?;
+            send(row.c(12), WM_SETFONT, self.hint_font.0 as usize, 0);
+        }
+        send(row.c(2), WM_SETFONT, self.hint_font.0 as usize, 0);
+        match kind {
+            Kind::Bool | Kind::Preview => {
+                self.control(
+                    &mut row,
+                    index,
+                    0,
+                    "BUTTON",
+                    &label,
+                    BS_AUTOCHECKBOX as u32 | BS_MULTILINE as u32 | WS_TABSTOP,
+                )?;
+                let checked = if matches!(kind, Kind::Preview) {
+                    self.live
+                } else {
+                    item.and_then(Item::as_bool).unwrap_or(false)
+                };
+                send(row.c(0), BM_SETCHECK, usize::from(checked), 0);
+            }
+            Kind::Number | Kind::Text => self.control(
+                &mut row,
+                index,
+                0,
+                "EDIT",
+                &text,
+                WS_BORDER
+                    | WS_TABSTOP
+                    | if matches!(kind, Kind::Number) {
+                        ES_NUMBER as u32
+                    } else {
+                        ES_MULTILINE as u32 | ES_AUTOVSCROLL as u32
+                    },
+            )?,
+            Kind::Font | Kind::Choice(_) => {
+                row.options = if let Kind::Choice(options) = kind {
+                    options
+                } else {
+                    self.families
+                        .iter()
+                        .map(|n| {
+                            (
+                                n.clone(),
+                                schema::option(&self.cfg, schema::ChoiceContext::Font, n),
+                            )
+                        })
+                        .collect()
+                };
+                // create() makes every combo box owner-drawn.
+                let style = CBS_DROPDOWNLIST as u32 | WS_TABSTOP | WS_VSCROLL;
+                self.control(&mut row, index, 0, "COMBOBOX", "", style)?;
+                if matches!(row.field.kind, Kind::Font) {
+                    unsafe {
+                        SetPropW(row.c(0), w!("FontPicker"), 1usize as HANDLE);
+                    }
+                }
+                populate(
+                    row.c(0),
+                    &row.options,
+                    &text,
+                    self.font.height() + self.s(14),
+                );
+            }
+            Kind::Mapping => {
+                let key = if row.field.section == "keys" {
+                    config::shortcut_name(&row.field.key)
+                } else {
+                    row.field.key.clone()
+                };
+                self.control(&mut row, index, 3, "EDIT", &key, WS_BORDER | WS_TABSTOP)?;
+                let related_label = if row.field.section == "presets" {
+                    self.cfg.tr("Find shortcuts", "查看快捷键")
+                } else {
+                    self.cfg.tr("View region", "查看分区")
+                };
+                self.control(
+                    &mut row,
+                    index,
+                    6,
+                    "BUTTON",
+                    related_label,
+                    BS_PUSHBUTTON as u32 | WS_TABSTOP,
+                )?;
+                if row.field.section == "keys" {
+                    unsafe {
+                        SetPropW(row.c(3), w!("ShortcutCapture"), 1 as HANDLE);
+                        SetPropW(
+                            row.c(3),
+                            w!("ShortcutZh"),
+                            usize::from(self.cfg.zh) as HANDLE,
+                        );
+                    }
+                    let hint = shortcut_caption(&key, false, self.cfg.zh);
+                    self.control(&mut row, index, 7, "STATIC", &hint, SS_LEFT)?;
+                }
+                self.control(
+                    &mut row,
+                    index,
+                    4,
+                    "BUTTON",
+                    self.cfg.tr("Delete", "删除"),
+                    BS_PUSHBUTTON as u32 | WS_TABSTOP,
+                )?;
+                if row.field.section == "presets" {
+                    self.control(
+                        &mut row,
+                        index,
+                        0,
+                        "EDIT",
+                        &text,
+                        WS_BORDER
+                            | WS_TABSTOP
+                            | ES_MULTILINE as u32
+                            | ES_AUTOVSCROLL as u32
+                            | ES_AUTOHSCROLL as u32,
+                    )?;
+                    self.control(
+                        &mut row,
+                        index,
+                        5,
+                        "BUTTON",
+                        self.cfg.tr("Preview this region", "预览此分区"),
+                        BS_AUTORADIOBUTTON as u32 | BS_MULTILINE as u32 | WS_TABSTOP,
+                    )?;
+                    send(
+                        row.c(5),
+                        BM_SETCHECK,
+                        usize::from(self.selected.as_ref() == Some(&row.field.key)),
+                        0,
+                    );
+                } else {
+                    self.control(
+                        &mut row,
+                        index,
+                        5,
+                        "BUTTON",
+                        self.cfg.tr("Preview this region", "预览此分区"),
+                        BS_PUSHBUTTON as u32 | WS_TABSTOP,
+                    )?;
+                    row.options = schema::actions(&self.cfg, false);
+                    self.control(
+                        &mut row,
+                        index,
+                        0,
+                        "COMBOBOX",
+                        "",
+                        CBS_DROPDOWNLIST as u32 | WS_TABSTOP | WS_VSCROLL,
+                    )?;
+                    populate(
+                        row.c(0),
+                        &row.options,
+                        &text,
+                        self.font.height() + self.s(14),
+                    );
+                }
+            }
+            Kind::Color(channels) => {
+                self.control(
+                    &mut row,
+                    index,
+                    0,
+                    "BUTTON",
+                    &text,
+                    BS_OWNERDRAW as u32 | WS_TABSTOP,
+                )?;
+                let rgb = u32::from_str_radix(text.trim_start_matches('#'), 16).unwrap_or(0);
+                let alpha = self
+                    .doc
+                    .get(&row.field.section)
+                    .and_then(|s| s.get("opacity"))
+                    .and_then(Item::as_integer);
+                for (channel, amount) in [
+                    (rgb >> 16) & 255,
+                    (rgb >> 8) & 255,
+                    rgb & 255,
+                    alpha.unwrap_or(255) as u32,
+                ]
+                .into_iter()
+                .take(channels.count())
+                .enumerate()
+                {
+                    self.control(
+                        &mut row,
+                        index,
+                        channel + 3,
+                        "EDIT",
+                        &amount.to_string(),
+                        WS_BORDER | WS_TABSTOP | ES_NUMBER as u32,
+                    )?;
+                    self.control(
+                        &mut row,
+                        index,
+                        channel + 7,
+                        "STATIC",
+                        ["R", "G", "B", "A"][channel],
+                        SS_CENTER,
+                    )?;
+                }
+            }
+            Kind::Fallbacks => {
+                self.control(
+                    &mut row,
+                    index,
+                    0,
+                    "LISTBOX",
+                    "",
+                    LBS_NOTIFY as u32
+                        | LBS_OWNERDRAWFIXED as u32
+                        | LBS_HASSTRINGS as u32
+                        | WS_BORDER
+                        | WS_VSCROLL
+                        | WS_TABSTOP,
+                )?;
+                if let Some(fonts) = item.and_then(Item::as_array) {
+                    for family in fonts.iter().filter_map(Value::as_str) {
+                        send(row.c(0), LB_ADDSTRING, 0, wide(family).as_ptr() as isize);
+                    }
+                }
+                row.options = self
+                    .families
+                    .iter()
+                    .map(|n| {
+                        (
+                            n.clone(),
+                            schema::option(&self.cfg, schema::ChoiceContext::Font, n),
+                        )
+                    })
+                    .collect();
+                self.control(
+                    &mut row,
+                    index,
+                    3,
+                    "COMBOBOX",
+                    "",
+                    CBS_DROPDOWNLIST as u32
+                        | CBS_OWNERDRAWFIXED as u32
+                        | CBS_HASSTRINGS as u32
+                        | WS_VSCROLL
+                        | WS_TABSTOP,
+                )?;
+                populate(
+                    row.c(3),
+                    &row.options,
+                    "SystemFont",
+                    self.font.height() + self.s(14),
+                );
+                unsafe {
+                    SetPropW(row.c(3), w!("FontPicker"), 1usize as HANDLE);
+                }
+                for (slot, en, zh) in [
+                    (4, "Add", "添加"),
+                    (5, "Remove", "删除"),
+                    (6, "Up", "上移"),
+                    (7, "Down", "下移"),
+                ] {
+                    self.control(
+                        &mut row,
+                        index,
+                        slot,
+                        "BUTTON",
+                        self.cfg.tr(en, zh),
+                        BS_PUSHBUTTON as u32 | WS_TABSTOP,
+                    )?;
+                }
+                send(
+                    row.c(0),
+                    LB_SETITEMHEIGHT,
+                    0,
+                    (self.font.height() + self.s(8)) as isize,
+                );
+            }
+            Kind::Add | Kind::OpenConfig => self.control(
+                &mut row,
+                index,
+                0,
+                "BUTTON",
+                &label,
+                BS_PUSHBUTTON as u32 | WS_TABSTOP,
+            )?,
+            Kind::Note => {}
+        }
+        Ok(row)
+    }
     fn rebuild(&mut self) -> Result<(), String> {
         let focused = unsafe { GetFocus() };
         let focus = self.rows.iter().find_map(|row| {
@@ -1301,329 +1638,23 @@ impl Editor {
             .into_iter()
             .enumerate()
         {
-            let mut row = Row {
-                field,
-                controls: [null_mut(); 16],
-                options: Vec::new(),
+            let lazy = self.tab == 2
+                && self.cfg.presets.len() > 64
+                && field.section == "presets"
+                && matches!(field.kind, Kind::Mapping);
+            let row = if lazy {
+                Row {
+                    field,
+                    controls: [null_mut(); 16],
+                    options: Vec::new(),
+                    range: Cell::new((0, 0)),
+                    positioned_scroll: Cell::new(0),
+                    culled: Cell::new(false),
+                    shown: Cell::new(0),
+                }
+            } else {
+                self.create_row(index, field)?
             };
-            if self
-                .rows
-                .last()
-                .is_some_and(|previous| schema::group(&previous.field) != schema::group(&row.field))
-            {
-                self.control(&mut row, index, 11, "STATIC", "", SS_OWNERDRAW)?;
-                unsafe {
-                    SetPropW(row.c(11), w!("Separator"), 1usize as HANDLE);
-                }
-            }
-            let item = self
-                .doc
-                .get(&row.field.section)
-                .and_then(|s| s.get(&row.field.key));
-            let text = item
-                .and_then(Item::as_str)
-                .map(str::to_owned)
-                .unwrap_or_else(|| {
-                    item.and_then(Item::as_integer)
-                        .map(|v| v.to_string())
-                        .unwrap_or_default()
-                });
-            let kind = row.field.kind.clone();
-            let label = row.field.label.clone();
-            let hint = row.field.hint.clone();
-            if !matches!(
-                kind,
-                Kind::Bool | Kind::Preview | Kind::Add | Kind::OpenConfig
-            ) {
-                self.control(&mut row, index, 1, "STATIC", &label, SS_LEFT)?;
-            }
-            self.control(&mut row, index, 2, "STATIC", &hint, SS_LEFT)?;
-            if !matches!(
-                kind,
-                Kind::Note | Kind::Preview | Kind::Add | Kind::OpenConfig
-            ) {
-                self.control(&mut row, index, 12, "STATIC", "", SS_LEFT)?;
-                send(row.c(12), WM_SETFONT, self.hint_font.0 as usize, 0);
-            }
-            send(row.c(2), WM_SETFONT, self.hint_font.0 as usize, 0);
-            match kind {
-                Kind::Bool | Kind::Preview => {
-                    self.control(
-                        &mut row,
-                        index,
-                        0,
-                        "BUTTON",
-                        &label,
-                        BS_AUTOCHECKBOX as u32 | BS_MULTILINE as u32 | WS_TABSTOP,
-                    )?;
-                    let checked = if matches!(kind, Kind::Preview) {
-                        self.live
-                    } else {
-                        item.and_then(Item::as_bool).unwrap_or(false)
-                    };
-                    send(row.c(0), BM_SETCHECK, usize::from(checked), 0);
-                }
-                Kind::Number | Kind::Text => self.control(
-                    &mut row,
-                    index,
-                    0,
-                    "EDIT",
-                    &text,
-                    WS_BORDER
-                        | WS_TABSTOP
-                        | if matches!(kind, Kind::Number) {
-                            ES_NUMBER as u32
-                        } else {
-                            ES_MULTILINE as u32 | ES_AUTOVSCROLL as u32
-                        },
-                )?,
-                Kind::Font | Kind::Choice(_) => {
-                    row.options = if let Kind::Choice(options) = kind {
-                        options
-                    } else {
-                        self.families
-                            .iter()
-                            .map(|n| {
-                                (
-                                    n.clone(),
-                                    schema::option(&self.cfg, schema::ChoiceContext::Font, n),
-                                )
-                            })
-                            .collect()
-                    };
-                    // create() makes every combo box owner-drawn.
-                    let style = CBS_DROPDOWNLIST as u32 | WS_TABSTOP | WS_VSCROLL;
-                    self.control(&mut row, index, 0, "COMBOBOX", "", style)?;
-                    if matches!(row.field.kind, Kind::Font) {
-                        unsafe {
-                            SetPropW(row.c(0), w!("FontPicker"), 1usize as HANDLE);
-                        }
-                    }
-                    populate(
-                        row.c(0),
-                        &row.options,
-                        &text,
-                        self.font.height() + self.s(14),
-                    );
-                }
-                Kind::Mapping => {
-                    let key = if row.field.section == "keys" {
-                        config::shortcut_name(&row.field.key)
-                    } else {
-                        row.field.key.clone()
-                    };
-                    self.control(&mut row, index, 3, "EDIT", &key, WS_BORDER | WS_TABSTOP)?;
-                    let related_label = if row.field.section == "presets" {
-                        self.cfg.tr("Find shortcuts", "查看快捷键")
-                    } else {
-                        self.cfg.tr("View region", "查看分区")
-                    };
-                    self.control(
-                        &mut row,
-                        index,
-                        6,
-                        "BUTTON",
-                        related_label,
-                        BS_PUSHBUTTON as u32 | WS_TABSTOP,
-                    )?;
-                    if row.field.section == "keys" {
-                        unsafe {
-                            SetPropW(row.c(3), w!("ShortcutCapture"), 1 as HANDLE);
-                            SetPropW(
-                                row.c(3),
-                                w!("ShortcutZh"),
-                                usize::from(self.cfg.zh) as HANDLE,
-                            );
-                        }
-                        let hint = shortcut_caption(&key, false, self.cfg.zh);
-                        self.control(&mut row, index, 7, "STATIC", &hint, SS_LEFT)?;
-                    }
-                    self.control(
-                        &mut row,
-                        index,
-                        4,
-                        "BUTTON",
-                        self.cfg.tr("Delete", "删除"),
-                        BS_PUSHBUTTON as u32 | WS_TABSTOP,
-                    )?;
-                    if row.field.section == "presets" {
-                        self.control(
-                            &mut row,
-                            index,
-                            0,
-                            "EDIT",
-                            &text,
-                            WS_BORDER
-                                | WS_TABSTOP
-                                | ES_MULTILINE as u32
-                                | ES_AUTOVSCROLL as u32
-                                | ES_AUTOHSCROLL as u32,
-                        )?;
-                        self.control(
-                            &mut row,
-                            index,
-                            5,
-                            "BUTTON",
-                            self.cfg.tr("Preview this region", "预览此分区"),
-                            BS_AUTORADIOBUTTON as u32 | BS_MULTILINE as u32 | WS_TABSTOP,
-                        )?;
-                        send(
-                            row.c(5),
-                            BM_SETCHECK,
-                            usize::from(self.selected.as_ref() == Some(&row.field.key)),
-                            0,
-                        );
-                    } else {
-                        self.control(
-                            &mut row,
-                            index,
-                            5,
-                            "BUTTON",
-                            self.cfg.tr("Preview this region", "预览此分区"),
-                            BS_PUSHBUTTON as u32 | WS_TABSTOP,
-                        )?;
-                        row.options = schema::actions(&self.cfg, false);
-                        self.control(
-                            &mut row,
-                            index,
-                            0,
-                            "COMBOBOX",
-                            "",
-                            CBS_DROPDOWNLIST as u32 | WS_TABSTOP | WS_VSCROLL,
-                        )?;
-                        populate(
-                            row.c(0),
-                            &row.options,
-                            &text,
-                            self.font.height() + self.s(14),
-                        );
-                    }
-                }
-                Kind::Color(channels) => {
-                    self.control(
-                        &mut row,
-                        index,
-                        0,
-                        "BUTTON",
-                        &text,
-                        BS_OWNERDRAW as u32 | WS_TABSTOP,
-                    )?;
-                    let rgb = u32::from_str_radix(text.trim_start_matches('#'), 16).unwrap_or(0);
-                    let alpha = self
-                        .doc
-                        .get(&row.field.section)
-                        .and_then(|s| s.get("opacity"))
-                        .and_then(Item::as_integer);
-                    for (channel, amount) in [
-                        (rgb >> 16) & 255,
-                        (rgb >> 8) & 255,
-                        rgb & 255,
-                        alpha.unwrap_or(255) as u32,
-                    ]
-                    .into_iter()
-                    .take(channels.count())
-                    .enumerate()
-                    {
-                        self.control(
-                            &mut row,
-                            index,
-                            channel + 3,
-                            "EDIT",
-                            &amount.to_string(),
-                            WS_BORDER | WS_TABSTOP | ES_NUMBER as u32,
-                        )?;
-                        self.control(
-                            &mut row,
-                            index,
-                            channel + 7,
-                            "STATIC",
-                            ["R", "G", "B", "A"][channel],
-                            SS_CENTER,
-                        )?;
-                    }
-                }
-                Kind::Fallbacks => {
-                    self.control(
-                        &mut row,
-                        index,
-                        0,
-                        "LISTBOX",
-                        "",
-                        LBS_NOTIFY as u32
-                            | LBS_OWNERDRAWFIXED as u32
-                            | LBS_HASSTRINGS as u32
-                            | WS_BORDER
-                            | WS_VSCROLL
-                            | WS_TABSTOP,
-                    )?;
-                    if let Some(fonts) = item.and_then(Item::as_array) {
-                        for family in fonts.iter().filter_map(Value::as_str) {
-                            send(row.c(0), LB_ADDSTRING, 0, wide(family).as_ptr() as isize);
-                        }
-                    }
-                    row.options = self
-                        .families
-                        .iter()
-                        .map(|n| {
-                            (
-                                n.clone(),
-                                schema::option(&self.cfg, schema::ChoiceContext::Font, n),
-                            )
-                        })
-                        .collect();
-                    self.control(
-                        &mut row,
-                        index,
-                        3,
-                        "COMBOBOX",
-                        "",
-                        CBS_DROPDOWNLIST as u32
-                            | CBS_OWNERDRAWFIXED as u32
-                            | CBS_HASSTRINGS as u32
-                            | WS_VSCROLL
-                            | WS_TABSTOP,
-                    )?;
-                    populate(
-                        row.c(3),
-                        &row.options,
-                        "SystemFont",
-                        self.font.height() + self.s(14),
-                    );
-                    unsafe {
-                        SetPropW(row.c(3), w!("FontPicker"), 1usize as HANDLE);
-                    }
-                    for (slot, en, zh) in [
-                        (4, "Add", "添加"),
-                        (5, "Remove", "删除"),
-                        (6, "Up", "上移"),
-                        (7, "Down", "下移"),
-                    ] {
-                        self.control(
-                            &mut row,
-                            index,
-                            slot,
-                            "BUTTON",
-                            self.cfg.tr(en, zh),
-                            BS_PUSHBUTTON as u32 | WS_TABSTOP,
-                        )?;
-                    }
-                    send(
-                        row.c(0),
-                        LB_SETITEMHEIGHT,
-                        0,
-                        (self.font.height() + self.s(8)) as isize,
-                    );
-                }
-                Kind::Add | Kind::OpenConfig => self.control(
-                    &mut row,
-                    index,
-                    0,
-                    "BUTTON",
-                    &label,
-                    BS_PUSHBUTTON as u32 | WS_TABSTOP,
-                )?,
-                Kind::Note => {}
-            }
             self.rows.push(row);
         }
         self.update_enabled_controls();
@@ -1735,6 +1766,22 @@ impl Editor {
         let expression_width = (combo_width * 2).min(width);
         let mut y = padding;
         for row in &self.rows {
+            let row_top = y;
+            if row.c(0).is_null() && matches!(row.field.kind, Kind::Mapping) {
+                y += measured(&row.field.label, &self.font, width) + gap + h * 2 + gap + self.s(12);
+                row.range.set((row_top, y));
+                continue;
+            }
+            if row.culled.replace(false) {
+                for (slot, &control) in row.controls.iter().enumerate() {
+                    if row.shown.get() & (1 << slot) != 0 {
+                        unsafe {
+                            ShowWindow(control, SW_SHOWNOACTIVATE);
+                        }
+                    }
+                }
+            }
+            row.positioned_scroll.set(self.scroll[1]);
             if !row.c(11).is_null() {
                 y += self.s(2);
                 place(row.c(11), padding, y - self.scroll[1], width, 1);
@@ -1994,6 +2041,7 @@ impl Editor {
                 }
                 y += axis_height * 2 + self.s(10);
             }
+            row.range.set((row_top, y));
         }
         self.extent[1] = y + padding;
         let mut adjusted = false;
@@ -2040,6 +2088,10 @@ impl Editor {
         if adjusted || rect.right != initial_right_width {
             self.layout()?;
         }
+        if self.materialize_visible()? {
+            return self.layout();
+        }
+        self.position_visible_rows();
         self.update_search_highlight();
         // Complete this resize before Windows draws the next drag frame. This also
         // erases newly exposed text and the background behind rounded status corners.
@@ -2069,6 +2121,98 @@ impl Editor {
         }
         sidebar_size(total, self.dpi, widest)
     }
+    fn materialize_visible(&mut self) -> Result<bool, String> {
+        let mut client = RECT::default();
+        unsafe {
+            GetClientRect(self.panes[1], &mut client);
+        }
+        let mut changed = false;
+        for index in 0..self.rows.len() {
+            let row = &self.rows[index];
+            let (top, bottom) = row.range.get();
+            if row.c(0).is_null()
+                && matches!(row.field.kind, Kind::Mapping)
+                && bottom >= self.scroll[1]
+                && top <= self.scroll[1] + client.bottom
+            {
+                self.rows[index] = self.create_row(index, row.field.clone())?;
+                changed = true;
+            }
+        }
+        Ok(changed)
+    }
+    fn reveal_row(&mut self, index: usize) -> Result<(), String> {
+        if self.rows[index].c(0).is_null() || self.rows[index].culled.get() {
+            let top = self.rows[index].range.get().0;
+            self.scroll_by(1, u16::MAX, top - self.scroll[1] - self.s(16))?;
+        }
+        Ok(())
+    }
+    fn position_visible_rows(&self) {
+        if self.tab != 2 || self.cfg.presets.len() <= 64 {
+            return;
+        }
+        let mut client = RECT::default();
+        unsafe {
+            GetClientRect(self.panes[1], &mut client);
+        }
+        for row in &self.rows {
+            let (top, bottom) = row.range.get();
+            let visible = bottom >= self.scroll[1] && top <= self.scroll[1] + client.bottom;
+            if !visible {
+                if !row.culled.replace(true) {
+                    let mut shown = 0;
+                    for (slot, &control) in row.controls.iter().enumerate() {
+                        if !control.is_null()
+                            && unsafe { GetWindowLongW(control, GWL_STYLE) } as u32 & WS_VISIBLE
+                                != 0
+                        {
+                            shown |= 1 << slot;
+                            unsafe {
+                                ShowWindow(control, SW_HIDE);
+                            }
+                        }
+                    }
+                    row.shown.set(shown);
+                }
+                continue;
+            }
+            let delta = row.positioned_scroll.get() - self.scroll[1];
+            for (slot, &control) in row.controls.iter().enumerate() {
+                if control.is_null() {
+                    continue;
+                }
+                if delta != 0 {
+                    unsafe {
+                        let mut rect = RECT::default();
+                        GetWindowRect(control, &mut rect);
+                        MapWindowPoints(
+                            null_mut(),
+                            self.panes[1],
+                            (&mut rect as *mut RECT).cast(),
+                            2,
+                        );
+                        SetWindowPos(
+                            control,
+                            null_mut(),
+                            rect.left,
+                            rect.top + delta,
+                            0,
+                            0,
+                            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS,
+                        );
+                    }
+                }
+                if row.culled.get() && row.shown.get() & (1 << slot) != 0 {
+                    unsafe {
+                        ShowWindow(control, SW_SHOWNOACTIVATE);
+                    }
+                }
+            }
+            row.culled.set(false);
+            row.positioned_scroll.set(self.scroll[1]);
+        }
+    }
     fn scroll_by(&mut self, pane: usize, command: u16, delta: i32) -> Result<(), String> {
         let before = self.scroll[pane];
         let mut rect = RECT::default();
@@ -2097,6 +2241,19 @@ impl Editor {
         }
         self.scroll[pane] = self.scroll[pane].clamp(0, (self.extent[pane] - rect.bottom).max(0));
         if before == self.scroll[pane] {
+            return Ok(());
+        }
+        if pane == 1 && self.cfg.presets.len() > 64 && self.tab == 2 {
+            let _redraw = RedrawGuard::new(self.panes[1]);
+            if self.materialize_visible()? {
+                self.layout()?;
+            } else {
+                self.position_visible_rows();
+            }
+            unsafe {
+                SetScrollPos(self.panes[1], SB_VERT, self.scroll[1], 1);
+            }
+            self.update_search_highlight();
             return Ok(());
         }
         // Move existing child controls only; measurements and row layout stay unchanged.
@@ -2319,7 +2476,7 @@ impl Editor {
         let preview_changed = cfg != self.cfg;
         self.apply_config(cfg)?;
         for row in &mut self.rows {
-            if matches!(row.field.kind, Kind::Mapping) {
+            if matches!(row.field.kind, Kind::Mapping) && !row.c(3).is_null() {
                 let name = caption(row.c(3)).trim().to_owned();
                 let name = if row.field.section == "keys" {
                     config::shortcut_name(&name)
@@ -2963,23 +3120,21 @@ impl Editor {
                 let tab = if source == "presets" { 4 } else { 2 };
                 self.switch_page(tab, 0)?;
                 let normalized = config::command_name(&name);
-                let target = self
-                    .rows
-                    .iter()
-                    .find(|r| {
-                        if source == "presets" {
-                            r.field.section == "keys"
-                                && self.doc["keys"]
-                                    .get(&r.field.key)
-                                    .and_then(Item::as_str)
-                                    .is_some_and(|v| config::command_name(v) == normalized)
-                        } else {
-                            r.field.section == "presets"
-                                && config::command_name(&r.field.key) == normalized
-                        }
-                    })
-                    .map(|r| r.c(3));
-                if let Some(control) = target {
+                let target = self.rows.iter().position(|r| {
+                    if source == "presets" {
+                        r.field.section == "keys"
+                            && self.doc["keys"]
+                                .get(&r.field.key)
+                                .and_then(Item::as_str)
+                                .is_some_and(|v| config::command_name(v) == normalized)
+                    } else {
+                        r.field.section == "presets"
+                            && config::command_name(&r.field.key) == normalized
+                    }
+                });
+                if let Some(index) = target {
+                    self.reveal_row(index)?;
+                    let control = self.rows[index].c(3);
                     let mut rect = RECT::default();
                     unsafe {
                         GetWindowRect(control, &mut rect);
@@ -3046,6 +3201,38 @@ impl Editor {
         };
         if changed {
             self.dirty.insert(index);
+            if row.field.section == "presets" && slot == 0 && event == EN_CHANGE {
+                let state = row.c(12);
+                let previous = caption(state);
+                let name = row.field.key.clone();
+                match caption(row.c(0)).parse::<crate::layout::Layout>() {
+                    Ok(layout) => {
+                        self.cfg.presets.insert(config::command_name(&name), layout);
+                        set_text(
+                            state,
+                            self.cfg.tr(
+                                "Not saved · Enter or leave to save",
+                                "未保存 · Enter 或离开后保存",
+                            ),
+                        );
+                        if self.live && self.selected.as_ref() == Some(&name) {
+                            self.render()?;
+                        }
+                    }
+                    Err(error) => set_text(
+                        state,
+                        &format!(
+                            "{}: {error}",
+                            self.cfg
+                                .tr("Invalid input · Not saved", "输入有误 · 未保存")
+                        ),
+                    ),
+                }
+                if previous != caption(state) {
+                    self.layout()?;
+                }
+                return Ok(());
+            }
             set_text(
                 self.rows[index].c(12),
                 self.cfg.tr(
@@ -4534,6 +4721,61 @@ fn message_loop(hwnd: HWND, timer: HANDLE) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "checks lazy region rows preserve edits and navigation with 300 presets"]
+    fn large_region_pages_materialize_only_needed_controls() {
+        let _hooks = input::Hooks::escape_only().unwrap();
+        let mut editor = test_editor(2, "virtual-region-test");
+        editor.live = false;
+        for n in 0..300 {
+            editor.doc["presets"][&format!("extra{n}")] = value("0|0|50sw|50sh");
+        }
+        editor.cfg = Config::parse(&editor.doc).unwrap();
+        let started = Instant::now();
+        editor.rebuild().unwrap();
+        println!("large page build_ms={}", started.elapsed().as_millis());
+        let created = editor.rows.iter().filter(|r| !r.c(0).is_null()).count();
+        assert!(created < 20, "created {created} rows");
+        let target = editor
+            .rows
+            .iter()
+            .position(|r| r.field.key == "extra290")
+            .unwrap();
+        assert!(editor.rows[target].c(0).is_null());
+        editor.reveal_row(target).unwrap();
+        let edit = editor.rows[target].c(0);
+        assert!(!edit.is_null());
+        set_text(edit, "10sw|10sh|70sw|70sh");
+        editor
+            .command(BASE + target as i32 * STRIDE, EN_CHANGE, edit)
+            .unwrap();
+        editor.scroll_by(1, u16::MAX, -100000).unwrap();
+        editor.reveal_row(target).unwrap();
+        assert_eq!(caption(editor.rows[target].c(0)), "10sw|10sh|70sw|70sh");
+        editor.save().unwrap();
+        assert_eq!(
+            editor.doc["presets"]["extra290"].as_str(),
+            Some("10sw|10sh|70sw|70sh")
+        );
+        assert!(editor.doc["presets"].get("extra0").is_some());
+        assert!(!editor.doc["presets"].as_table().unwrap().contains_key(""));
+        let started = Instant::now();
+        for n in 0..20 {
+            editor
+                .scroll_by(1, u16::MAX, if n % 2 == 0 { 40 } else { -40 })
+                .unwrap();
+        }
+        println!(
+            "large page scroll_avg_ms={:.3}",
+            started.elapsed().as_secs_f64() * 50.0
+        );
+        let visible = editor
+            .rows
+            .iter()
+            .filter(|r| !r.c(0).is_null() && !r.culled.get())
+            .count();
+        assert!(visible < 20);
+    }
     include!("search_tests.rs");
     #[test]
     #[ignore = "uses a temporary settings window to verify search focus, keyboard input and navigation"]
