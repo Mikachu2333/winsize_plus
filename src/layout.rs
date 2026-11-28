@@ -134,33 +134,6 @@ impl FromStr for Layout {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn numeric_terms_round_to_two_places_for_storage_and_resolution() {
-        assert_eq!(
-            normalize("1.234｜-2.345、33.33333sw+0.126|66.66666sh|2").unwrap(),
-            "1.23|-2.35|33.33sw+0.13|66.67sh|2"
-        );
-        assert_eq!(
-            normalize("0|0|100.00sw|50.5sh").unwrap(),
-            "0|0|100sw|50.5sh"
-        );
-        let area = Rect {
-            x: 0,
-            y: 0,
-            width: 10000,
-            height: 10000,
-        };
-        let layout: Layout = "0|0|33.33333333sw|66.66666667sh".parse().unwrap();
-        let resolved = layout.resolve(area, area, area).unwrap();
-        assert_eq!((resolved.width, resolved.height), (3333, 6667));
-        assert!(normalize("name 1/4").is_err());
-        assert_eq!(normalize("0|0|100|100").unwrap(), "0|0|100|100");
-    }
-}
-
 impl Layout {
     pub fn uses_virtual_desktop(&self) -> bool {
         self.virtual_origin
@@ -218,5 +191,32 @@ impl Layout {
             return Err("Invalid rectangle / 矩形越界".into());
         }
         Ok(rect)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn numeric_terms_round_to_two_places_for_storage_and_resolution() {
+        assert_eq!(
+            normalize("1.234｜-2.345、33.33333sw+0.126|66.66666sh|2").unwrap(),
+            "1.23|-2.35|33.33sw+0.13|66.67sh|2"
+        );
+        assert_eq!(
+            normalize("0|0|100.00sw|50.5sh").unwrap(),
+            "0|0|100sw|50.5sh"
+        );
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 10000,
+            height: 10000,
+        };
+        let layout: Layout = "0|0|33.33333333sw|66.66666667sh".parse().unwrap();
+        let resolved = layout.resolve(area, area, area).unwrap();
+        assert_eq!((resolved.width, resolved.height), (3333, 6667));
+        assert!(normalize("name 1/4").is_err());
+        assert_eq!(normalize("0|0|100|100").unwrap(), "0|0|100|100");
     }
 }

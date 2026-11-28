@@ -6201,7 +6201,8 @@ mod tests {
         fallbacks.push("Noto Color Emoji");
         fallbacks.push("Microsoft YaHei UI");
         doc["ui"]["font_fallbacks"] = value(fallbacks);
-        doc["presets"]["这是一个超过八个汉字的测试分区名称"] = value("0|0|50sw|50sh");
+        let overflow_name = "这是一个用于验证下拉框溢出提示的超长分区名称".repeat(4);
+        doc["presets"][&overflow_name] = value("0|0|50sw|50sh");
         std::fs::write(&path, doc.to_string()).unwrap();
         assert!(
             unsafe { FindWindowW(CLASS, null()) }.is_null(),
@@ -6625,7 +6626,7 @@ mod tests {
                     combo,
                     CB_FINDSTRINGEXACT,
                     usize::MAX,
-                    wide("这是一个超过八个汉字的测试分区名称").as_ptr() as isize,
+                    wide(&overflow_name).as_ptr() as isize,
                 );
                 if index < 0 {
                     return Err("Long action label missing".into());
@@ -6757,12 +6758,14 @@ mod tests {
                     PostMessageW(hwnd, WM_COMMAND, (TAB_BASE + 5) as usize, 0);
                 }
                 wait_tab(hwnd, 5)?;
-                unsafe {
-                    PostMessageW(hwnd, WM_COMMAND, AXIS_BOTH as usize, 0);
-                }
-                std::thread::sleep(Duration::from_millis(200));
+                send(hwnd, WM_COMMAND, AXIS_BOTH as usize, 0);
+                wait_tab(hwnd, 5)?;
                 let pane = unsafe { GetDlgItem(hwnd, 2) };
-                let width = unsafe { GetDlgItem(pane, BASE + 2 * STRIDE) };
+                let width_row = schema::fields(5, 0, &Config::parse(&merged)?, &merged)
+                    .iter()
+                    .position(|field| field.section == "horizontal" && field.key == "width")
+                    .ok_or("Horizontal line width missing")?;
+                let width = unsafe { GetDlgItem(pane, BASE + width_row as i32 * STRIDE) };
                 send(width, EM_SETSEL, 0, -1);
                 send(width, EM_REPLACESEL, 1, w!("3") as isize);
                 send(width, WM_CHAR, 13, 0);
@@ -6772,7 +6775,13 @@ mod tests {
                     .map_err(|e| e.to_string())?;
                 let effective = Config::parse(&saved)?;
                 if effective.lines[0].width != 3 || effective.lines[1].width != 3 {
-                    return Err("Unified axis style did not update both lines".into());
+                    return Err(format!(
+                        "Unified axis style did not update both lines: horizontal={}, vertical={}, input={}, status={}",
+                        effective.lines[0].width,
+                        effective.lines[1].width,
+                        caption(width),
+                        caption(unsafe { GetDlgItem(hwnd, 600) })
+                    ));
                 }
                 send(hwnd, WM_COMMAND, AXIS_CUSTOM as usize, 0);
                 let pane = unsafe { GetDlgItem(hwnd, 2) };
@@ -6787,7 +6796,13 @@ mod tests {
                     return Err("Selecting an axis cleared the custom mode".into());
                 }
                 send(hwnd, WM_COMMAND, AXIS_V as usize, 0);
-                let vertical_width = unsafe { GetDlgItem(pane, BASE + 2 * STRIDE) };
+                let mut custom_doc = saved.clone();
+                custom_doc["crosshair"]["mode"] = value("custom");
+                let width_row = schema::fields(5, 1, &Config::parse(&custom_doc)?, &custom_doc)
+                    .iter()
+                    .position(|field| field.section == "vertical" && field.key == "width")
+                    .ok_or("Vertical line width missing")?;
+                let vertical_width = unsafe { GetDlgItem(pane, BASE + width_row as i32 * STRIDE) };
                 send(vertical_width, EM_SETSEL, 0, -1);
                 send(vertical_width, EM_REPLACESEL, 1, w!("7") as isize);
                 send(vertical_width, WM_CHAR, 13, 0);
