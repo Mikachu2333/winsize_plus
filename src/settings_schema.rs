@@ -461,8 +461,8 @@ fn describe(section: &str, key: &str) -> (&'static str, &'static str, &'static s
         _ => (
             "Setting",
             "设置项",
-            "Changes are saved and applied automatically.",
-            "更改后自动保存并应用。",
+            "Text saves on Enter or focus loss; other controls save after confirmation.",
+            "文本按 Enter 或离开后保存；其他控件确认后自动保存。",
         ),
     }
 }
@@ -504,7 +504,7 @@ pub fn fields(tab: usize, axis: usize, cfg: &Config, doc: &DocumentMut) -> Vec<F
         }
     }
     if tab == 0 {
-        fields.push(Field { section: String::new(), key: String::new(), label: cfg.tr("Changes are saved and applied automatically", "更改后自动保存并应用").into(), hint: cfg.tr("Manual file edits take precedence over conflicting GUI edits. To allow an excluded window again, remove its exclusion from the configuration file.", "文件中的手动修改优先于 GUI 的冲突修改。若要重新允许已排除的窗口，请从配置文件中移除对应排除项。").into(), kind: Kind::Note });
+        fields.push(Field { section: String::new(), key: String::new(), label: cfg.tr("Text: Enter or leave to save; other choices save after confirmation", "文本按 Enter 或离开后保存；其他选项确认后自动保存").into(), hint: cfg.tr("Manual file edits take precedence over conflicting GUI edits. To allow an excluded window again, remove its exclusion from the configuration file.", "文件中的手动修改优先于 GUI 的冲突修改。若要重新允许已排除的窗口，请从配置文件中移除对应排除项。").into(), kind: Kind::Note });
         fields.push(Field { section: String::new(), key: String::new(), label: cfg.tr("Open configuration file", "打开配置文件").into(), hint: cfg.tr("Open winsizep_config.toml in Notepad. Windows 10 and 11 system tray overflow menus are excluded by default.", "使用记事本打开 winsizep_config.toml。默认排除 Windows 10 和 11 的系统托盘弹出菜单。").into(), kind: Kind::OpenConfig });
     }
     if tab == 2 {

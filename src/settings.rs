@@ -1321,6 +1321,20 @@ impl Editor {
                 self.control(&mut row, index, 1, "STATIC", &label, SS_LEFT)?;
             }
             self.control(&mut row, index, 2, "STATIC", &hint, SS_LEFT)?;
+            if !matches!(
+                kind,
+                Kind::Note | Kind::Preview | Kind::Add | Kind::OpenConfig
+            ) {
+                self.control(
+                    &mut row,
+                    index,
+                    12,
+                    "STATIC",
+                    self.cfg.tr("Saved", "已保存"),
+                    SS_LEFT,
+                )?;
+                send(row.c(12), WM_SETFONT, self.hint_font.0 as usize, 0);
+            }
             send(row.c(2), WM_SETFONT, self.hint_font.0 as usize, 0);
             match kind {
                 Kind::Bool | Kind::Preview => {
@@ -1879,6 +1893,13 @@ impl Editor {
                 place(row.c(2), padding, y - self.scroll[1], width, hint);
                 y += hint;
             }
+            if !row.c(12).is_null() {
+                let state_height = measured(&caption(row.c(12)), &self.hint_font, width)
+                    .max(self.hint_font.height());
+                y += self.s(2);
+                place(row.c(12), padding, y - self.scroll[1], width, state_height);
+                y += state_height;
+            }
             y += self.s(12);
             if self.tab == 5 && row.field.section == "crosshair" {
                 let axis_height = self
@@ -2173,8 +2194,17 @@ impl Editor {
         if self.dirty.is_empty() {
             return Ok(());
         }
-        let draft = self.collect()?;
-        Config::parse(&draft)?;
+        let draft = match self
+            .collect()
+            .and_then(|draft| Config::parse(&draft).map(|_| draft))
+        {
+            Ok(draft) => draft,
+            Err(error) => {
+                self.mark_edit_error(&error);
+                self.layout()?;
+                return Err(error);
+            }
+        };
         let rebuild = self.dirty.iter().any(|i| {
             self.rows
                 .get(*i)
@@ -2191,6 +2221,17 @@ impl Editor {
         let saved = match config::save_settings(&self.path, &self.original, &draft) {
             Ok(saved) => saved,
             Err(error) => {
+                for &index in &self.dirty {
+                    if let Some(row) = self.rows.get(index) {
+                        set_text(
+                            row.c(12),
+                            self.cfg.tr(
+                                "Not saved: file write failed; see details below",
+                                "未保存：文件写入失败，详见底部提示",
+                            ),
+                        );
+                    }
+                }
                 // The edits themselves are valid, so the file is busy, read-only or was
                 // changed meanwhile. Nothing else would try again: retry until it works
                 // instead of leaving the edits unsaved once the message fades.
@@ -2223,6 +2264,11 @@ impl Editor {
                 }
             }
         }
+        for &index in &self.dirty {
+            if let Some(row) = self.rows.get(index) {
+                set_text(row.c(12), self.cfg.tr("Saved", "已保存"));
+            }
+        }
         self.dirty.clear();
         self.save_error.set(false);
         self.saved_status(self.cfg.tr("Saved", "已保存"), false);
@@ -2237,6 +2283,34 @@ impl Editor {
             }
         }
         Ok(())
+    }
+    fn mark_edit_error(&self, error: &str) {
+        let matches =
+            |row: &Row| error.starts_with(&format!("{}.{}", row.field.section, row.field.key));
+        let found = self
+            .dirty
+            .iter()
+            .filter_map(|i| self.rows.get(*i))
+            .any(matches);
+        for &index in &self.dirty {
+            if let Some(row) = self.rows.get(index) {
+                let state = if !found || matches(row) {
+                    format!(
+                        "{}: {error}",
+                        self.cfg
+                            .tr("Invalid input · Not saved", "输入有误 · 未保存")
+                    )
+                } else {
+                    self.cfg
+                        .tr(
+                            "Not saved · Correct the marked field first",
+                            "未保存 · 请先修正标出的字段",
+                        )
+                        .into()
+                };
+                set_text(row.c(12), &state);
+            }
+        }
     }
     fn update_enabled_controls(&self) {
         let field = |section: &str, key: &str| {
@@ -2879,6 +2953,13 @@ impl Editor {
         };
         if changed {
             self.dirty.insert(index);
+            set_text(
+                self.rows[index].c(12),
+                self.cfg.tr(
+                    "Not saved · Enter or leave text field to save",
+                    "未保存 · 文本按 Enter 或离开后保存",
+                ),
+            );
             // Typed text is saved when its field loses focus or Enter is pressed, so a
             // half-typed number or name never reaches the file. Switches and lists are
             // complete as soon as they change.
@@ -2886,19 +2967,21 @@ impl Editor {
                 self.pending = Some(Instant::now() + Duration::from_millis(450));
             }
             self.update_enabled_controls();
-            if let Ok(draft) = self.collect()
-                && let Ok(cfg) = Config::parse(&draft)
-            {
-                self.apply_config(cfg);
-                if self.tab != 0 && self.tab != 4 {
-                    self.render()?;
-                }
-                if matches!(kind, Kind::Color(_)) {
-                    unsafe {
-                        InvalidateRect(self.rows[index].c(0), null(), 1);
+            match self.collect().and_then(|draft| Config::parse(&draft)) {
+                Ok(cfg) => {
+                    self.apply_config(cfg);
+                    if self.tab != 0 && self.tab != 4 {
+                        self.render()?;
+                    }
+                    if matches!(kind, Kind::Color(_)) {
+                        unsafe {
+                            InvalidateRect(self.rows[index].c(0), null(), 1);
+                        }
                     }
                 }
+                Err(error) => self.mark_edit_error(&error),
             }
+            self.layout()?;
         }
         Ok(())
     }
@@ -5088,6 +5171,32 @@ mod tests {
             ReleaseDC(hwnd, dc);
             pixels
         }
+    }
+
+    #[test]
+    #[ignore = "edits an isolated setting and verifies inline draft, error and saved feedback"]
+    fn inline_edit_status_tracks_validity_and_persistence() {
+        let mut editor = test_editor(5, "inline-status-test");
+        editor.cfg.zh = true;
+        let index = editor
+            .rows
+            .iter()
+            .position(|r| r.field.section == "crosshair" && r.field.key == "fps")
+            .unwrap();
+        let edit = editor.rows[index].c(0);
+        let state = editor.rows[index].c(12);
+        let id = BASE + index as i32 * STRIDE;
+        set_text(edit, "invalid");
+        editor.command(id, EN_CHANGE, edit).unwrap();
+        assert!(caption(state).contains("未保存"));
+        assert!(caption(state).contains("输入有误"));
+        assert!(editor.save().is_err());
+        set_text(edit, "60");
+        editor.command(id, EN_CHANGE, edit).unwrap();
+        assert!(caption(state).contains("Not saved") || caption(state).contains("未保存"));
+        editor.save().unwrap();
+        assert!(caption(state) == "Saved" || caption(state) == "已保存");
+        assert_eq!(config::load(&editor.path, None).unwrap().fps, 60.0);
     }
 
     #[test]
