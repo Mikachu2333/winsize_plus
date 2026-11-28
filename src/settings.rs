@@ -1132,7 +1132,7 @@ impl Editor {
         let style = if is_edit && id != SEARCH_EDIT {
             style | ES_MULTILINE as u32 | ES_AUTOVSCROLL as u32
         } else if is_combo {
-            style | CBS_OWNERDRAWFIXED as u32 | CBS_HASSTRINGS as u32
+            (style & !3) | CBS_DROPDOWN as u32 | CBS_OWNERDRAWFIXED as u32 | CBS_HASSTRINGS as u32
         } else {
             style
         };
@@ -1166,6 +1166,7 @@ impl Editor {
                 self.window.0 as usize,
             ))?;
             if is_combo {
+                crate::settings_combo::attach(hwnd);
                 desktop::check(SetPropW(hwnd, w!("SettingsCombo"), 1usize as HANDLE))?;
                 let mut info = COMBOBOXINFO {
                     cbSize: size_of::<COMBOBOXINFO>() as u32,
@@ -2022,9 +2023,9 @@ impl Editor {
         Ok(())
     }
     fn selected_value(row: &Row, slot: usize) -> String {
-        let i = send(row.c(slot), CB_GETCURSEL, 0, 0);
+        let i = crate::settings_combo::selected_index(row.c(slot));
         row.options
-            .get(i as usize)
+            .get(i.unwrap_or(usize::MAX))
             .map(|v| v.0.clone())
             .unwrap_or_default()
     }
@@ -2649,6 +2650,9 @@ impl Editor {
         Ok(())
     }
     fn command(&mut self, id: i32, event: u32, sender: HWND) -> Result<(), String> {
+        if crate::settings_combo::notification(sender, event) {
+            return Ok(());
+        }
         if id == SEARCH_FRAME && event == STN_CLICKED {
             unsafe {
                 SetFocus(self.search.edit);
@@ -3017,7 +3021,8 @@ impl Editor {
         } else {
             item
         };
-        let Some((_, label)) = row.options.get(selected as usize) else {
+        let original = crate::settings_combo::original_index(control, selected);
+        let Some((_, label)) = row.options.get(original.unwrap_or(usize::MAX)) else {
             self.tooltip.hide();
             return;
         };
@@ -3063,17 +3068,9 @@ impl Editor {
     }
 }
 fn populate(hwnd: HWND, options: &[(String, String)], selected: &str, height: i32) {
-    send(hwnd, WM_SETREDRAW, 0, 0);
-    send(hwnd, CB_RESETCONTENT, 0, 0);
-    for (i, (value, label)) in options.iter().enumerate() {
-        send(hwnd, CB_ADDSTRING, 0, wide(label).as_ptr() as isize);
-        if value.eq_ignore_ascii_case(selected) {
-            send(hwnd, CB_SETCURSEL, i, 0);
-        }
-    }
+    crate::settings_combo::populate(hwnd, options, selected);
     send(hwnd, CB_SETITEMHEIGHT, usize::MAX, height as isize);
     send(hwnd, CB_SETITEMHEIGHT, 0, height as isize);
-    send(hwnd, WM_SETREDRAW, 1, 0);
 }
 fn rename_entry(table: &mut toml_edit::Table, old: &str, new: &str) {
     let order: HashMap<_, _> = table
@@ -3489,6 +3486,11 @@ unsafe extern "system" fn pane_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: LP
         match message {
             WM_COMMAND => {
                 if !UPDATING.with(Cell::get) {
+                    // Commit item identity before CLOSEUP restores the full list.
+                    // Combo notifications are synchronous; the editor runs later.
+                    if crate::settings_combo::notification(lp as HWND, (wp >> 16) as u32) {
+                        return 0;
+                    }
                     PostMessageW(root, WM_COMMAND, wp, lp);
                 }
                 0
@@ -4987,6 +4989,29 @@ mod tests {
             ReleaseDC(hwnd, dc);
             pixels
         }
+    }
+
+    #[test]
+    #[ignore = "uses actual settings combos to verify filtering does not edit bindings until selection"]
+    fn searchable_action_combo_saves_original_filtered_region() {
+        let mut editor = test_editor(4, "settings-combo-filter");
+        let index = editor
+            .rows
+            .iter()
+            .position(|r| r.field.section == "keys" && r.field.key == "Q")
+            .unwrap();
+        let combo = editor.rows[index].c(0);
+        let id = BASE + index as i32 * STRIDE;
+        let options = editor.rows[index].options.clone();
+        let selected = options.iter().position(|(v, _)| v == "4/4").unwrap();
+        set_text(combo, "4/4");
+        editor.command(id, CBN_EDITCHANGE, combo).unwrap();
+        assert_eq!(send(combo, CB_GETCOUNT, 0, 0), 1);
+        assert_eq!(Editor::selected_value(&editor.rows[index], 0), "1/9");
+        send(combo, CB_SETCURSEL, 0, 0);
+        editor.command(id, CBN_SELCHANGE, combo).unwrap();
+        assert_eq!(crate::settings_combo::selected_index(combo), Some(selected));
+        assert_eq!(editor.collect().unwrap()["keys"]["Q"].as_str(), Some("4/4"));
     }
 
     #[test]

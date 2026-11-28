@@ -119,7 +119,10 @@ pub fn draw(root: HWND, draw: &DRAWITEMSTRUCT) {
                         label.as_mut_ptr() as isize,
                     );
                     if !GetPropW(draw.hwndItem, w!("FontPicker")).is_null() {
-                        let family = if draw.itemID == 0 {
+                        let family = if draw.CtlType == ODT_COMBOBOX
+                            && SendMessageW(draw.hwndItem, CB_GETITEMDATA, draw.itemID as usize, 0)
+                                == 0
+                        {
                             "SystemFont".into()
                         } else {
                             String::from_utf16_lossy(&label[..length as usize])
