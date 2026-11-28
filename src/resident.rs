@@ -140,11 +140,46 @@ impl App {
                 })
             });
             let seconds = remaining.as_millis().div_ceil(1000).max(1);
-            if self.cfg.zh {
-                format!("已选 {count} 个分区 · Enter 确认 · Esc 取消 · {seconds} 秒后应用")
+            let mut text = if self.cfg.zh {
+                format!("已选 {count} 个分区 · Enter 确认 · Esc 取消")
             } else {
-                format!("{count} selected · Enter to apply · Esc to cancel · Apply in {seconds}s")
+                format!("{count} selected · Enter to apply · Esc to cancel")
+            };
+            if self.selection_suspended.is_some() {
+                text.push_str(self.cfg.tr(
+                    " · Timer paused; release to continue",
+                    " · 计时已暂停，松开后继续",
+                ));
+            } else {
+                text.push_str(&if self.cfg.zh {
+                    format!(" · {seconds} 秒后应用")
+                } else {
+                    format!(" · Apply in {seconds}s")
+                });
             }
+            if self.cfg.mouse_enabled {
+                let mut help = Vec::new();
+                if self.cfg.add_button.is_some() {
+                    help.push(format!(
+                        "{} {}",
+                        self.cfg.button_name(self.cfg.add_button),
+                        self.cfg.tr("toggles a region", "添加／取消分区")
+                    ));
+                }
+                if self.cfg.apply_button.is_some() {
+                    help.push(format!(
+                        "{} {}",
+                        self.cfg.button_name(self.cfg.apply_button),
+                        self.cfg
+                            .tr("applies only the hovered region", "仅应用悬停分区")
+                    ));
+                }
+                if !help.is_empty() {
+                    text.push('\n');
+                    text.push_str(&help.join(" · "));
+                }
+            }
+            text
         };
         if text != self.selection_hint {
             self.overlay.tip(&text, &self.cfg)?;
@@ -817,13 +852,13 @@ impl App {
                     .preview_until
                     .take()
                     .map(|end| end.saturating_duration_since(occurred));
-                Ok(())
+                self.selection_tip()
             }
             input::POINTER_UP => {
                 if let Some(remaining) = self.selection_suspended.take() {
                     self.preview_until = Some(occurred + remaining);
                 }
-                Ok(())
+                self.selection_tip()
             }
             input::DRAG_START => {
                 let drag = desktop::Drag::start(
@@ -1232,6 +1267,44 @@ mod tests {
         app.act("pause").unwrap();
         assert!(!app.paused);
         assert_eq!(app.overlay.tip_text(), "开始捕获");
+    }
+
+    #[test]
+    #[ignore = "checks selection hints while pausing and resuming the apply timer"]
+    fn selection_hints_explain_paused_timer_and_click_actions() {
+        let _hooks = input::Hooks::start(&crate::test_support::cfg()).unwrap();
+        let mut app = test_app();
+        app.cfg.zh = true;
+        app.begin_alt_preview(unsafe { GetForegroundWindow() }, false)
+            .unwrap();
+        app.preview
+            .toggle(
+                "1/4".into(),
+                crate::layout::Rect {
+                    x: 0,
+                    y: 0,
+                    width: 300,
+                    height: 200,
+                },
+                &app.cfg,
+            )
+            .unwrap();
+        app.preview_until = Some(later(3000));
+        app.handle_event(MSG {
+            message: input::POINTER_DOWN,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(app.overlay.tip_text().contains("计时已暂停"));
+        assert!(!app.overlay.tip_text().contains("秒后应用"));
+        assert!(app.overlay.tip_text().contains("添加／取消"));
+        assert!(app.overlay.tip_text().contains("仅应用悬停"));
+        app.handle_event(MSG {
+            message: input::POINTER_UP,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(app.overlay.tip_text().contains("秒后应用"));
     }
 
     #[test]
