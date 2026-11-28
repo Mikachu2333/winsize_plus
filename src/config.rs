@@ -124,6 +124,13 @@ pub fn vk(text: &str) -> Option<u32> {
         return Some(text.as_bytes()[0].to_ascii_uppercase() as u32);
     }
     if let Some(number) = text
+        .strip_prefix("numpad")
+        .and_then(|n| n.parse::<u32>().ok())
+        .filter(|n| *n <= 9)
+    {
+        return Some(0x60 + number);
+    }
+    if let Some(number) = text
         .strip_prefix('f')
         .and_then(|number| number.parse::<u32>().ok())
         .filter(|number| (1..=24).contains(number))
@@ -274,6 +281,7 @@ fn key_name(key: u32) -> String {
         0xbe => ".".into(),
         0xbf => "/".into(),
         0x70..=0x87 => format!("F{}", key - 0x6f),
+        0x60..=0x69 => format!("Numpad{}", key - 0x60),
         0x30..=0x39 | 0x41..=0x5a => char::from_u32(key).unwrap().to_string(),
         _ => format!("VK:{key:02X}"),
     }
@@ -1119,7 +1127,65 @@ fn document(text: &str) -> Result<(DocumentMut, bool), String> {
     }
 }
 
+fn migrate_default_regions(doc: &mut DocumentMut) {
+    let old = [
+        ("LeftTop", "0|0|50sw|50sh"),
+        ("FullTop", "0|0|100sw|50sh"),
+        ("RightTop", "50sw|0|50sw|50sh"),
+        ("FullLeft", "0|0|50sw|100sh"),
+        ("Center", "10sw|10sh|80sw|80sh"),
+        ("FullRight", "50sw|0|50sw|100sh"),
+        ("LeftBottom", "0|50sh|50sw|50sh"),
+        ("FullBottom", "0|50sh|100sw|50sh"),
+        ("RightBottom", "50sw|50sh|50sw|50sh"),
+    ];
+    let defaults: DocumentMut = help().parse().expect("valid default config");
+    let Some(presets) = doc.get_mut("presets").and_then(Item::as_table_mut) else {
+        return;
+    };
+    if !old
+        .iter()
+        .all(|(name, text)| presets.get(name).and_then(Item::as_str) == Some(*text))
+        || defaults["presets"]
+            .as_table()
+            .unwrap()
+            .iter()
+            .any(|(name, _)| presets.contains_key(name))
+    {
+        return;
+    }
+    for (name, _) in old {
+        presets.remove(name);
+    }
+    for (name, layout) in defaults["presets"].as_table().unwrap() {
+        presets.insert(name, layout.clone());
+    }
+    for section in ["keys", "commands"] {
+        if let Some(table) = doc.get_mut(section).and_then(Item::as_table_mut) {
+            for (_, item) in table.iter_mut() {
+                if let Some(index) = item.as_str().and_then(|text| {
+                    old.iter()
+                        .position(|(name, _)| name.eq_ignore_ascii_case(text))
+                }) {
+                    assign(item, value(format!("{}/9", index + 1)));
+                }
+            }
+        }
+    }
+    if let Some(keys) = doc.get_mut("keys").and_then(Item::as_table_mut)
+        && !keys.is_empty()
+    {
+        for n in 1..=4 {
+            let key = n.to_string();
+            if !keys.iter().any(|(existing, _)| vk(existing) == vk(&key)) {
+                keys.insert(&key, value(format!("{n}/4")));
+            }
+        }
+    }
+}
+
 fn migrate(doc: &mut DocumentMut) -> Result<(), String> {
+    migrate_default_regions(doc);
     // Fixed grid mappings no longer participate in input; keep their region definitions.
     doc.as_table_mut().remove("grid");
     if doc
@@ -1386,7 +1452,7 @@ fn recover(doc: &mut DocumentMut) -> Result<Config, String> {
                     && doc[section][key]
                         .as_str()
                         .is_none_or(|text| text.parse::<Layout>().is_err())
-                    && let Some(fallback) = defaults.get("presets").and_then(|s| s.get("Center"))
+                    && let Some(fallback) = defaults.get("presets").and_then(|s| s.get("5/9"))
                 {
                     // A custom region has no default of its own. Keep its name, and with it
                     // every binding that refers to it, and substitute the centered region.
@@ -1787,6 +1853,78 @@ fn load_snapshot_inner(path: &Path, edit: Option<(&Identity, Switch)>) -> Result
 #[cfg(test)]
 mod tests {
     #[test]
+    fn default_regions_tile_odd_work_areas_and_use_only_top_row_digits() {
+        let cfg = crate::test_support::cfg();
+        let area = crate::layout::Rect {
+            x: -1921,
+            y: -81,
+            width: 1921,
+            height: 1081,
+        };
+        for divisor in [2, 3] {
+            let mut total = 0;
+            for row in 0..divisor {
+                let mut right = area.x;
+                for column in 0..divisor {
+                    let n = row * divisor + column + 1;
+                    let name = format!("{n}/{}", divisor * divisor);
+                    let rect = cfg.presets[&name].resolve(area, area, area).unwrap();
+                    assert_eq!(rect.x, right);
+                    right = rect.x + rect.width;
+                    total += rect.width * rect.height;
+                    if row + 1 == divisor {
+                        assert_eq!(rect.y + rect.height, area.y + area.height);
+                    }
+                }
+                assert_eq!(right, area.x + area.width);
+            }
+            assert_eq!(total, area.width * area.height);
+        }
+        for n in 1..=4 {
+            assert_eq!(cfg.keys.get(&(0x30 + n)), Some(&format!("{n}/4")));
+            assert!(!cfg.keys.contains_key(&(0x60 + n)));
+            assert_eq!(vk(&format!("Numpad{n}")), Some(0x60 + n));
+        }
+    }
+
+    #[test]
+    fn legacy_default_region_migration_preserves_customizations_and_numeric_bindings() {
+        let legacy = r#"
+[presets]
+LeftTop = "0|0|50sw|50sh"
+FullTop = "0|0|100sw|50sh"
+RightTop = "50sw|0|50sw|50sh"
+FullLeft = "0|0|50sw|100sh"
+Center = "10sw|10sh|80sw|80sh"
+FullRight = "50sw|0|50sw|100sh"
+LeftBottom = "0|50sh|50sw|50sh"
+FullBottom = "0|50sh|100sw|50sh"
+RightBottom = "50sw|50sh|50sw|50sh"
+Custom = "10|20|300|400"
+[keys]
+Q = "LeftTop"
+"VK:31" = "Help"
+[commands]
+My = "Center"
+"#;
+        let mut doc: DocumentMut = legacy.parse().unwrap();
+        let mut custom = doc.clone();
+        custom["presets"]["LeftTop"] = value("1|2|300|400");
+        let before = custom.to_string();
+        migrate_default_regions(&mut custom);
+        assert_eq!(custom.to_string(), before);
+        migrate_default_regions(&mut doc);
+        assert_eq!(doc["presets"]["Custom"].as_str(), Some("10|20|300|400"));
+        assert_eq!(doc["keys"]["Q"].as_str(), Some("1/9"));
+        assert_eq!(doc["keys"]["VK:31"].as_str(), Some("Help"));
+        assert!(doc["keys"].get("1").is_none());
+        assert_eq!(doc["keys"]["2"].as_str(), Some("2/4"));
+        assert_eq!(doc["commands"]["My"].as_str(), Some("5/9"));
+        let after = doc.to_string();
+        migrate_default_regions(&mut doc);
+        assert_eq!(doc.to_string(), after);
+    }
+    #[test]
     fn topmost_marker_defaults_preserve_old_configs_and_validate_choices() {
         let mut doc = help().parse::<DocumentMut>().unwrap();
         doc.as_table_mut().remove("topmost_marker");
@@ -2035,6 +2173,7 @@ mod tests {
     fn region_captions_follow_case_insensitive_user_bindings() {
         let mut doc = help().parse::<DocumentMut>().unwrap();
         doc["keys"] = Item::Table(Table::new());
+        doc["presets"]["FullTop"] = value("0|0|100sw|50sh");
         doc["keys"]["w"] = value("fUlLtOp");
         doc["shortcuts"]["alt"] = value("LEFT");
         doc["shortcuts"]["gesture"] = value("Both");
@@ -2053,16 +2192,16 @@ mod tests {
             "W"
         );
         assert_eq!(cfg.region_caption("FULLTOP"), "FullTop\n[ W ]");
-        assert_eq!(cfg.region_caption("center"), "Center");
+        assert_eq!(cfg.region_caption("5/9"), "5/9");
         assert_eq!(shortcut_name("iNsErT"), "Insert");
         assert_eq!(shortcut_name("f12"), "F12");
         assert_eq!(shortcut_name("vk:57"), "W");
         doc["keys"].as_table_mut().unwrap().remove("w");
         doc["keys"]["f12"] = value("FULLTOP");
-        doc["keys"]["insert"] = value("fulltop");
+        doc["keys"]["insert"] = value("FullTop");
         let cfg = Config::parse(&doc).unwrap();
-        assert_eq!(cfg.region_caption("fulltop"), "FullTop\n[ Insert ] [ F12 ]");
-        doc["keys"]["F12"] = value("Center");
+        assert_eq!(cfg.region_caption("FullTop"), "FullTop\n[ Insert ] [ F12 ]");
+        doc["keys"]["F12"] = value("5/9");
         assert!(Config::parse(&doc).is_err());
     }
     #[test]
@@ -2160,9 +2299,9 @@ mod tests {
         let text = Config::parse(&doc).unwrap().help_text();
         assert!(
             text.contains(concat!(
-                "Q\tW\tE\t\tLeftTop\tFullTop\tRightTop\n",
-                "A\tS\tD\t->\tFullLeft\tCenter\tFullRight\n",
-                "Z\tX\tC\t\tLeftBottom\tFullBottom\tRightBottom\n\n",
+                "Q\tW\tE\t\t\t1/9\t2/9\t3/9\n",
+                "A\tS\tD\t\t->\t4/9\t5/9\t6/9\n",
+                "Z\tX\tC\t\t\t7/9\t8/9\t9/9\n\n",
                 "L toggle crosshair;  = both axes;  \\ vertical;  - horizontal\n",
                 "Alt + M = mouse annotations;  Alt + K = keyboard annotations\n\n",
             )),
@@ -2214,7 +2353,7 @@ mod tests {
         for key in [
             "F12", "F2", "0", "1", "Grave", "Equal", "P", "Q", "Quote", "A", "Slash", "Z", "Insert",
         ] {
-            doc["keys"][key] = value("Center");
+            doc["keys"][key] = value("5/9");
         }
         let text = Config::parse(&doc).unwrap().help_text();
         let rows: Vec<_> = text.lines().filter(|line| line.contains('\t')).collect();
@@ -2225,7 +2364,7 @@ mod tests {
         {
             assert!(row.starts_with(expected), "{row}");
         }
-        assert_eq!(text.matches("Alt + Insert = Center").count(), 1);
+        assert_eq!(text.matches("Alt + Insert = 5/9").count(), 1);
         doc["keys"] = Item::Table(Table::new());
         assert!(!Config::parse(&doc).unwrap().help_text().contains('\t'));
     }
@@ -2246,9 +2385,9 @@ mod tests {
             .collect();
         assert_eq!(rows.len(), 3);
         for names in [
-            ["左上角区域名称", "FullLeft", "LeftBottom"],
-            ["FullTop", "Center", "FullBottom"],
-            ["RightTop", "FullRight", "RightBottom"],
+            ["左上角区域名称", "4/9", "7/9"],
+            ["2/9", "5/9", "8/9"],
+            ["3/9", "6/9", "9/9"],
         ] {
             let starts: Vec<_> = rows
                 .iter()
@@ -2294,7 +2433,7 @@ mod tests {
         for (key, target) in [
             ("Help", "Quit"),
             ("Pin", "Quit"),
-            ("LeftTop", "Help"),
+            ("1/9", "Help"),
             ("reboot", "Restart"),
             (" G ", "Help"),
         ] {
@@ -2307,15 +2446,15 @@ mod tests {
         }
         let mut doc = help().parse::<DocumentMut>().unwrap();
         doc["commands"]["Help"] = value("Help");
-        doc["commands"][" My Command "] = value("Center");
+        doc["commands"][" My Command "] = value("5/9");
         let cfg = Config::parse(&doc).unwrap();
-        assert_eq!(cfg.action("MY COMMAND"), "center");
+        assert_eq!(cfg.action("MY COMMAND"), "5/9");
         assert_eq!(cfg.action("Pin"), "top");
     }
     #[test]
     fn normalized_names_and_disabled_key_aliases_cannot_hide_duplicates() {
         let mut doc = help().parse::<DocumentMut>().unwrap();
-        doc["presets"][" Ｃｅｎｔｅｒ "] = value("0|0|100|100");
+        doc["presets"][" ５/９ "] = value("0|0|100|100");
         assert!(
             Config::parse(&doc)
                 .err()
@@ -2324,7 +2463,7 @@ mod tests {
         );
         let mut doc = help().parse::<DocumentMut>().unwrap();
         doc["keys"]["Q"] = value("");
-        doc["keys"]["VK:51"] = value("Center");
+        doc["keys"]["VK:51"] = value("5/9");
         assert!(Config::parse(&doc).err().unwrap().contains("duplicate key"));
         let mut doc = help().parse::<DocumentMut>().unwrap();
         doc["presets"]["大区域"] = value("0|0|100|100");
@@ -2525,10 +2664,10 @@ mod tests {
     }
     #[test]
     fn merging_renames_preserves_positions_and_manual_order() {
-        let base = "[keys]\nQ='LeftTop'\nG='Guide'\nH='Help'\n"
+        let base = "[keys]\nQ='1/9'\nG='Guide'\nH='Help'\n"
             .parse::<DocumentMut>()
             .unwrap();
-        let draft = "[keys]\nQ='LeftTop'\nF12='Guide'\nH='Help'\n"
+        let draft = "[keys]\nQ='1/9'\nF12='Guide'\nH='Help'\n"
             .parse::<DocumentMut>()
             .unwrap();
         let mut disk = base.clone();
@@ -2542,11 +2681,11 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["Q", "F12", "H"]
         );
-        let mut reordered = "[keys]\nH='Help'\nG='Guide'\nQ='LeftTop'\n"
+        let mut reordered = "[keys]\nH='Help'\nG='Guide'\nQ='1/9'\n"
             .parse::<DocumentMut>()
             .unwrap();
         let mut draft = base.clone();
-        draft["keys"]["Q"] = value("Center");
+        draft["keys"]["Q"] = value("5/9");
         merge_edits(base.as_table(), draft.as_table(), reordered.as_table_mut());
         assert_eq!(
             reordered["keys"]
@@ -2562,11 +2701,11 @@ mod tests {
     #[test]
     fn removed_presets_are_not_readded_and_escape_is_reserved() {
         let mut doc = help().parse::<DocumentMut>().unwrap();
-        doc["presets"].as_table_mut().unwrap().remove("Center");
+        doc["presets"].as_table_mut().unwrap().remove("5/9");
         doc["keys"]["Esc"] = value("Help");
         doc["presets"]["Escape"] = value("0|0|100sw|100sh");
         let cfg = recover(&mut doc).unwrap();
-        assert!(!cfg.presets.contains_key("center"));
+        assert!(!cfg.presets.contains_key("5/9"));
         assert!(!cfg.presets.contains_key("escape"));
         assert!(!cfg.keys.contains_key(&27));
         assert_eq!(vk("vk:1B"), None);
@@ -2579,7 +2718,7 @@ mod tests {
         doc["keys"]["F9"] = value("My Region");
         let cfg = recover(&mut doc).unwrap();
         // The broken region keeps its name and bindings and takes the centered default.
-        assert!(cfg.presets["my region"] == cfg.presets["center"]);
+        assert!(cfg.presets["my region"] == cfg.presets["5/9"]);
         assert_eq!(doc["keys"]["F9"].as_str(), Some("My Region"));
         assert_eq!(doc["keys"]["P"].as_str(), Some("Top"));
         assert_eq!(cfg.warnings, ["presets.My Region"]);

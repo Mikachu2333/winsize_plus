@@ -4664,7 +4664,7 @@ mod tests {
         let index = editor
             .rows
             .iter()
-            .position(|row| row.field.section == "presets" && row.field.key == "Center")
+            .position(|row| row.field.section == "presets" && row.field.key == "5/9")
             .unwrap();
         let focused = editor.rows[index].c(0);
         set_text(focused, "20sw|20sh|60sw|60sh");
@@ -4675,19 +4675,19 @@ mod tests {
         }
         send(focused, EM_SETSEL, 2, 5);
         let mut disk = editor.doc.clone();
-        disk["presets"].as_table_mut().unwrap().remove("LeftTop");
+        disk["presets"].as_table_mut().unwrap().remove("1/9");
         std::fs::write(&editor.path, disk.to_string()).unwrap();
         editor.save().unwrap();
         assert!(
             !editor
                 .rows
                 .iter()
-                .any(|row| row.field.section == "presets" && row.field.key == "LeftTop")
+                .any(|row| row.field.section == "presets" && row.field.key == "1/9")
         );
         let center = editor
             .rows
             .iter()
-            .find(|row| row.field.section == "presets" && row.field.key == "Center")
+            .find(|row| row.field.section == "presets" && row.field.key == "5/9")
             .unwrap();
         assert_eq!(unsafe { GetFocus() }, center.c(0));
         assert_eq!(send(center.c(0), EM_GETSEL, 0, 0), 2 | (5 << 16));
@@ -4838,7 +4838,7 @@ mod tests {
     }
     #[test]
     fn renamed_mapping_keeps_its_position() {
-        let mut doc = "[keys]\nQ='LeftTop'\nG='Guide'\nH='Help'\n"
+        let mut doc = "[keys]\nQ='1/9'\nG='Guide'\nH='Help'\n"
             .parse::<DocumentMut>()
             .unwrap();
         rename_entry(doc["keys"].as_table_mut().unwrap(), "G", "F12");

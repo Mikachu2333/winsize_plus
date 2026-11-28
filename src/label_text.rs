@@ -405,7 +405,7 @@ mod tests {
         let mut cfg = crate::test_support::cfg();
         cfg.region_font = "Arial".into();
         for dpi in [96, 144, 192] {
-            let image = render(&cfg.region_caption("FullTop"), 600, dpi, 0xffffff, &cfg).unwrap();
+            let image = render(&cfg.region_caption("2/9"), 600, dpi, 0xffffff, &cfg).unwrap();
             let mut bands = Vec::new();
             let mut bounds: Option<(usize, usize)> = None;
             for row in pixels(&image).chunks_exact(image.width as usize) {

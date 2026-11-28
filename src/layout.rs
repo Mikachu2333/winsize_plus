@@ -112,18 +112,33 @@ impl Layout {
                 .iter()
                 .map(|(factor, unit)| factor * f64::from(factors[*unit]) / 100.0)
                 .sum::<f64>()
-                .round()
                 + f64::from(offset);
             if !(f64::from(i32::MIN)..=f64::from(i32::MAX)).contains(&value) {
                 return Err("coordinate overflow / 坐标越界".to_owned());
             }
-            Ok(value as i32)
+            Ok(value)
         };
+        let x = eval(0, origin.x)?;
+        let y = eval(1, origin.y)?;
+        // Round shared edges, not each cell's width independently: thirds then
+        // partition odd-sized work areas without gaps or overlapping pixels.
+        let right = x + eval(2, 0)?;
+        let bottom = y + eval(3, 0)?;
+        if ![right, bottom]
+            .iter()
+            .all(|v| (f64::from(i32::MIN)..=f64::from(i32::MAX)).contains(v))
+        {
+            return Err("coordinate overflow / 坐标越界".into());
+        }
         let rect = Rect {
-            x: eval(0, origin.x)?,
-            y: eval(1, origin.y)?,
-            width: eval(2, 0)?,
-            height: eval(3, 0)?,
+            x: x.round() as i32,
+            y: y.round() as i32,
+            width: (right.round() as i32)
+                .checked_sub(x.round() as i32)
+                .ok_or("coordinate overflow")?,
+            height: (bottom.round() as i32)
+                .checked_sub(y.round() as i32)
+                .ok_or("coordinate overflow")?,
         };
         if rect.width <= 0
             || rect.height <= 0

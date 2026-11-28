@@ -598,7 +598,7 @@ mod tests {
         ] {
             assert!(matches(&index, query, tab, section, key), "{query}");
         }
-        assert!(matches(&index, "Q", 2, "presets", "LeftTop"));
+        assert!(matches(&index, "Q", 2, "presets", "1/9"));
         assert!(
             matches!(&index.entries[index.find("准星")[0]].target, Target::Field { section, key, .. } if section == "crosshair" && key == "fps")
         );
@@ -634,7 +634,7 @@ mod tests {
             "Fallback Font",
         ]));
         doc["keys"]["Q"] = toml_edit::value("quit");
-        doc["keys"]["T"] = toml_edit::value("LeftTop");
+        doc["keys"]["T"] = toml_edit::value("1/9");
         let index = Index::build(&doc).unwrap();
         assert!(matches(&index, "x2", 6, "selection", "apply_button"));
         assert!(!matches(&index, "right", 6, "selection", "apply_button"));

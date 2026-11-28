@@ -1526,7 +1526,7 @@ mod tests {
                     || desktop::apply(
                         hwnd,
                         &Request {
-                            preset: Some("center".into()),
+                            preset: Some("5/9".into()),
                             ..Default::default()
                         },
                         &app.cfg,
