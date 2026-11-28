@@ -1178,25 +1178,29 @@ fn migrate_default_regions(doc: &mut DocumentMut) {
         ("RightBottom", "50sw|50sh|50sw|50sh"),
     ];
     let defaults: DocumentMut = help().parse().expect("valid default config");
+    // This migration replaces only the historical grid. Later default additions
+    // such as center belong in new files, not in existing user maps.
+    let numbered_regions: Vec<_> = (1..=9)
+        .map(|n| format!("{n}/9"))
+        .chain((1..=4).map(|n| format!("{n}/4")))
+        .collect();
     let Some(presets) = doc.get_mut("presets").and_then(Item::as_table_mut) else {
         return;
     };
     if !old
         .iter()
         .all(|(name, text)| presets.get(name).and_then(Item::as_str) == Some(*text))
-        || defaults["presets"]
-            .as_table()
-            .unwrap()
+        || numbered_regions
             .iter()
-            .any(|(name, _)| presets.contains_key(name))
+            .any(|name| presets.contains_key(name))
     {
         return;
     }
     for (name, _) in old {
         presets.remove(name);
     }
-    for (name, layout) in defaults["presets"].as_table().unwrap() {
-        presets.insert(name, layout.clone());
+    for name in &numbered_regions {
+        presets.insert(name, defaults["presets"][name].clone());
     }
     for section in ["keys", "commands"] {
         if let Some(table) = doc.get_mut(section).and_then(Item::as_table_mut) {
@@ -2032,6 +2036,11 @@ mod tests {
             assert!(!cfg.keys.contains_key(&(0x60 + n)));
             assert_eq!(vk(&format!("Numpad{n}")), Some(0x60 + n));
         }
+        assert_eq!(cfg.keys.get(&0x47).map(String::as_str), Some("center"));
+        let center = cfg.preset("G").unwrap().resolve(area, area, area).unwrap();
+        assert_eq!((center.width, center.height), (1537, 865));
+        assert!((center.x * 2 + center.width - (area.x * 2 + area.width)).abs() <= 1);
+        assert!((center.y * 2 + center.height - (area.y * 2 + area.height)).abs() <= 1);
     }
 
     #[test]
@@ -2067,6 +2076,8 @@ My = "Center"
         assert!(doc["keys"].get("1").is_none());
         assert_eq!(doc["keys"]["2"].as_str(), Some("2/4"));
         assert_eq!(doc["commands"]["My"].as_str(), Some("5/9"));
+        assert!(doc["presets"].get("center").is_none());
+        assert!(doc["keys"].get("G").is_none());
         let after = doc.to_string();
         migrate_default_regions(&mut doc);
         assert_eq!(doc.to_string(), after);
@@ -2447,7 +2458,7 @@ My = "Center"
         assert!(
             text.contains(concat!(
                 "Q\tW\tE\t\t\t1/9\t2/9\t3/9\n",
-                "A\tS\tD\t\t->\t4/9\t5/9\t6/9\n",
+                "A\tS\tD\tG\t->\t4/9\t5/9\t6/9\tcenter\n",
                 "Z\tX\tC\t\t\t7/9\t8/9\t9/9\n\n",
                 "L toggle crosshair;  = both axes;  \\ vertical;  - horizontal\n",
                 "Alt + M = mouse annotations;  Alt + K = keyboard annotations\n\n",
@@ -2714,7 +2725,7 @@ My = "Center"
         let mut doc = help().parse::<DocumentMut>().unwrap();
         assert_eq!(Config::parse(&doc).unwrap().font_size, 12);
         assert_eq!(doc["keys"]["L"].as_str(), Some("Guide"));
-        assert!(doc["keys"].get("G").is_none());
+        assert_eq!(doc["keys"]["G"].as_str(), Some("center"));
         assert!(doc["commands"].get("ASDF").is_none());
         doc["outline"]
             .as_table_mut()
@@ -2849,10 +2860,15 @@ My = "Center"
     fn removed_presets_are_not_readded_and_escape_is_reserved() {
         let mut doc = help().parse::<DocumentMut>().unwrap();
         doc["presets"].as_table_mut().unwrap().remove("5/9");
+        doc["presets"].as_table_mut().unwrap().remove("center");
+        doc["keys"].as_table_mut().unwrap().remove("G");
         doc["keys"]["Esc"] = value("Help");
         doc["presets"]["Escape"] = value("0|0|100sw|100sh");
+        migrate(&mut doc).unwrap();
         let cfg = recover(&mut doc).unwrap();
         assert!(!cfg.presets.contains_key("5/9"));
+        assert!(!cfg.presets.contains_key("center"));
+        assert!(!cfg.keys.contains_key(&0x47));
         assert!(!cfg.presets.contains_key("escape"));
         assert!(!cfg.keys.contains_key(&27));
         assert_eq!(vk("vk:1B"), None);

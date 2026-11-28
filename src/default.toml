@@ -98,6 +98,7 @@ font_size = 18
 "2/4" = "50sw|0sh|50sw|50sh"
 "3/4" = "0sw|50sh|50sw|50sh"
 "4/4" = "50sw|50sh|50sw|50sh"
+center = "10sw|10sh|80sw|80sh"
 
 # Hold Alt for general.alt_hold_ms then press a key, or double-tap Alt then key.
 # Empty values disable bindings.
@@ -117,6 +118,7 @@ D = "6/9"
 Z = "7/9"
 X = "8/9"
 C = "9/9"
+G = "center"
 P = "Top"
 U = "Ignore"
 L = "Guide"
