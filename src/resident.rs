@@ -409,7 +409,7 @@ impl App {
             }
             "settings" => crate::settings::open(),
             "time" | "monitor" => self.status(action),
-            "version" => self.notice(concat!("WinSizeP ", env!("CARGO_PKG_VERSION"))),
+            "version" => self.notice(crate::identity::VERSION_TEXT),
             "help" => {
                 self.hide = None;
                 self.overlay.tip(&self.cfg.help_text(), &self.cfg)

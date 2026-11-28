@@ -71,3 +71,5 @@ cargo test
 生成程序：`target/release/winsizep.exe`。
 
 Debug 与 Release 使用独立的实例及设置窗口标识，可同时运行；Debug 标题和托盘提示会标明构建类型。两种构建的自动启动任务也分别保存。
+
+两种版本同时运行时，可在托盘手动暂停其中一个以选择当前使用的实例。Debug 托盘悬浮提示及版本查询显示 `WinSizeP DEBUG`，Release 显示正常版本号。

@@ -23,6 +23,11 @@ pub const NAME: &str = if cfg!(debug_assertions) {
 } else {
     "WinSizeP"
 };
+pub const VERSION_TEXT: &str = if cfg!(debug_assertions) {
+    "WinSizeP DEBUG"
+} else {
+    concat!("WinSizeP ", env!("CARGO_PKG_VERSION"))
+};
 pub fn settings_class(name: &str) -> bool {
     matches!(name, "WinSizeP.Settings" | "WinSizeP.Settings.Debug")
 }

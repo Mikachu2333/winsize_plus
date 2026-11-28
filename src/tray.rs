@@ -89,7 +89,7 @@ fn add(hwnd: HWND, icon: HICON) -> Result<(), String> {
     let mut tip = [0u16; 128];
     for (unit, value) in tip
         .iter_mut()
-        .zip(format!("{} {}", crate::identity::NAME, env!("CARGO_PKG_VERSION")).encode_utf16())
+        .zip(crate::identity::VERSION_TEXT.encode_utf16())
     {
         *unit = value;
     }

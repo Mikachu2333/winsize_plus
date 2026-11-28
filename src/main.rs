@@ -393,7 +393,7 @@ fn execute(args: &[String]) -> Result<(), String> {
         ["--shell-launch", exe, parameters] => {
             return launch::shell_helper(std::path::Path::new(exe), parameters);
         }
-        ["--version" | "-V"] => println!("WinSizeP {}", env!("CARGO_PKG_VERSION")),
+        ["--version" | "-V"] => println!("{}", identity::VERSION_TEXT),
         ["--help" | "-h"] => {
             println!(
                 "{}\n\nwinsizep --pid 123 --preset Center\nwinsizep --name notepad.exe --size 900,600\nwinsizep --stdin [shared options]\n--settings  --check  --version",
