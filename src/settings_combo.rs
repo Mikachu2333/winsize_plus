@@ -4,6 +4,7 @@ use std::{cell::RefCell, collections::HashMap};
 use windows_sys::{
     Win32::{
         Foundation::*,
+        Graphics::Gdi::*,
         UI::{Controls::*, Shell::*, WindowsAndMessaging::*},
     },
     core::w,
@@ -29,6 +30,56 @@ fn text(hwnd: HWND) -> String {
 }
 fn send(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> isize {
     unsafe { SendMessageW(hwnd, msg, wp, lp) }
+}
+fn center_edit(combo: HWND) {
+    // The searchable combo owns a single-line EDIT; its formatting rectangle
+    // cannot supply vertical padding. Center the child at its actual font height.
+    unsafe {
+        let mut info = COMBOBOXINFO {
+            cbSize: size_of::<COMBOBOXINFO>() as u32,
+            ..Default::default()
+        };
+        if GetComboBoxInfo(combo, &mut info) == 0 || info.hwndItem.is_null() {
+            return;
+        }
+        let dc = GetDC(info.hwndItem);
+        if dc.is_null() {
+            return;
+        }
+        let font = send(info.hwndItem, WM_GETFONT, 0, 0) as HFONT;
+        let old = SelectObject(dc, font);
+        let mut metrics = TEXTMETRICW::default();
+        let measured = GetTextMetricsW(dc, &mut metrics);
+        SelectObject(dc, old);
+        ReleaseDC(info.hwndItem, dc);
+        if measured == 0 {
+            return;
+        }
+        let height = metrics
+            .tmHeight
+            .max(1)
+            .min((info.rcItem.bottom - info.rcItem.top).max(1));
+        let y = info.rcItem.top + (info.rcItem.bottom - info.rcItem.top - height) / 2;
+        let mut current = RECT::default();
+        GetWindowRect(info.hwndItem, &mut current);
+        MapWindowPoints(
+            std::ptr::null_mut(),
+            combo,
+            (&mut current as *mut RECT).cast(),
+            2,
+        );
+        if current.top != y || current.bottom - current.top != height {
+            SetWindowPos(
+                info.hwndItem,
+                std::ptr::null_mut(),
+                info.rcItem.left,
+                y,
+                (info.rcItem.right - info.rcItem.left).max(1),
+                height,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+    }
 }
 fn matching(options: &[(String, String)], query: &str) -> Vec<usize> {
     let query = query.trim().to_lowercase();
@@ -263,6 +314,14 @@ unsafe extern "system" fn combo_proc(
     _: usize,
 ) -> LRESULT {
     unsafe {
+        if matches!(
+            msg,
+            WM_WINDOWPOSCHANGED | WM_SETFONT | CB_SETITEMHEIGHT | WM_THEMECHANGED
+        ) {
+            let result = DefSubclassProc(hwnd, msg, wp, lp);
+            center_edit(hwnd);
+            return result;
+        }
         if msg == CB_SETCURSEL {
             let result = DefSubclassProc(hwnd, msg, wp, lp);
             let original = original_index(hwnd, result);
@@ -344,6 +403,101 @@ unsafe extern "system" fn edit_proc(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "uses native searchable combos to check edit alignment after font changes and filtering"]
+    fn searchable_edit_stays_vertically_centered() {
+        unsafe {
+            let root = CreateWindowExW(
+                0,
+                w!("STATIC"),
+                w!("Combo alignment"),
+                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                100,
+                100,
+                600,
+                400,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            );
+            let combo = CreateWindowExW(
+                0,
+                w!("COMBOBOX"),
+                w!(""),
+                WS_CHILD
+                    | WS_VISIBLE
+                    | CBS_DROPDOWN as u32
+                    | CBS_OWNERDRAWFIXED as u32
+                    | CBS_HASSTRINGS as u32,
+                10,
+                10,
+                300,
+                240,
+                root,
+                1 as HMENU,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            );
+            attach(combo, true);
+            for dpi in [96, 144, 192] {
+                let font = crate::fonts::Font::new("SystemFont", 12, dpi, false, false).unwrap();
+                send(combo, WM_SETFONT, font.0 as usize, 1);
+                send(
+                    combo,
+                    CB_SETITEMHEIGHT,
+                    usize::MAX,
+                    (font.height() + 16 * dpi / 96) as isize,
+                );
+                populate(
+                    combo,
+                    &[
+                        ("first".into(), "First value".into()),
+                        ("second".into(), "Second value".into()),
+                    ],
+                    "first",
+                );
+                for search in [false, true] {
+                    if search {
+                        SetWindowTextW(combo, w!("second"));
+                        filter(combo);
+                    }
+                    let mut info = COMBOBOXINFO {
+                        cbSize: size_of::<COMBOBOXINFO>() as u32,
+                        ..Default::default()
+                    };
+                    GetComboBoxInfo(combo, &mut info);
+                    let mut edit = RECT::default();
+                    GetWindowRect(info.hwndItem, &mut edit);
+                    MapWindowPoints(
+                        std::ptr::null_mut(),
+                        combo,
+                        (&mut edit as *mut RECT).cast(),
+                        2,
+                    );
+                    let top = edit.top - info.rcItem.top;
+                    let bottom = info.rcItem.bottom - edit.bottom;
+                    assert!(
+                        (top - bottom).abs() <= 1,
+                        "dpi={dpi}, search={search}, top={top}, bottom={bottom}"
+                    );
+                    assert!(
+                        edit.bottom - edit.top >= font.height() - 2,
+                        "text clipped at dpi={dpi}"
+                    );
+                    send(combo, CB_SHOWDROPDOWN, 0, 0);
+                    restore(combo);
+                }
+                send(
+                    combo,
+                    WM_SETFONT,
+                    GetStockObject(DEFAULT_GUI_FONT) as usize,
+                    0,
+                );
+            }
+            DestroyWindow(root);
+        }
+    }
     #[test]
     #[ignore = "uses native dropdown navigation to verify Escape restores and Enter confirms"]
     fn browsing_with_arrows_does_not_commit_until_confirmed() {
