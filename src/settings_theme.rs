@@ -125,11 +125,13 @@ pub fn apply(hwnd: HWND) {
 pub fn color(dc: HDC, hint_text: bool, field: bool) -> isize {
     unsafe {
         SetTextColor(dc, if hint_text { hint() } else { text() });
-        SetBkMode(dc, TRANSPARENT as i32);
+        // Native edits redraw shifted glyph runs during Delete/Backspace without
+        // erasing the entire control. Opaque text must erase the previous glyphs.
+        SetBkMode(dc, if field { OPAQUE } else { TRANSPARENT } as i32);
         SetBkColor(
             dc,
-            if field && dark() {
-                0x303030
+            if field {
+                if dark() { 0x303030 } else { 0xf5f5f5 }
             } else {
                 background()
             },

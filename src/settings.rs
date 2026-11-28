@@ -4955,6 +4955,92 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opens temporary edits and compares repeated Delete/Backspace paints with full repaint"]
+    fn repeated_delete_and_backspace_leave_no_stale_text_pixels() {
+        let _dpi = crate::test_support::Dpi::new();
+        let editor = test_editor(0, "settings-delete-paint-test");
+        let root = editor.window.0;
+        unsafe {
+            SetWindowLongPtrW(root, GWLP_WNDPROC, window_proc as *const () as isize);
+            for pane in editor.panes {
+                ShowWindow(pane, SW_HIDE);
+            }
+            ShowWindow(root, SW_SHOW);
+        }
+        for style in [
+            ES_AUTOHSCROLL,
+            ES_MULTILINE | ES_AUTOVSCROLL,
+            ES_NUMBER | ES_AUTOHSCROLL,
+        ] {
+            let edit = editor
+                .create(root, "EDIT", "", WS_BORDER | WS_TABSTOP | style as u32, 900)
+                .unwrap();
+            place(edit, 20, 20, 320, 100);
+            for dark in [false, true] {
+                crate::settings_theme::test_dark(Some(dark));
+                for backspace in [false, true] {
+                    set_text(edit, "12345678901234567890123456789012345678901234567890");
+                    unsafe {
+                        SetFocus(edit);
+                        SendMessageW(
+                            edit,
+                            EM_SETSEL,
+                            if backspace { 50 } else { 0 },
+                            if backspace { 50 } else { 0 },
+                        );
+                        HideCaret(edit);
+                        RedrawWindow(
+                            edit,
+                            null(),
+                            null_mut(),
+                            RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW,
+                        );
+                    }
+                    for count in 0..50 {
+                        unsafe {
+                            if backspace {
+                                SendMessageW(edit, WM_CHAR, 8, 1);
+                            } else {
+                                SendMessageW(edit, WM_KEYDOWN, 0x2e, 1);
+                                SendMessageW(edit, WM_KEYUP, 0x2e, 1);
+                            }
+                            RedrawWindow(edit, null(), null_mut(), RDW_UPDATENOW);
+                        }
+                        assert_eq!(caption(edit).len(), 49 - count);
+                        let mut rect = RECT::default();
+                        unsafe {
+                            GetClientRect(edit, &mut rect);
+                        }
+                        let incremental = painted_pixels(edit, rect);
+                        unsafe {
+                            RedrawWindow(
+                                edit,
+                                null(),
+                                null_mut(),
+                                RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW,
+                            );
+                        }
+                        let full = painted_pixels(edit, rect);
+                        assert_eq!(
+                            incremental
+                                .iter()
+                                .zip(&full)
+                                .filter(|(a, b)| a != b)
+                                .count(),
+                            0,
+                            "delete={count}, backspace={backspace}, dark={dark}, style={style}"
+                        );
+                    }
+                }
+            }
+            unsafe {
+                DestroyWindow(edit);
+            }
+        }
+        crate::settings_theme::test_dark(None);
+    }
+
+    #[test]
     #[ignore = "resizes a multiline edit across wrapping widths and compares with a full repaint"]
     fn long_edit_text_repaints_after_shrinking_and_growing() {
         let _dpi = crate::test_support::Dpi::new();
