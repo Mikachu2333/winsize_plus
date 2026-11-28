@@ -2241,8 +2241,13 @@ impl Editor {
                 |row| Self::selected_value(row, 0),
             )
         };
-        let gestures = choice("shortcuts", "gesture", "left") != "off";
+        let gestures = checked("shortcuts", "mouse_enabled");
         for (section, key, active) in [
+            ("shortcuts", "move_enabled", gestures),
+            ("shortcuts", "resize_enabled", gestures),
+            ("shortcuts", "center_enabled", gestures),
+            ("selection", "add_button", gestures),
+            ("selection", "apply_button", gestures),
             (
                 "topmost_marker",
                 "size",
@@ -4993,6 +4998,21 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "checks all dependent controls when mouse actions are disabled"]
+    fn mouse_switch_disables_region_click_controls() {
+        let _hooks = input::Hooks::escape_only().unwrap();
+        let mut editor = test_editor(6, "mouse-master-switch");
+        editor.doc["shortcuts"]["mouse_enabled"] = value(false);
+        editor.cfg = Config::parse(&editor.doc).unwrap();
+        editor.rebuild().unwrap();
+        for row in &editor.rows {
+            if row.field.section == "selection" {
+                assert_eq!(unsafe { IsWindowEnabled(row.c(0)) }, 0);
+            }
+        }
+    }
+
+    #[test]
     #[ignore = "shows settings region outlines beyond the former dwell delay and closes them with one Escape"]
     fn region_preview_keeps_all_outlines_and_escape_closes_once() {
         let _hooks = input::Hooks::escape_only().unwrap();
@@ -5878,31 +5898,17 @@ mod tests {
                     }
                 }
                 let pane = unsafe { GetDlgItem(hwnd, 2) };
-                let gesture = unsafe { GetDlgItem(pane, control_id("gesture")) };
-                let selection = send(gesture, CB_GETCURSEL, 0, 0);
-                send(gesture, CB_SETCURSEL, 3, 0);
-                send(
-                    hwnd,
-                    WM_COMMAND,
-                    control_id("gesture") as usize
-                        | ((crate::settings_combo::COMMIT as usize) << 16),
-                    gesture as isize,
-                );
+                let mouse = unsafe { GetDlgItem(pane, control_id("mouse_enabled")) };
+                send(mouse, BM_CLICK, 0, 0);
+                std::thread::sleep(Duration::from_millis(100));
                 for key in ["move_button", "resize_button", "center_button"] {
                     if unsafe { IsWindowEnabled(GetDlgItem(pane, control_id(key))) } != 0 {
                         return Err(format!(
-                            "{key} remained enabled while mouse gestures were off"
+                            "{key} remained enabled while mouse actions were off"
                         ));
                     }
                 }
-                send(gesture, CB_SETCURSEL, selection as usize, 0);
-                send(
-                    hwnd,
-                    WM_COMMAND,
-                    control_id("gesture") as usize
-                        | ((crate::settings_combo::COMMIT as usize) << 16),
-                    gesture as isize,
-                );
+                send(mouse, BM_CLICK, 0, 0);
                 // The window format is editable only while the window tip is selected.
                 send(hwnd, WM_COMMAND, (TAB_BASE + 1) as usize, 0);
                 wait_tab(hwnd, 1)?;

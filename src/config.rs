@@ -71,7 +71,7 @@ pub struct Config {
     pub keycast: CastStyle,
     pub zh: bool,
     pub alt: String,
-    pub gesture: String,
+    pub mouse_enabled: bool,
     pub double_ms: u32,
     pub alt_hold_ms: u32,
     pub elevate: bool,
@@ -390,7 +390,7 @@ fn canonicalize(doc: &mut DocumentMut) {
 impl Config {
     pub fn same_interaction(&self, other: &Self) -> bool {
         self.alt == other.alt
-            && self.gesture == other.gesture
+            && self.mouse_enabled == other.mouse_enabled
             && self.alt_hold_ms == other.alt_hold_ms
             && self.double_ms == other.double_ms
             && self.move_button == other.move_button
@@ -489,7 +489,7 @@ impl Config {
                 "调整窗口大小（固定左上角）",
             ),
         ] {
-            if button_id.is_some() && self.gesture != "off" {
+            if button_id.is_some() && self.mouse_enabled {
                 mouse.push(format!(
                     "Alt + {} {} = {}",
                     button(button_id),
@@ -498,7 +498,7 @@ impl Config {
                 ));
             }
         }
-        if self.gesture != "off" {
+        if self.mouse_enabled {
             if self.center_button.is_some() {
                 mouse.push(format!(
                     "Alt + {} = {}",
@@ -968,7 +968,7 @@ impl Config {
             keycast: cast("keycast")?,
             zh: language == "zh-CN" || (language == "auto" && system_zh()),
             alt: choice("shortcuts", "alt", &["left", "right", "both"])?,
-            gesture: choice("shortcuts", "gesture", &["left", "right", "both", "off"])?,
+            mouse_enabled: boolean("shortcuts", "mouse_enabled")?,
             double_ms: unsafe {
                 windows_sys::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime()
             },
@@ -2215,11 +2215,11 @@ My = "Center"
         doc["presets"]["FullTop"] = value("0|0|100sw|50sh");
         doc["keys"]["w"] = value("fUlLtOp");
         doc["shortcuts"]["alt"] = value("LEFT");
-        doc["shortcuts"]["gesture"] = value("Both");
+        doc["shortcuts"]["mouse_enabled"] = value(true);
         doc["shortcuts"]["move_button"] = value("Left");
         let cfg = Config::parse(&doc).unwrap();
         assert_eq!(cfg.alt, "left");
-        assert_eq!(cfg.gesture, "both");
+        assert!(cfg.mouse_enabled);
         assert_eq!(cfg.move_button, Some(1));
         let fields = crate::settings_schema::fields(4, 0, &cfg, &doc);
         assert_eq!(
@@ -2321,7 +2321,7 @@ My = "Center"
     fn help_omits_disabled_mouse_actions_and_uses_readable_key_names() {
         let mut doc = help().parse::<DocumentMut>().unwrap();
         doc["general"]["language"] = value("en");
-        doc["shortcuts"]["gesture"] = value("off");
+        doc["shortcuts"]["mouse_enabled"] = value(false);
         doc["keys"]["F12"] = value("Help");
         doc["keys"]["Insert"] = value("Version");
         doc["keys"]["Comma"] = value("Help");
@@ -2378,7 +2378,7 @@ My = "Center"
                 assert!(sections[5].starts_with("Aliases:\n"));
                 assert!(!text.contains(['：', '；', '，', '（', '）', '、']));
             }
-            doc["shortcuts"]["gesture"] = value("off");
+            doc["shortcuts"]["mouse_enabled"] = value(false);
             doc["keys"] = Item::Table(Table::new());
             let text = Config::parse(&doc).unwrap().help_text();
             assert_eq!(text.split("\n\n").count(), 3);

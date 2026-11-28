@@ -119,7 +119,7 @@ impl App {
             if let Some(name) = self.preview.hovered_name() {
                 parts.push(self.cfg.display_name(name).to_owned());
             }
-            if self.cfg.gesture != "off" {
+            if self.cfg.mouse_enabled {
                 for (button, en, zh) in [
                     (self.cfg.add_button, "select", "累计选择"),
                     (self.cfg.apply_button, "apply", "立即应用"),
@@ -759,7 +759,10 @@ impl App {
                     self.preview.follow(point, &self.cfg)?;
                     self.selection_tip()?;
                 }
-                if self.held_window.is_some() && self.selection_suspended.is_none() {
+                if self.cfg.mouse_enabled
+                    && self.held_window.is_some()
+                    && self.selection_suspended.is_none()
+                {
                     self.neighbors.follow(point, &self.cfg)?;
                 }
                 if (self.overlay.mode() != 0 || self.drag.is_some())
@@ -902,7 +905,10 @@ impl App {
                 self.close_preview()?;
             } else {
                 self.preview.tick(&self.cfg)?;
-                if self.held_window.is_some() && self.selection_suspended.is_none() {
+                if self.cfg.mouse_enabled
+                    && self.held_window.is_some()
+                    && self.selection_suspended.is_none()
+                {
                     self.neighbors.follow(desktop::cursor()?, &self.cfg)?;
                 }
                 self.selection_tip()?;

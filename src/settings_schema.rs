@@ -292,16 +292,16 @@ fn describe(section: &str, key: &str) -> (&'static str, &'static str, &'static s
             "0–60000，默认 1500。延迟结束后启用键盘和鼠标操作；提前输入组合键会交给应用，并取消本次长按触发。双击 Alt 可直接触发。",
         ),
         ("shortcuts", "alt") => (
-            "Alt key for shortcuts",
-            "快捷操作使用的 Alt",
+            "Activation Alt key",
+            "激活使用的 Alt",
             "Hold Alt until activation, then press a key; or double-tap Alt then press a key. Double-tap timing follows Windows.",
             "长按 Alt 触发后配合按键，或双击 Alt 后按键；双击时间跟随 Windows。",
         ),
-        ("shortcuts", "gesture") => (
-            "Alt key for mouse actions",
-            "鼠标操作使用的 Alt",
-            "Used for moving, resizing and right-click placement.",
-            "用于触发统一的分区选择、拖动和缩放操作。",
+        ("shortcuts", "mouse_enabled") => (
+            "Enable mouse actions",
+            "启用鼠标操作",
+            "After Alt activation, enable region clicks, moving, resizing and centering. Keyboard actions stay available.",
+            "Alt 激活后允许鼠标选区、移动、缩放和居中；关闭后仍可使用键盘操作。",
         ),
         ("shortcuts", "move_enabled") => (
             "Enable window dragging",
@@ -533,6 +533,14 @@ pub fn fields(tab: usize, axis: usize, cfg: &Config, doc: &DocumentMut) -> Vec<F
                 .sort_by_key(|(key, _)| order.iter().position(|v| v == key).unwrap_or(order.len()));
         }
         for (key, item) in entries {
+            if !mapping
+                && DEFAULTS
+                    .get(section)
+                    .and_then(|table| table.get(key))
+                    .is_none()
+            {
+                continue;
+            }
             if *section == "general" {
                 let activation = matches!(key, "alt_hold_ms" | "preview" | "target_marker");
                 if activation != (tab == 4) {
@@ -582,7 +590,6 @@ pub fn fields(tab: usize, axis: usize, cfg: &Config, doc: &DocumentMut) -> Vec<F
                     ("topmost_marker", "position") => &["top-left", "bottom-left", "bottom-right"],
                     ("general", "language") => &["auto", "zh-CN", "en"],
                     ("shortcuts", "alt") => &["left", "right", "both"],
-                    ("shortcuts", "gesture") => &["left", "right", "both", "off"],
                     ("selection", "add_button" | "apply_button") => {
                         &["left", "right", "middle", "x1", "x2", "off"]
                     }
@@ -678,7 +685,7 @@ fn field_order(section: &str) -> &'static [&'static str] {
         "topmost_marker" => &["enabled", "size", "position"],
         "shortcuts" => &[
             "alt",
-            "gesture",
+            "mouse_enabled",
             "move_enabled",
             "move_button",
             "resize_enabled",

@@ -1249,7 +1249,7 @@ pub fn configure(cfg: &Config) -> Result<(), String> {
     let (add_button, apply_button) = (cfg.add_button, cfg.apply_button);
     let (alt, gesture, hold_ms, exclusions, move_button, resize_button, double_ms) = (
         mask(&cfg.alt),
-        mask(&cfg.gesture),
+        if cfg.mouse_enabled { mask(&cfg.alt) } else { 0 },
         cfg.alt_hold_ms,
         cfg.exclusions.clone(),
         cfg.move_button,
@@ -1610,6 +1610,25 @@ impl Drop for Hooks {
 
 #[cfg(test)]
 pub(super) mod tests {
+    #[test]
+    fn unified_activation_uses_one_alt_and_independent_mouse_enablement() {
+        use super::*;
+        let _hooks = Hooks::escape_only().unwrap();
+        let mut cfg = crate::test_support::cfg();
+        cfg.alt = "right".into();
+        cfg.mouse_enabled = true;
+        configure(&cfg).unwrap();
+        assert_eq!(
+            on_hook(|| INPUT.with_borrow(|s| (s.alt_mask, s.gesture_mask))).unwrap(),
+            (2, 2)
+        );
+        cfg.mouse_enabled = false;
+        configure(&cfg).unwrap();
+        assert_eq!(
+            on_hook(|| INPUT.with_borrow(|s| (s.alt_mask, s.gesture_mask))).unwrap(),
+            (2, 0)
+        );
+    }
     #[test]
     fn native_editor_bypasses_bindings_only_while_its_window_is_foreground() {
         use super::*;
