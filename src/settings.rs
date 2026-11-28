@@ -1406,6 +1406,8 @@ impl Editor {
                         unsafe {
                             SetPropW(row.c(3), w!("ShortcutCapture"), 1 as HANDLE);
                         }
+                        let hint = shortcut_caption(&key, false);
+                        self.control(&mut row, index, 7, "STATIC", &hint, SS_LEFT as u32)?;
                     }
                     self.control(
                         &mut row,
@@ -1777,6 +1779,13 @@ impl Editor {
                     y += gap;
                     place(row.c(6), padding, y - self.scroll[1], width, h);
                     y += h;
+                    if !row.c(7).is_null() {
+                        y += gap;
+                        let hint_height =
+                            measured(&caption(row.c(7)), &self.hint_font, width).max(h);
+                        place(row.c(7), padding, y - self.scroll[1], width, hint_height);
+                        y += hint_height;
+                    }
                 }
                 Kind::Color(channels) => {
                     let color_width = (combo_width + self.s(80)).min(width);
@@ -3129,6 +3138,20 @@ impl Editor {
         Ok(())
     }
 }
+fn shortcut_caption(name: &str, captured: bool) -> String {
+    let value = config::vk(name).map_or_else(
+        || name.to_owned(),
+        |vk| format!("{} · VK:{vk:02X}", config::shortcut_name(name)),
+    );
+    format!(
+        "{value} · {}",
+        if captured {
+            "已录入；再次点击可重录 / Click to recapture"
+        } else {
+            "点击后按一个键录入 / Click, then press one key"
+        }
+    )
+}
 fn populate(hwnd: HWND, options: &[(String, String)], selected: &str, height: i32) {
     crate::settings_combo::populate(hwnd, options, selected);
     send(hwnd, CB_SETITEMHEIGHT, usize::MAX, height as isize);
@@ -3308,13 +3331,33 @@ unsafe extern "system" fn control_proc(
         let class = String::from_utf16_lossy(&class[..length as usize]);
         let id = GetDlgCtrlID(hwnd);
         if !GetPropW(hwnd, w!("ShortcutCapture")).is_null() {
+            let hint = GetDlgItem(GetParent(hwnd), id + 4);
+            if matches!(message, WM_SETFOCUS | WM_LBUTTONDOWN) {
+                SetPropW(hwnd, w!("ShortcutCapture"), 1 as HANDLE);
+                set_text(hint, "正在录入：请按一个键 / Press one key");
+            }
+            if message == WM_KILLFOCUS {
+                set_text(hint, &shortcut_caption(&caption(hwnd), false));
+            }
             if message == WM_KEYDOWN || message == WM_SYSKEYDOWN {
+                if GetPropW(hwnd, w!("ShortcutCapture")) as usize == 2
+                    && !matches!(wp, 9 | 13 | 27)
+                    && GetKeyState(0x11) >= 0
+                {
+                    return 0;
+                }
                 let key =
                     config::physical_key(wp as u32, (lp as u32 >> 16) & 0xff, lp & (1 << 24) != 0);
                 if !config::reserved_key(key) && GetKeyState(0x11) >= 0 {
                     let name = config::shortcut_name(&format!("VK:{key:02X}"));
                     set_text(hwnd, &name);
+                    SetPropW(hwnd, w!("ShortcutCapture"), 2 as HANDLE);
+                    set_text(hint, &shortcut_caption(&name, true));
                     SendMessageW(hwnd, EM_SETSEL, 0, -1);
+                    return 0;
+                }
+                if config::reserved_key(key) && !matches!(wp,9|13|27|0x10..=0x12|0xa0..=0xa5) {
+                    set_text(hint, "该按键由系统保留，请换一个 / Reserved key");
                     return 0;
                 }
             }
@@ -5154,6 +5197,7 @@ mod tests {
             (0x23, 0x4f, false, "Numpad1"),
             (0x70, 0x3b, false, "F1"),
         ] {
+            send(edit, WM_SETFOCUS, 0, 0);
             send(
                 edit,
                 WM_KEYDOWN,
@@ -5172,6 +5216,12 @@ mod tests {
         }
         assert_eq!(config::physical_key(0x23, 0x4f, true), 0x23);
         assert_ne!(config::vk("1"), config::vk("Numpad1"));
+        send(edit, WM_SETFOCUS, 0, 0);
+        send(edit, WM_KEYDOWN, 0x46, 1);
+        send(edit, WM_KEYDOWN, 0x31, 1);
+        send(edit, WM_KEYDOWN, 0x32, 1);
+        assert_eq!(caption(edit), "F");
+        assert!(caption(row.c(7)).contains("VK:46"));
     }
 
     #[test]

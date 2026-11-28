@@ -99,6 +99,15 @@ fn rebuild(combo: HWND, search: &Search, indices: &[usize]) {
             send(combo, CB_SETITEMDATA, index as usize, original as isize);
         }
     }
+    if indices.is_empty() {
+        let row = send(
+            combo,
+            CB_ADDSTRING,
+            0,
+            wide("无匹配结果 / No matches").as_ptr() as isize,
+        );
+        send(combo, CB_SETITEMDATA, row as usize, -1);
+    }
     send(combo, WM_SETREDRAW, 1, 0);
 }
 fn finish_rebuild(combo: HWND) {
@@ -154,7 +163,7 @@ fn commit(combo: HWND) -> bool {
     }
     false
 }
-fn confirm(combo: HWND) {
+fn confirm(combo: HWND) -> bool {
     if commit(combo) {
         unsafe {
             PostMessageW(
@@ -164,7 +173,9 @@ fn confirm(combo: HWND) {
                 combo as isize,
             );
         }
+        return true;
     }
+    false
 }
 pub fn filter(combo: HWND) {
     let query = text(combo);
@@ -183,7 +194,7 @@ pub fn filter(combo: HWND) {
     };
     let indices = matching(&search.options, &query);
     rebuild(combo, &search, &indices);
-    send(combo, CB_SHOWDROPDOWN, usize::from(!indices.is_empty()), 0);
+    send(combo, CB_SHOWDROPDOWN, 1, 0);
     unsafe {
         SetWindowTextW(combo, wide(query).as_ptr());
     }
@@ -221,7 +232,7 @@ pub fn notification(combo: HWND, event: u32) -> bool {
             false
         }
         CBN_SELENDOK => {
-            confirm(combo);
+            let _ = confirm(combo);
             true
         }
         CBN_SELENDCANCEL | CBN_KILLFOCUS => {
@@ -306,7 +317,9 @@ unsafe extern "system" fn edit_proc(
                 if send(combo, CB_GETCURSEL, 0, 0) < 0 && send(combo, CB_GETCOUNT, 0, 0) > 0 {
                     send(combo, CB_SETCURSEL, 0, 0);
                 }
-                confirm(combo);
+                if !confirm(combo) {
+                    return 0;
+                }
             }
             send(combo, CB_SHOWDROPDOWN, 0, 0);
             restore(combo);
@@ -449,7 +462,8 @@ mod tests {
             assert_eq!(text(combo), "特殊分区");
             SetWindowTextW(combo, wide("not found").as_ptr());
             filter(combo);
-            assert_eq!(send(combo, CB_GETCOUNT, 0, 0), 0);
+            assert_eq!(send(combo, CB_GETCOUNT, 0, 0), 1);
+            assert_eq!(original_index(combo, 0), None);
             assert_eq!(selected_index(combo), Some(400));
             notification(combo, CBN_SELENDCANCEL);
             assert_eq!(text(combo), "特殊分区");
