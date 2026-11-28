@@ -711,8 +711,8 @@ mod tests {
             assert_eq!(preview.visible(), mode == "always");
             // Slight motion and even crossing another candidate's edge keep the browsed region.
             let inside = POINT {
-                x: area.x + area.width / 5,
-                y: area.y + area.height / 5,
+                x: area.x + area.width / 4,
+                y: area.y + area.height / 4,
             };
             let (name, rect) = preview.hit(inside, &cfg).unwrap().unwrap();
             assert_eq!(name, "center");
