@@ -224,6 +224,19 @@ unsafe extern "system" fn combo_proc(
     _: usize,
 ) -> LRESULT {
     unsafe {
+        if msg == CB_SETCURSEL {
+            let result = DefSubclassProc(hwnd, msg, wp, lp);
+            let original = original_index(hwnd, result);
+            SEARCHES.with_borrow_mut(|all| {
+                if let Some(search) = all.get_mut(&(hwnd as usize))
+                    && !search.busy
+                    && search.query.is_empty()
+                {
+                    search.committed = original;
+                }
+            });
+            return result;
+        }
         if msg == WM_NCDESTROY {
             SEARCHES.with_borrow_mut(|s| {
                 s.remove(&(hwnd as usize));
@@ -359,6 +372,13 @@ mod tests {
             notification(combo, CBN_SELENDCANCEL);
             assert_eq!(text(combo), "特殊分区");
             assert_eq!(send(combo, CB_GETCOUNT, 0, 0), 401);
+            // A configuration refresh can change the selection without a user notification.
+            send(combo, CB_SETCURSEL, 20, 0);
+            SetWindowTextW(combo, wide("missing again").as_ptr());
+            filter(combo);
+            notification(combo, CBN_SELENDCANCEL);
+            assert_eq!(selected_index(combo), Some(20));
+            assert_eq!(text(combo), "区域 20");
             DestroyWindow(root);
             assert!(!SEARCHES.with_borrow(|all| all.contains_key(&(combo as usize))));
         }
