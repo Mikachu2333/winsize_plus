@@ -251,6 +251,23 @@ impl Preview {
     pub fn count(&self) -> usize {
         self.chosen.len()
     }
+    pub fn restyle(&mut self, cfg: &Config) -> Result<(), String> {
+        let Some((monitor, _)) = self.display.as_ref() else {
+            return Ok(());
+        };
+        let monitor = *monitor;
+        let selected = self
+            .selected
+            .and_then(|i| self.regions.get(i))
+            .map(|r| r.name.clone());
+        let chosen = std::mem::take(&mut self.chosen);
+        self.rebuild(monitor, cfg)?;
+        for region in chosen {
+            self.toggle(region.name, region.rect, cfg)?;
+        }
+        let index = selected.and_then(|name| self.regions.iter().position(|r| r.name == name));
+        self.highlight(index, cfg)
+    }
     pub fn selection_rect(&self) -> Option<Rect> {
         enclosing(self.chosen.iter().map(|region| region.rect))
     }

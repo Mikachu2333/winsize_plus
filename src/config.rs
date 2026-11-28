@@ -388,6 +388,23 @@ fn canonicalize(doc: &mut DocumentMut) {
 }
 
 impl Config {
+    pub fn same_interaction(&self, other: &Self) -> bool {
+        self.alt == other.alt
+            && self.gesture == other.gesture
+            && self.alt_hold_ms == other.alt_hold_ms
+            && self.double_ms == other.double_ms
+            && self.move_button == other.move_button
+            && self.resize_button == other.resize_button
+            && self.center_button == other.center_button
+            && self.add_button == other.add_button
+            && self.apply_button == other.apply_button
+            && self.presets == other.presets
+            && self.keys == other.keys
+            && self.commands == other.commands
+            && self.exclusions == other.exclusions
+            && self.preview == other.preview
+            && self.elevate == other.elevate
+    }
     pub fn button_name(&self, button: Option<u32>) -> &str {
         match button {
             Some(1) => self.tr("Left click", "左键"),

@@ -258,13 +258,28 @@ impl App {
         if self.mousecast {
             self.cast.prepare_mouse(desktop::cursor()?, &cfg)?;
         }
-        input::configure(&cfg)?;
+        let preserve_session = !restart && self.cfg.same_interaction(&cfg);
+        if !preserve_session {
+            input::configure(&cfg)?;
+        }
         input::set_casting(self.mousecast, self.keycast)?;
         self.frames.reset(cfg.fps);
         self.overlay.guides(self.overlay.mode(), &cfg)?;
         self.topmost.configure(&cfg)?;
         self.cfg = cfg;
-        self.close_preview()?;
+        if preserve_session {
+            self.preview.restyle(&self.cfg)?;
+            self.selection_hint.clear();
+            if self.cfg.target_marker {
+                if let Some(hwnd) = self.held_window {
+                    self.marker.show(hwnd)?;
+                }
+            } else {
+                self.marker.hide();
+            }
+        } else {
+            self.close_preview()?;
+        }
         self.snapshot = Some(snapshot);
         if restart {
             self.exit = Some(crate::ResidentExit::Restart(Some(self.cfg.elevate)));
@@ -280,6 +295,8 @@ impl App {
                     "配置已应用，但无法更新配置文件"
                 )
             ))
+        } else if preserve_session && self.held_window.is_some() {
+            self.selection_tip()
         } else {
             self.config_notice()
         }
@@ -1157,6 +1174,45 @@ mod tests {
         app.act("pause").unwrap();
         assert!(!app.paused);
         assert_eq!(app.overlay.tip_text(), "开始捕获");
+    }
+
+    #[test]
+    #[ignore = "reloads an isolated configuration while a temporary selection is active"]
+    fn appearance_reload_preserves_selection_and_deadline_but_bindings_cancel() {
+        let _hooks = input::Hooks::start(&crate::test_support::cfg()).unwrap();
+        let mut app = test_app();
+        let path = std::env::temp_dir().join(format!(
+            "winsizep-session-reload-{}.toml",
+            std::process::id()
+        ));
+        app.path = path.clone();
+        let mut doc = config::help().parse::<toml_edit::DocumentMut>().unwrap();
+        std::fs::write(&path, doc.to_string()).unwrap();
+        app.begin_alt_preview(unsafe { GetForegroundWindow() }, false)
+            .unwrap();
+        let rect = crate::layout::Rect {
+            x: 0,
+            y: 0,
+            width: 300,
+            height: 200,
+        };
+        app.preview.toggle("1/4".into(), rect, &app.cfg).unwrap();
+        app.preview_until = Some(later(3000));
+        let deadline = app.preview_until;
+        doc["regions"]["font_size"] = toml_edit::value(20);
+        doc["outline"]["opacity"] = toml_edit::value(180);
+        std::fs::write(&path, doc.to_string()).unwrap();
+        app.load(true).unwrap();
+        assert_eq!(app.preview.count(), 1);
+        assert_eq!(app.preview.selection_rect(), Some(rect));
+        assert_eq!(app.preview_until, deadline);
+        assert_eq!(app.cfg.region_font_size, 20);
+        doc["keys"]["Q"] = toml_edit::value("2/4");
+        std::fs::write(&path, doc.to_string()).unwrap();
+        app.load(true).unwrap();
+        assert!(app.held_window.is_none());
+        assert!(!app.preview.visible());
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
