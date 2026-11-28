@@ -768,7 +768,11 @@ unsafe extern "system" fn keyboard(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT
                     .and_then(|ch| crate::config::vk(&ch.to_string()))
                     .unwrap_or(data.vkCode)
             } else {
-                data.vkCode
+                crate::config::physical_key(
+                    data.vkCode,
+                    data.scanCode,
+                    data.flags & LLKHF_EXTENDED != 0,
+                )
             };
             // Only physical Alt events may change preview and gesture state. Forward
             // injected presses and releases without consuming them or casting them.

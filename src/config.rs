@@ -292,6 +292,28 @@ fn is_builtin_action(name: &str) -> bool {
 pub fn shortcut_name(text: &str) -> String {
     vk(text).map(key_name).unwrap_or_else(|| text.to_owned())
 }
+/// Preserve physical keypad identity when Num Lock translates it to navigation.
+pub fn physical_key(vk: u32, scan: u32, extended: bool) -> u32 {
+    if !extended {
+        let digit = match scan & 0xff {
+            0x52 => Some(0),
+            0x4f => Some(1),
+            0x50 => Some(2),
+            0x51 => Some(3),
+            0x4b => Some(4),
+            0x4c => Some(5),
+            0x4d => Some(6),
+            0x47 => Some(7),
+            0x48 => Some(8),
+            0x49 => Some(9),
+            _ => None,
+        };
+        if let Some(digit) = digit {
+            return 0x60 + digit;
+        }
+    }
+    vk
+}
 fn reserved_preset_name(name: &str) -> bool {
     let name = command_name(name);
     is_builtin_action(&name) || ALIASES.iter().any(|(alias, _)| *alias == name)

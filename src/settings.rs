@@ -1385,6 +1385,11 @@ impl Editor {
                         row.field.key.clone()
                     };
                     self.control(&mut row, index, 3, "EDIT", &key, WS_BORDER | WS_TABSTOP)?;
+                    if row.field.section == "keys" {
+                        unsafe {
+                            SetPropW(row.c(3), w!("ShortcutCapture"), 1 as HANDLE);
+                        }
+                    }
                     self.control(
                         &mut row,
                         index,
@@ -3234,6 +3239,7 @@ unsafe extern "system" fn control_proc(
             return result;
         }
         if message == WM_NCDESTROY {
+            RemovePropW(hwnd, w!("ShortcutCapture"));
             RemovePropW(hwnd, w!("OwnerCombo"));
             RemoveWindowSubclass(hwnd, Some(control_proc), 1);
             return DefSubclassProc(hwnd, message, wp, lp);
@@ -3242,6 +3248,35 @@ unsafe extern "system" fn control_proc(
         let length = GetClassNameW(hwnd, class.as_mut_ptr(), 32);
         let class = String::from_utf16_lossy(&class[..length as usize]);
         let id = GetDlgCtrlID(hwnd);
+        if !GetPropW(hwnd, w!("ShortcutCapture")).is_null() {
+            if message == WM_KEYDOWN || message == WM_SYSKEYDOWN {
+                let key =
+                    config::physical_key(wp as u32, (lp as u32 >> 16) & 0xff, lp & (1 << 24) != 0);
+                if !config::reserved_key(key) && GetKeyState(0x11) >= 0 {
+                    let name = config::shortcut_name(&format!("VK:{key:02X}"));
+                    set_text(hwnd, &name);
+                    SendMessageW(hwnd, EM_SETSEL, 0, -1);
+                    return 0;
+                }
+            }
+            if matches!(message, WM_CHAR | WM_SYSCHAR)
+                && !matches!(wp, 9 | 13 | 27)
+                && GetKeyState(0x11) >= 0
+            {
+                return 0;
+            }
+            if message == WM_GETDLGCODE && lp != 0 {
+                let routed = &*(lp as *const MSG);
+                let key = config::physical_key(
+                    routed.wParam as u32,
+                    (routed.lParam as u32 >> 16) & 0xff,
+                    routed.lParam & (1 << 24) != 0,
+                );
+                if !config::reserved_key(key) {
+                    return DefSubclassProc(hwnd, message, wp, lp) | DLGC_WANTMESSAGE as isize;
+                }
+            }
+        }
         if id == SEARCH_EDIT && matches!(message, WM_SETFOCUS | WM_KILLFOCUS) {
             InvalidateRect(GetDlgItem(root as HWND, SEARCH_FRAME), null(), 0);
         }
@@ -4952,6 +4987,42 @@ mod tests {
             ReleaseDC(hwnd, dc);
             pixels
         }
+    }
+
+    #[test]
+    #[ignore = "uses temporary shortcut controls to distinguish top-row and Num Lock-independent keypad input"]
+    fn shortcut_capture_distinguishes_keypad_digits_and_navigation() {
+        let editor = test_editor(4, "settings-shortcut-capture");
+        let row = editor
+            .rows
+            .iter()
+            .find(|row| row.field.section == "keys" && row.field.key == "Q")
+            .unwrap();
+        let edit = row.c(3);
+        for (vk, scan, extended, expected) in [
+            (0x31, 0x02, false, "1"),
+            (0x61, 0x4f, false, "Numpad1"),
+            (0x23, 0x4f, false, "Numpad1"),
+            (0x70, 0x3b, false, "F1"),
+        ] {
+            send(
+                edit,
+                WM_KEYDOWN,
+                vk,
+                1 | (scan << 16) | (isize::from(extended) << 24),
+            );
+            assert_eq!(caption(edit), expected);
+            assert_eq!(
+                config::vk(&caption(edit)),
+                Some(if expected == "Numpad1" {
+                    0x61
+                } else {
+                    vk as u32
+                })
+            );
+        }
+        assert_eq!(config::physical_key(0x23, 0x4f, true), 0x23);
+        assert_ne!(config::vk("1"), config::vk("Numpad1"));
     }
 
     #[test]

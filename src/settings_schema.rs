@@ -600,7 +600,7 @@ pub fn fields(tab: usize, axis: usize, cfg: &Config, doc: &DocumentMut) -> Vec<F
             let (label, hint) = if mapping {
                 (if *section == "keys" { config::shortcut_name(key) } else { key.to_owned() }, match *section {
                 "presets" => "",
-                "keys" => cfg.tr("Key and action. System Alt shortcuts, modifiers, Esc and tip navigation keys are reserved. Clear the action to disable a binding.", "按键与动作；系统常用 Alt 快捷键、修饰键、Esc 和提示滚动键已保留。清空动作可禁用绑定。"),
+                "keys" => cfg.tr("Press a key to record it: top-row 1 and Numpad1 have different virtual keys. Ctrl+V pastes a key name or VK:xx. System shortcuts are reserved; clear the action to disable.", "按下按键自动录入：主键盘 1 与 Numpad1 使用不同 VK。Ctrl+V 可粘贴按键名称或 VK:xx；系统快捷键保留，清空动作可禁用。"),
                 "commands" => cfg.tr("Command name and action. Names are case-insensitive and cannot shadow regions or redefine built-in actions/aliases.", "命令名称与动作；名称不区分大小写，不可与分区重名或改写内置动作及别名。"),
                 _ => cfg.tr("Cell number and region. General cells are 1–9.", "格子编号与区域名称，通用格子编号为 1–9。"),
             }.to_owned())
