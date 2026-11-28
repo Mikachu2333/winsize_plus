@@ -76,7 +76,7 @@ pub struct Config {
     pub alt_hold_ms: u32,
     pub elevate: bool,
     pub autostart: bool,
-    pub preview: bool,
+    pub preview_mode: String,
     pub target_marker: bool,
     pub show: String,
     pub duration: u32,
@@ -402,7 +402,7 @@ impl Config {
             && self.keys == other.keys
             && self.commands == other.commands
             && self.exclusions == other.exclusions
-            && self.preview == other.preview
+            && self.preview_mode == other.preview_mode
             && self.elevate == other.elevate
     }
     pub fn button_name(&self, button: Option<u32>) -> &str {
@@ -974,7 +974,7 @@ impl Config {
             },
             elevate: boolean("general", "elevate")?,
             autostart: boolean("general", "autostart")?,
-            preview: boolean("general", "preview")?,
+            preview_mode: choice("general", "preview_mode", &["always", "selected", "off"])?,
             target_marker: boolean("general", "target_marker")?,
             alt_hold_ms: number("general", "alt_hold_ms", 0, 60000)? as u32,
             show: choice("tip", "show", &["off", "time", "monitor", "window"])?,

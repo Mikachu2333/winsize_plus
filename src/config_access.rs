@@ -337,11 +337,11 @@ mod tests {
             .with_file_name(format!("normal-config-probe-{}.toml", std::process::id()));
         let loaded = crate::config::load_snapshot(&writable, None).unwrap();
         let mut draft = loaded.document;
-        draft["general"]["preview"] = toml_edit::value(!loaded.config.preview);
+        draft["general"]["preview_mode"] = toml_edit::value("off");
         crate::config::save_settings(&writable, &loaded.text, &draft).unwrap();
         assert_eq!(
-            crate::config::load(&writable, None).unwrap().preview,
-            !loaded.config.preview
+            crate::config::load(&writable, None).unwrap().preview_mode,
+            "off"
         );
         std::fs::remove_file(writable).unwrap();
         let folder = std::env::current_exe()

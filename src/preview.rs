@@ -198,6 +198,8 @@ pub struct Preview {
     chosen_panels: Vec<Panel>,
     envelope: Panel,
     frame: Rect,
+    painting: bool,
+    interactive: bool,
     display: Option<(HMONITOR, Display)>,
     regions: Vec<PresetRegion>,
     selected: Option<usize>,
@@ -207,9 +209,13 @@ pub struct Preview {
     warnings: Vec<String>,
 }
 impl Preview {
-    pub fn visible(&self) -> bool {
+    pub fn active(&self) -> bool {
         self.display.is_some()
     }
+    pub fn visible(&self) -> bool {
+        self.active() && self.painting
+    }
+
     pub fn new() -> Result<Self, String> {
         Ok(Self {
             base: Panel::new()?,
@@ -220,6 +226,8 @@ impl Preview {
             chosen_panels: Vec::new(),
             envelope: Panel::new()?,
             frame: Rect::default(),
+            painting: true,
+            interactive: false,
             display: None,
             regions: Vec::new(),
             selected: None,
@@ -230,13 +238,13 @@ impl Preview {
         })
     }
     pub fn start(&mut self, hwnd: HWND, cfg: &Config) -> Result<(), String> {
-        self.begin(hwnd, cfg, None)
+        self.begin(hwnd, cfg, None, false)
     }
     pub fn select(&mut self, hwnd: HWND, name: &str, cfg: &Config) -> Result<(), String> {
-        self.begin(hwnd, cfg, Some(crate::config::command_name(name)))
+        self.begin(hwnd, cfg, Some(crate::config::command_name(name)), false)
     }
     pub fn interactive(&mut self, hwnd: HWND, cfg: &Config) -> Result<(), String> {
-        self.begin(hwnd, cfg, None)
+        self.begin(hwnd, cfg, None, true)
     }
     pub fn hit(&mut self, point: POINT, cfg: &Config) -> Result<Option<(String, Rect)>, String> {
         self.follow(point, cfg)?;
@@ -278,6 +286,15 @@ impl Preview {
         } else {
             self.chosen.push(chosen);
         }
+        if self.interactive {
+            self.painting = cfg.preview_mode == "always"
+                || (cfg.preview_mode == "selected" && !self.chosen.is_empty());
+        }
+        if !self.painting {
+            self.hide_layers();
+            return Ok(());
+        }
+        self.base.show(desktop::desktop());
         for panel in &self.chosen_panels {
             panel.hide();
         }
@@ -300,10 +317,20 @@ impl Preview {
                 .style(unsafe { GetSysColor(COLOR_HIGHLIGHT) }, 255);
             self.envelope.show(area);
         }
+        let hovered = self.selected.take();
+        self.highlight(hovered, cfg)?;
         Ok(())
     }
-    fn begin(&mut self, hwnd: HWND, cfg: &Config, locked: Option<String>) -> Result<(), String> {
+    fn begin(
+        &mut self,
+        hwnd: HWND,
+        cfg: &Config,
+        locked: Option<String>,
+        interactive: bool,
+    ) -> Result<(), String> {
         self.hide();
+        self.interactive = interactive;
+        self.painting = !interactive || cfg.preview_mode == "always";
         self.locked = locked;
         let point = desktop::cursor()?;
         self.frame = desktop::bounds(hwnd)
@@ -317,7 +344,7 @@ impl Preview {
         }
         result
     }
-    pub fn hide(&mut self) {
+    fn hide_layers(&self) {
         self.base.hide();
         self.highlight.hide();
         for panel in &self.overlaps {
@@ -327,8 +354,11 @@ impl Preview {
         for panel in &self.chosen_panels {
             panel.hide();
         }
-        self.chosen.clear();
         self.envelope.hide();
+    }
+    pub fn hide(&mut self) {
+        self.hide_layers();
+        self.chosen.clear();
         self.display = None;
         self.selected = None;
         self.pointer = None;
@@ -426,7 +456,9 @@ impl Preview {
         }
         self.label.hide();
         self.selected = None;
-        self.base.show(desktop::desktop());
+        if self.painting {
+            self.base.show(desktop::desktop());
+        }
         Ok(())
     }
     fn highlight(&mut self, selected: Option<usize>, cfg: &Config) -> Result<(), String> {
@@ -439,6 +471,9 @@ impl Preview {
             panel.hide();
         }
         self.label.hide();
+        if !self.painting {
+            return Ok(());
+        }
         if let Some(index) = selected {
             self.highlight.style(
                 unsafe { GetSysColor(COLOR_HIGHLIGHT) },
@@ -483,7 +518,7 @@ impl Preview {
         Ok(())
     }
     pub fn tick(&mut self, cfg: &Config) -> Result<(), String> {
-        if self.visible() {
+        if self.active() {
             let point = desktop::cursor()?;
             // Mouse hooks can miss moves while a native UI operation is running. Polling
             // only changed coordinates avoids starting a fresh dwell at the old deadline.
@@ -525,6 +560,33 @@ impl Preview {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "opens temporary previews to verify all three display modes across selection changes"]
+    fn display_modes_apply_to_the_entire_selection_session() {
+        let _overlay = overlay::Overlay::new().unwrap();
+        let mut cfg = crate::test_support::cfg();
+        for mode in ["always", "selected", "off"] {
+            cfg.preview_mode = mode.into();
+            let mut preview = Preview::new().unwrap();
+            preview.interactive(std::ptr::null_mut(), &cfg).unwrap();
+            assert!(preview.active());
+            assert_eq!(preview.visible(), mode == "always");
+            let rect = Rect {
+                x: 100,
+                y: 100,
+                width: 300,
+                height: 200,
+            };
+            preview.toggle("one".into(), rect, &cfg).unwrap();
+            assert_eq!(preview.count(), 1);
+            assert_eq!(preview.visible(), mode != "off");
+            preview.toggle("one".into(), rect, &cfg).unwrap();
+            assert_eq!(preview.count(), 0);
+            assert_eq!(preview.visible(), mode == "always");
+            preview.hide();
+            assert!(!preview.active());
+        }
+    }
     #[test]
     fn adjacent_regions_share_the_same_stroke() {
         let area = Rect {

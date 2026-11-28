@@ -62,6 +62,7 @@ pub enum ChoiceContext {
     MouseButton,
     TipContent,
     Theme,
+    PreviewMode,
     Font,
     Action,
     Position,
@@ -84,6 +85,9 @@ pub fn option(cfg: &Config, context: ChoiceContext, value: &str) -> String {
         (MouseButton, "x1") => ("Side button 1", "侧键 1"),
         (MouseButton, "x2") => ("Side button 2", "侧键 2"),
         (MouseButton, "off") => ("Disabled", "关闭"),
+        (PreviewMode, "always") => ("Show all after activation", "激活后显示全部"),
+        (PreviewMode, "selected") => ("Show after cumulative selection", "累计选择后显示"),
+        (PreviewMode, "off") => ("Hide throughout the session", "不显示框线"),
         (Theme, "system") => ("System theme", "跟随系统"),
         (Theme, "light") => ("Light", "明亮"),
         (Theme, "dark") => ("Dark", "黑暗"),
@@ -273,11 +277,11 @@ fn describe(section: &str, key: &str) -> (&'static str, &'static str, &'static s
             "Click to apply the hovered region. Selection buttons must differ and cannot share the centering button.",
             "单击立即应用悬停分区；两个选择按键须不同，且不能与居中按键重复。",
         ),
-        ("general", "preview") => (
-            "Show region outlines after Alt",
-            "Alt 触发后显示分区框线",
-            "Hold or double-tap Alt to select regions. Esc cancels; empty selection closes after 10 seconds.",
-            "长按或双击 Alt 进入相同的选择状态；Esc 取消，未选择时 10 秒退出。",
+        ("general", "preview_mode") => (
+            "Region outline display mode",
+            "分区框线显示模式",
+            "Always: show on activation; Selected: show after cumulative selection; Off: hide outlines throughout the session. Click selection still works.",
+            "激活后显示全部；累计选择后才显示；或整个会话不显示框线。三种模式均可选区。",
         ),
         ("general", "target_marker") => (
             "Mark the window awaiting an Alt action",
@@ -542,7 +546,7 @@ pub fn fields(tab: usize, axis: usize, cfg: &Config, doc: &DocumentMut) -> Vec<F
                 continue;
             }
             if *section == "general" {
-                let activation = matches!(key, "alt_hold_ms" | "preview" | "target_marker");
+                let activation = matches!(key, "alt_hold_ms" | "preview_mode" | "target_marker");
                 if activation != (tab == 4) {
                     continue;
                 }
@@ -589,6 +593,7 @@ pub fn fields(tab: usize, axis: usize, cfg: &Config, doc: &DocumentMut) -> Vec<F
                     ("topmost_marker", "size") => &["16", "20", "24", "32"],
                     ("topmost_marker", "position") => &["top-left", "bottom-left", "bottom-right"],
                     ("general", "language") => &["auto", "zh-CN", "en"],
+                    ("general", "preview_mode") => &["always", "selected", "off"],
                     ("shortcuts", "alt") => &["left", "right", "both"],
                     ("selection", "add_button" | "apply_button") => {
                         &["left", "right", "middle", "x1", "x2", "off"]
@@ -606,6 +611,7 @@ pub fn fields(tab: usize, axis: usize, cfg: &Config, doc: &DocumentMut) -> Vec<F
                 if !values.is_empty() {
                     let context = match (*section, key) {
                         ("general", "language") => ChoiceContext::Language,
+                        ("general", "preview_mode") => ChoiceContext::PreviewMode,
                         ("shortcuts", "alt" | "gesture") => ChoiceContext::AltSide,
                         ("shortcuts" | "selection", _) => ChoiceContext::MouseButton,
                         ("tip", "show") => ChoiceContext::TipContent,
@@ -679,7 +685,7 @@ fn field_order(section: &str) -> &'static [&'static str] {
             "autostart",
             "elevate",
             "alt_hold_ms",
-            "preview",
+            "preview_mode",
             "target_marker",
         ],
         "topmost_marker" => &["enabled", "size", "position"],
@@ -741,7 +747,7 @@ pub fn group(field: &Field) -> (&str, u8) {
     }
     match (field.section.as_str(), field.key.as_str()) {
         ("general", "alt_hold_ms") | ("shortcuts", "alt") => return ("keyboard-activation", 0),
-        ("general", "preview" | "target_marker") => return ("activation-feedback", 0),
+        ("general", "preview_mode" | "target_marker") => return ("activation-feedback", 0),
         ("shortcuts", _) => return ("mouse-actions", 0),
         ("general", "autostart" | "elevate") => return ("general", 1),
         ("mousecast", "radius" | "opacity") => return ("mousecast", 1),
@@ -825,7 +831,7 @@ mod tests {
                 }
             }
         }
-        for key in ["alt_hold_ms", "preview", "target_marker"] {
+        for key in ["alt_hold_ms", "preview_mode", "target_marker"] {
             assert!(
                 !expected[0]
                     .iter()

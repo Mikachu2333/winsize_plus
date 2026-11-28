@@ -73,9 +73,7 @@ impl App {
     fn refresh_preview(&mut self) -> Result<(), String> {
         self.preview.hide();
         input::track_preview(false)?;
-        if self.cfg.preview
-            && let Some(hwnd) = self.held_window
-        {
+        if let Some(hwnd) = self.held_window {
             self.preview.interactive(hwnd, &self.cfg)?;
             input::track_preview(true)?;
         }
@@ -436,7 +434,7 @@ impl App {
                 if self.preview.visible() {
                     self.close_preview()?;
                     self.notice(self.cfg.tr("Outlines hidden", "框线已隐藏"))
-                } else if !self.cfg.preview {
+                } else if self.cfg.preview_mode == "off" {
                     self.close_preview()?;
                     self.notice(self.cfg.tr(
                         "Region outlines disabled in settings",
@@ -755,7 +753,7 @@ impl App {
                 if self.mousecast {
                     self.cast.follow_mouse(point, &self.cfg)?;
                 }
-                if self.preview.visible() {
+                if self.preview.active() {
                     self.preview.follow(point, &self.cfg)?;
                     self.selection_tip()?;
                 }
@@ -777,7 +775,7 @@ impl App {
                     return Ok(());
                 }
                 let point = input::click_point();
-                if !self.preview.visible() {
+                if !self.preview.active() {
                     self.preview.interactive(self.window, &self.cfg)?;
                 }
                 if let Some((name, rect)) = self.preview.hit(point, &self.cfg)? {
@@ -1515,7 +1513,7 @@ mod tests {
     fn borders_notice_reflects_visibility_and_clears_old_deadlines() {
         let _dpi = crate::test_support::Dpi::new();
         let mut cfg = crate::test_support::cfg();
-        cfg.preview = false;
+        cfg.preview_mode = "off".into();
         let overlay = Overlay::new().unwrap();
         let _hooks = input::Hooks::start(&cfg).unwrap();
         let mut app = App {
@@ -1559,7 +1557,7 @@ mod tests {
                 "分区框线已在设置中禁用"
             )
         );
-        app.cfg.preview = true;
+        app.cfg.preview_mode = "always".into();
         app.cfg.keys.insert(0x42, "borders".into());
         app.act("borders").unwrap();
         assert!(app.preview.visible());

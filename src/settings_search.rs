@@ -343,7 +343,7 @@ fn aliases(_: usize, section: &str, key: &str) -> &'static [&'static str] {
         ("general", "alt_hold_ms") => {
             &["长按时间", "触发延迟", "等待时间", "按住时间", "hold delay"]
         }
-        ("general", "preview") => &["分区预览", "区域预览", "操作预览", "框线预览"],
+        ("general", "preview_mode") => &["分区预览", "区域预览", "操作预览", "框线预览"],
         ("general", "target_marker") => {
             &["目标窗口", "待操作窗口", "目标边框", "选择标记", "目标高亮"]
         }
