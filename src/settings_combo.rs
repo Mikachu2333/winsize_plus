@@ -8,6 +8,7 @@ use windows_sys::{
     },
     core::w,
 };
+pub const COMMIT: u32 = 0x7f01;
 
 #[derive(Clone)]
 struct Search {
@@ -16,6 +17,7 @@ struct Search {
     query: String,
     busy: bool,
     composing: bool,
+    editing: bool,
 }
 thread_local! {static SEARCHES: RefCell<HashMap<usize,Search>> = RefCell::new(HashMap::new());}
 fn text(hwnd: HWND) -> String {
@@ -72,6 +74,7 @@ pub fn populate(combo: HWND, options: &[(String, String)], selected: &str) {
                 query: String::new(),
                 busy: false,
                 composing: false,
+                editing: false,
             },
         );
     });
@@ -109,6 +112,7 @@ fn restore(combo: HWND) {
     let search = SEARCHES.with_borrow_mut(|all| {
         let s = all.get_mut(&(combo as usize))?;
         s.query.clear();
+        s.editing = false;
         Some(s.clone())
     });
     let Some(search) = search else {
@@ -135,19 +139,9 @@ pub fn original_index(combo: HWND, index: isize) -> Option<usize> {
     (data >= 0).then_some(data as usize)
 }
 pub fn selected_index(combo: HWND) -> Option<usize> {
-    let state = SEARCHES.with_borrow(|all| {
-        all.get(&(combo as usize))
-            .map(|s| (s.query.is_empty(), s.committed))
-    });
-    state.and_then(|(empty, committed)| {
-        if empty {
-            original_index(combo, send(combo, CB_GETCURSEL, 0, 0)).or(committed)
-        } else {
-            committed
-        }
-    })
+    SEARCHES.with_borrow(|all| all.get(&(combo as usize)).and_then(|s| s.committed))
 }
-fn commit(combo: HWND) {
+fn commit(combo: HWND) -> bool {
     let index = original_index(combo, send(combo, CB_GETCURSEL, 0, 0));
     if let Some(index) = index {
         SEARCHES.with_borrow_mut(|all| {
@@ -156,6 +150,20 @@ fn commit(combo: HWND) {
                 s.query.clear();
             }
         });
+        return true;
+    }
+    false
+}
+fn confirm(combo: HWND) {
+    if commit(combo) {
+        unsafe {
+            PostMessageW(
+                GetParent(combo),
+                WM_COMMAND,
+                (GetDlgCtrlID(combo) as usize & 0xffff) | ((COMMIT as usize) << 16),
+                combo as isize,
+            );
+        }
     }
 }
 pub fn filter(combo: HWND) {
@@ -167,6 +175,7 @@ pub fn filter(combo: HWND) {
             return None;
         }
         s.query = query.clone();
+        s.editing = true;
         Some(s.clone())
     });
     let Some(search) = search else {
@@ -183,11 +192,8 @@ pub fn filter(combo: HWND) {
 }
 /// Returns true for search-only changes which must not become configuration edits.
 pub fn notification(combo: HWND, event: u32) -> bool {
-    let state = SEARCHES.with_borrow(|all| {
-        all.get(&(combo as usize))
-            .map(|s| (s.busy, s.query.is_empty()))
-    });
-    let Some((busy, empty)) = state else {
+    let state = SEARCHES.with_borrow(|all| all.get(&(combo as usize)).map(|s| (s.busy, s.editing)));
+    let Some((busy, editing)) = state else {
         return false;
     };
     if busy {
@@ -199,11 +205,27 @@ pub fn notification(combo: HWND, event: u32) -> bool {
             true
         }
         CBN_SELCHANGE => {
-            commit(combo);
+            SEARCHES.with_borrow_mut(|all| {
+                if let Some(s) = all.get_mut(&(combo as usize)) {
+                    s.editing = true;
+                }
+            });
+            true
+        }
+        CBN_DROPDOWN => {
+            SEARCHES.with_borrow_mut(|all| {
+                if let Some(s) = all.get_mut(&(combo as usize)) {
+                    s.editing = true;
+                }
+            });
             false
         }
+        CBN_SELENDOK => {
+            confirm(combo);
+            true
+        }
         CBN_SELENDCANCEL | CBN_KILLFOCUS => {
-            if !empty {
+            if editing {
                 restore(combo);
             }
             true
@@ -230,7 +252,7 @@ unsafe extern "system" fn combo_proc(
             SEARCHES.with_borrow_mut(|all| {
                 if let Some(search) = all.get_mut(&(hwnd as usize))
                     && !search.busy
-                    && search.query.is_empty()
+                    && !search.editing
                 {
                     search.committed = original;
                 }
@@ -284,13 +306,7 @@ unsafe extern "system" fn edit_proc(
                 if send(combo, CB_GETCURSEL, 0, 0) < 0 && send(combo, CB_GETCOUNT, 0, 0) > 0 {
                     send(combo, CB_SETCURSEL, 0, 0);
                 }
-                commit(combo);
-                PostMessageW(
-                    GetParent(combo),
-                    WM_COMMAND,
-                    (GetDlgCtrlID(combo) as usize & 0xffff) | ((CBN_SELCHANGE as usize) << 16),
-                    combo as isize,
-                );
+                confirm(combo);
             }
             send(combo, CB_SHOWDROPDOWN, 0, 0);
             restore(combo);
@@ -308,6 +324,70 @@ unsafe extern "system" fn edit_proc(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "uses native dropdown navigation to verify Escape restores and Enter confirms"]
+    fn browsing_with_arrows_does_not_commit_until_confirmed() {
+        unsafe extern "system" fn parent(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+            if msg == WM_COMMAND {
+                notification(lp as HWND, (wp >> 16) as u32);
+                return 0;
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+        }
+        unsafe {
+            let root = CreateWindowExW(
+                0,
+                w!("STATIC"),
+                w!("Dropdown transaction test"),
+                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                100,
+                100,
+                600,
+                400,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            );
+            SetWindowLongPtrW(root, GWLP_WNDPROC, parent as *const () as isize);
+            let combo = CreateWindowExW(
+                0,
+                w!("COMBOBOX"),
+                w!(""),
+                WS_CHILD | WS_VISIBLE | CBS_DROPDOWN as u32 | WS_VSCROLL,
+                10,
+                10,
+                300,
+                240,
+                root,
+                1 as HMENU,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            );
+            attach(combo);
+            populate(
+                combo,
+                &[
+                    ("old".into(), "Old selection".into()),
+                    ("new".into(), "New selection".into()),
+                ],
+                "old",
+            );
+            let mut info = COMBOBOXINFO {
+                cbSize: size_of::<COMBOBOXINFO>() as u32,
+                ..Default::default()
+            };
+            GetComboBoxInfo(combo, &mut info);
+            for confirm in [false, true] {
+                SendMessageW(combo, CB_SHOWDROPDOWN, 1, 0);
+                SendMessageW(combo, WM_KEYDOWN, 0x28, 1);
+                assert_eq!(selected_index(combo), Some(0));
+                SendMessageW(info.hwndItem, WM_KEYDOWN, if confirm { 13 } else { 27 }, 1);
+                assert_eq!(selected_index(combo), Some(usize::from(confirm)));
+            }
+            DestroyWindow(root);
+        }
+    }
     #[test]
     fn searches_values_labels_and_multiple_unicode_terms() {
         let options = vec![
@@ -361,7 +441,9 @@ mod tests {
             assert_eq!(send(combo, CB_GETCOUNT, 0, 0), 1);
             assert_eq!(selected_index(combo), Some(10));
             send(combo, CB_SETCURSEL, 0, 0);
-            assert!(!notification(combo, CBN_SELCHANGE));
+            assert!(notification(combo, CBN_SELCHANGE));
+            assert_eq!(selected_index(combo), Some(10));
+            assert!(notification(combo, CBN_SELENDOK));
             assert_eq!(selected_index(combo), Some(400));
             notification(combo, CBN_CLOSEUP);
             assert_eq!(text(combo), "特殊分区");

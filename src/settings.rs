@@ -2711,7 +2711,10 @@ impl Editor {
             }
             return Ok(());
         }
-        if matches!(event, BN_CLICKED | CBN_SELCHANGE | EN_CHANGE | EDIT_COMMIT) {
+        if matches!(
+            event,
+            BN_CLICKED | crate::settings_combo::COMMIT | EN_CHANGE | EDIT_COMMIT
+        ) {
             // A new user action can report the same problem again; background
             // retries without another edit keep the original ten-second deadline.
             self.last_error.borrow_mut().take();
@@ -2808,8 +2811,10 @@ impl Editor {
         }
         let changed = match kind {
             Kind::Bool => event == BN_CLICKED,
-            Kind::Choice(_) | Kind::Font => event == CBN_SELCHANGE,
-            Kind::Mapping if slot == 0 && row.field.section != "presets" => event == CBN_SELCHANGE,
+            Kind::Choice(_) | Kind::Font => event == crate::settings_combo::COMMIT,
+            Kind::Mapping if slot == 0 && row.field.section != "presets" => {
+                event == crate::settings_combo::COMMIT
+            }
             _ => event == EN_CHANGE,
         };
         if changed {
@@ -4477,7 +4482,11 @@ mod tests {
             let control = editor.rows[index].c(0);
             send(control, CB_SETCURSEL, choice, 0);
             editor
-                .command(BASE + index as i32 * STRIDE, CBN_SELCHANGE, control)
+                .command(
+                    BASE + index as i32 * STRIDE,
+                    crate::settings_combo::COMMIT,
+                    control,
+                )
                 .unwrap();
         }
         editor.save().unwrap();
@@ -5016,7 +5025,10 @@ mod tests {
         assert_eq!(send(combo, CB_GETCOUNT, 0, 0), 1);
         assert_eq!(Editor::selected_value(&editor.rows[index], 0), "1/9");
         send(combo, CB_SETCURSEL, 0, 0);
-        editor.command(id, CBN_SELCHANGE, combo).unwrap();
+        crate::settings_combo::notification(combo, CBN_SELENDOK);
+        editor
+            .command(id, crate::settings_combo::COMMIT, combo)
+            .unwrap();
         assert_eq!(crate::settings_combo::selected_index(combo), Some(selected));
         assert_eq!(editor.collect().unwrap()["keys"]["Q"].as_str(), Some("4/4"));
     }
@@ -5593,7 +5605,7 @@ mod tests {
                 send(
                     root,
                     WM_COMMAND,
-                    (BASE + 2 * STRIDE) as usize | ((CBN_SELCHANGE as usize) << 16),
+                    (BASE + 2 * STRIDE) as usize | ((crate::settings_combo::COMMIT as usize) << 16),
                     language as isize,
                 );
                 std::thread::sleep(Duration::from_millis(800));
@@ -5872,7 +5884,8 @@ mod tests {
                 send(
                     hwnd,
                     WM_COMMAND,
-                    control_id("gesture") as usize | ((CBN_SELCHANGE as usize) << 16),
+                    control_id("gesture") as usize
+                        | ((crate::settings_combo::COMMIT as usize) << 16),
                     gesture as isize,
                 );
                 for key in ["move_button", "resize_button", "center_button"] {
@@ -5886,7 +5899,8 @@ mod tests {
                 send(
                     hwnd,
                     WM_COMMAND,
-                    control_id("gesture") as usize | ((CBN_SELCHANGE as usize) << 16),
+                    control_id("gesture") as usize
+                        | ((crate::settings_combo::COMMIT as usize) << 16),
                     gesture as isize,
                 );
                 // The window format is editable only while the window tip is selected.
@@ -5909,7 +5923,7 @@ mod tests {
                     send(
                         hwnd,
                         WM_COMMAND,
-                        tip_id("show") as usize | ((CBN_SELCHANGE as usize) << 16),
+                        tip_id("show") as usize | ((crate::settings_combo::COMMIT as usize) << 16),
                         show as isize,
                     );
                     if (unsafe { IsWindowEnabled(format) } != 0) != expected
