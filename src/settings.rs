@@ -1769,8 +1769,17 @@ impl Editor {
                     let row_gap = self.s(10).min((width - 3).max(0) / 4);
                     let delete_width = button_width.min((width / 4).max(1));
                     let fields_width = (width - delete_width - 2 * row_gap).max(2);
-                    let key_width = name_width.min((fields_width / 3).max(1));
-                    let value_width = (fields_width - key_width).max(1);
+                    let key_width = name_width.min(if preset {
+                        (fields_width * 2 / 5).max(1)
+                    } else {
+                        (fields_width / 3).max(1)
+                    });
+                    let value_width = if preset {
+                        key_width * 3 / 2
+                    } else {
+                        fields_width - key_width
+                    }
+                    .max(1);
                     let top = y - self.scroll[1];
                     place(row.c(3), padding, top, key_width, h);
                     place(
@@ -1809,7 +1818,30 @@ impl Editor {
                         related_width,
                         h,
                     );
-                    y += h;
+                    let state = caption(row.c(12));
+                    let state_height = if state.is_empty() {
+                        unsafe {
+                            ShowWindow(row.c(12), SW_HIDE);
+                        }
+                        0
+                    } else {
+                        let state_width =
+                            (width - preview_width - related_width - 2 * row_gap).max(1);
+                        let state_height = measured(&state, &self.hint_font, state_width)
+                            .max(self.hint_font.height());
+                        place(
+                            row.c(12),
+                            padding + preview_width + row_gap,
+                            y - self.scroll[1] + ((h - state_height) / 2).max(0),
+                            state_width,
+                            state_height,
+                        );
+                        unsafe {
+                            ShowWindow(row.c(12), SW_SHOW);
+                        }
+                        state_height
+                    };
+                    y += h.max(state_height);
                     if !row.c(7).is_null() {
                         y += gap;
                         let hint_height =
@@ -1910,7 +1942,7 @@ impl Editor {
                 place(row.c(2), padding, y - self.scroll[1], width, hint);
                 y += hint;
             }
-            if !row.c(12).is_null() {
+            if !row.c(12).is_null() && !matches!(row.field.kind, Kind::Mapping) {
                 let state = caption(row.c(12));
                 if state.is_empty() {
                     unsafe {
@@ -5430,6 +5462,11 @@ mod tests {
         let _hooks = input::Hooks::escape_only().unwrap();
         for tab in [2, 4] {
             let mut editor = test_editor(tab, &format!("mapping-rows-{tab}"));
+            for row in &editor.rows {
+                if matches!(row.field.kind, Kind::Mapping) {
+                    set_text(row.c(12), "未保存 · 文本按 Enter 或离开后保存");
+                }
+            }
             for (dpi, width) in [(96, 640), (96, 980), (144, 1100), (192, 1280)] {
                 editor.dpi = dpi;
                 unsafe {
@@ -5476,12 +5513,20 @@ mod tests {
                         "inputs overlap at dpi={dpi}, width={width}"
                     );
                     assert_eq!(delete.right, pane.right - editor.s(16));
+                    if row.field.section == "presets" {
+                        assert_eq!(value.right - value.left, (name.right - name.left) * 3 / 2);
+                    }
                     let preview = geometry(row.c(5));
                     let related = geometry(row.c(6));
                     assert_eq!(preview.top, related.top);
                     assert!(preview.right < related.left);
                     assert_eq!(related.right, delete.right);
-                    assert!(caption(row.c(12)).is_empty());
+                    let status = geometry(row.c(12));
+                    assert!(status.left > preview.right && status.right < related.left);
+                    assert!(status.top >= preview.top && status.top < preview.bottom);
+                    if !row.c(7).is_null() {
+                        assert!(status.bottom <= geometry(row.c(7)).top);
+                    }
                 }
             }
         }
