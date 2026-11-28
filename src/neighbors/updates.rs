@@ -1,7 +1,7 @@
 //! One bounded update lane per foreign UI thread; newer sessions supersede older work.
 use crate::{desktop, layout::Rect};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::{
         Arc, Condvar, Mutex, OnceLock, Weak,
         atomic::{AtomicU64, Ordering},
@@ -22,6 +22,7 @@ struct Job {
 #[derive(Default)]
 struct State {
     latest: HashMap<usize, Job>,
+    order: VecDeque<usize>,
     owners: HashMap<usize, u64>,
     active: Option<(usize, u64, Instant)>,
     error: Option<(u64, String)>,
@@ -80,7 +81,7 @@ fn lane(key: Key) -> Result<Arc<Lane>, String> {
                             return;
                         }
                     }
-                    let handle = *state.latest.keys().next().unwrap();
+                    let handle = state.order.pop_front().unwrap();
                     let job = state.latest.remove(&handle).unwrap();
                     if state.owners.get(&handle) != Some(&job.generation) {
                         continue;
@@ -184,6 +185,9 @@ impl Updates {
                     continue;
                 }
                 state.owners.insert(job.handle, self.generation);
+                if !state.latest.contains_key(&job.handle) {
+                    state.order.push_back(job.handle);
+                }
                 state.latest.insert(job.handle, job);
             }
             target.wake.notify_one();

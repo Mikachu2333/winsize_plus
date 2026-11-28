@@ -298,7 +298,9 @@ fn run(shared: Arc<Shared>) {
             if motion.finished || result.is_err() {
                 drag = None;
                 let mut state = shared.state.lock().unwrap();
-                state.error = result.err();
+                if shared.generation.load(Ordering::Acquire) == motion.id {
+                    state.error = result.err();
+                }
                 state.busy = state.job.is_some();
             }
         }
