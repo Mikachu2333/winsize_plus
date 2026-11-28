@@ -242,6 +242,7 @@ pub struct Hint {
     links: Vec<Link>,
     panels: Vec<Panel>,
     refreshed: Option<Instant>,
+    shown: Vec<Rect>,
 }
 impl Hint {
     pub fn hide(&mut self) {
@@ -249,6 +250,7 @@ impl Hint {
             p.hide();
         }
         self.refreshed = None;
+        self.shown.clear();
         crate::input::edge_cursor(None);
     }
     pub fn follow(&mut self, point: POINT, cfg: &Config) -> Result<(), String> {
@@ -261,39 +263,51 @@ impl Hint {
             self.refreshed = Some(Instant::now());
         }
         let Some(seed) = hit(&self.links, point, radius(point), None) else {
-            for p in &self.panels {
-                p.hide();
-            }
+            self.show(&[])?;
             crate::input::edge_cursor(None);
             return Ok(());
         };
         let group = connected(&self.links, seed);
-        while self.panels.len() < group.len() {
-            self.panels.push(Panel::new()?);
-        }
-        for p in &self.panels {
-            p.hide();
-        }
-        for (&i, panel) in group.iter().zip(&self.panels) {
-            let l = &self.links[i];
-            let rect = match l.axis {
-                Axis::X => Rect {
-                    x: l.coordinate as i32 - 2,
-                    y: l.start as i32,
-                    width: 4,
-                    height: (l.end - l.start) as i32,
-                },
-                Axis::Y => Rect {
-                    x: l.start as i32,
-                    y: l.coordinate as i32 - 2,
-                    width: (l.end - l.start) as i32,
-                    height: 4,
-                },
-            };
-            panel.style(0xd77800, 220);
-            panel.show(rect);
-        }
+        let rectangles = group
+            .iter()
+            .map(|&i| {
+                let l = &self.links[i];
+                match l.axis {
+                    Axis::X => Rect {
+                        x: l.coordinate as i32 - 2,
+                        y: l.start as i32,
+                        width: 4,
+                        height: (l.end - l.start) as i32,
+                    },
+                    Axis::Y => Rect {
+                        x: l.start as i32,
+                        y: l.coordinate as i32 - 2,
+                        width: (l.end - l.start) as i32,
+                        height: 4,
+                    },
+                }
+            })
+            .collect::<Vec<_>>();
+        self.show(&rectangles)?;
         crate::input::edge_cursor(Some(self.links[seed].axis));
+        Ok(())
+    }
+    fn show(&mut self, rectangles: &[Rect]) -> Result<(), String> {
+        if self.shown == rectangles {
+            return Ok(());
+        }
+        while self.panels.len() < rectangles.len() {
+            let panel = Panel::new()?;
+            panel.style(0xd77800, 220);
+            self.panels.push(panel);
+        }
+        for (index, &rect) in rectangles.iter().enumerate() {
+            self.panels[index].show(rect);
+        }
+        for panel in &self.panels[rectangles.len()..] {
+            panel.hide();
+        }
+        self.shown = rectangles.to_vec();
         Ok(())
     }
 }
@@ -456,6 +470,7 @@ fn resize(mut rect: Rect, axis: Axis, before: bool, delta: i64) -> Rect {
 mod tests {
     use super::*;
     use std::ptr::null_mut;
+    use windows_sys::Win32::Graphics::Gdi::{GetUpdateRect, UpdateWindow, ValidateRect};
     fn window(x: i32, y: i32, width: i32, height: i32) -> Window {
         Window {
             hwnd: null_mut(),
@@ -474,6 +489,31 @@ mod tests {
             movable: true,
         }
     }
+    #[test]
+    #[ignore = "shows temporary shared-edge highlights to verify unchanged geometry does not invalidate windows"]
+    fn unchanged_shared_edge_does_not_repaint() {
+        let _overlay = crate::overlay::Overlay::new().unwrap();
+        let mut hint = Hint::default();
+        let rect = Rect {
+            x: 100,
+            y: 100,
+            width: 4,
+            height: 300,
+        };
+        hint.show(&[rect]).unwrap();
+        unsafe {
+            UpdateWindow(hint.panels[0].0);
+            ValidateRect(hint.panels[0].0, std::ptr::null());
+        }
+        hint.show(&[rect]).unwrap();
+        assert_eq!(
+            unsafe { GetUpdateRect(hint.panels[0].0, std::ptr::null_mut(), 0) },
+            0
+        );
+        hint.show(&[]).unwrap();
+        assert_eq!(unsafe { IsWindowVisible(hint.panels[0].0) }, 0);
+    }
+
     #[test]
     fn t_junction_expands_only_along_chosen_axis() {
         let windows = [

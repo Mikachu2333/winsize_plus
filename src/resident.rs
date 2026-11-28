@@ -832,6 +832,9 @@ impl App {
                 self.close_preview()?;
             } else {
                 self.preview.tick(&self.cfg)?;
+                if self.held_window.is_some() && self.selection_suspended.is_none() {
+                    self.neighbors.follow(desktop::cursor()?, &self.cfg)?;
+                }
                 self.selection_tip()?;
                 self.marker.follow()?;
                 self.preview_check = Some(later(100));
