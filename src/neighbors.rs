@@ -466,6 +466,7 @@ impl Drag {
         }
     }
     pub fn follow(&self, point: POINT) -> Result<(), String> {
+        self.updates.status()?;
         let delta = self.delta(point);
         if self.last_delta.get() == Some(delta) {
             return Ok(());
@@ -967,5 +968,116 @@ mod tests {
         assert_eq!(right.x + right.width, 1003);
         assert_eq!(right.x - left.x - left.width, 3);
         assert_eq!(drag.delta(POINT { x: 0, y: 0 }), -300);
+    }
+    #[test]
+    #[ignore]
+    fn slow_process_does_not_block_other_windows_or_supersede_new_sessions() {
+        use std::{
+            os::windows::process::CommandExt,
+            process::{Command, Stdio},
+        };
+        let spawn = |id: &str| {
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "neighbors::tests::linked_target_process",
+                ])
+                .env("WINSIZEP_LINKED_TEST", id)
+                .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap()
+        };
+        let slow_id = format!("audit-slow-{}", std::process::id());
+        let fast_id = format!("audit-fast-{}", std::process::id());
+        let mut slow = spawn(&slow_id);
+        let mut fast = spawn(&fast_id);
+        let result = std::panic::catch_unwind(|| {
+            let lookup = |id: &str| {
+                let end = Instant::now() + Duration::from_secs(5);
+                loop {
+                    let h = unsafe {
+                        FindWindowW(
+                            windows_sys::core::w!("WinSizeP.LinkedTest"),
+                            desktop::wide(format!("{id}-0")).as_ptr(),
+                        )
+                    };
+                    if !h.is_null() {
+                        break h;
+                    }
+                    assert!(Instant::now() < end);
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            };
+            let slow_hwnd = lookup(&slow_id);
+            let fast_hwnd = lookup(&fast_id);
+            let slow_rect = desktop::bounds(slow_hwnd).unwrap().0;
+            let fast_rect = desktop::bounds(fast_hwnd).unwrap().0;
+            unsafe {
+                SendMessageW(slow_hwnd, WM_APP + 71, 1500, 0);
+            }
+            let updates = updates::Updates::new().unwrap();
+            updates
+                .submit(vec![
+                    (
+                        slow_hwnd as usize,
+                        Rect {
+                            width: slow_rect.width + 20,
+                            ..slow_rect
+                        },
+                    ),
+                    (
+                        fast_hwnd as usize,
+                        Rect {
+                            width: fast_rect.width + 20,
+                            ..fast_rect
+                        },
+                    ),
+                ])
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(400));
+            let fast_after = desktop::bounds(fast_hwnd).unwrap().0;
+            assert_eq!(
+                fast_after.width,
+                fast_rect.width + 20,
+                "responsive process waited behind a slow process"
+            );
+            let newer = updates::Updates::new().unwrap();
+            newer
+                .submit(vec![(
+                    slow_hwnd as usize,
+                    Rect {
+                        width: slow_rect.width + 80,
+                        ..slow_rect
+                    },
+                )])
+                .unwrap();
+            updates
+                .submit(vec![(slow_hwnd as usize, slow_rect)])
+                .unwrap();
+            drop(newer);
+            drop(updates);
+            let end = Instant::now() + Duration::from_secs(3);
+            while desktop::bounds(slow_hwnd).unwrap().0.width != slow_rect.width + 80
+                && Instant::now() < end
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(
+                desktop::bounds(slow_hwnd).unwrap().0.width,
+                slow_rect.width + 80,
+                "old session overwrote the newer target"
+            );
+        });
+        let _ = slow.kill();
+        let _ = slow.wait();
+        let _ = fast.kill();
+        let _ = fast.wait();
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
     }
 }
