@@ -40,8 +40,9 @@ pub fn cursor() -> Result<POINT, String> {
 }
 
 static DISPLAY_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+type DisplayCache = (u64, Vec<(usize, isize, Display)>);
 thread_local! {
-    static DISPLAY_CACHE: std::cell::RefCell<(u64, Vec<(usize, isize, Display)>)> = const { std::cell::RefCell::new((u64::MAX, Vec::new())) };
+    static DISPLAY_CACHE: std::cell::RefCell<DisplayCache> = const { std::cell::RefCell::new((u64::MAX, Vec::new())) };
 }
 pub fn display_epoch() -> u64 {
     DISPLAY_EPOCH.load(std::sync::atomic::Ordering::Relaxed)
