@@ -520,8 +520,8 @@ impl Config {
         sections.push(mouse);
         let mut regions = vec![
             self.tr(
-                "Hold Alt + a key, or double-tap Alt then press a key:",
-                "按住 Alt + 按键，或双击 Alt 后按键：",
+                "Hold or double-tap Alt, release it, then use a key or mouse action:",
+                "长按或双击 Alt 激活后，可松开 Alt 使用按键或鼠标：",
             )
             .into(),
         ];

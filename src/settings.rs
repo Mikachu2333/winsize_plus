@@ -1165,7 +1165,7 @@ impl Editor {
                 self.window.0 as usize,
             ))?;
             if is_combo {
-                crate::settings_combo::attach(hwnd);
+                crate::settings_combo::attach(hwnd, self.cfg.zh);
                 desktop::check(SetPropW(hwnd, w!("SettingsCombo"), 1usize as HANDLE))?;
                 let mut info = COMBOBOXINFO {
                     cbSize: size_of::<COMBOBOXINFO>() as u32,
@@ -1419,9 +1419,14 @@ impl Editor {
                     if row.field.section == "keys" {
                         unsafe {
                             SetPropW(row.c(3), w!("ShortcutCapture"), 1 as HANDLE);
+                            SetPropW(
+                                row.c(3),
+                                w!("ShortcutZh"),
+                                usize::from(self.cfg.zh) as HANDLE,
+                            );
                         }
-                        let hint = shortcut_caption(&key, false);
-                        self.control(&mut row, index, 7, "STATIC", &hint, SS_LEFT as u32)?;
+                        let hint = shortcut_caption(&key, false, self.cfg.zh);
+                        self.control(&mut row, index, 7, "STATIC", &hint, SS_LEFT)?;
                     }
                     self.control(
                         &mut row,
@@ -3221,17 +3226,18 @@ impl Editor {
         Ok(())
     }
 }
-fn shortcut_caption(name: &str, captured: bool) -> String {
+fn shortcut_caption(name: &str, captured: bool, zh: bool) -> String {
     let value = config::vk(name).map_or_else(
         || name.to_owned(),
         |vk| format!("{} · VK:{vk:02X}", config::shortcut_name(name)),
     );
     format!(
         "{value} · {}",
-        if captured {
-            "已录入；再次点击可重录 / Click to recapture"
-        } else {
-            "点击后按一个键录入 / Click, then press one key"
+        match (captured, zh) {
+            (true, true) => "已录入；再次点击可重录",
+            (false, true) => "点击后按一个键录入",
+            (true, false) => "Captured; click to recapture",
+            (false, false) => "Click, then press one key",
         }
     )
 }
@@ -3405,6 +3411,7 @@ unsafe extern "system" fn control_proc(
         }
         if message == WM_NCDESTROY {
             RemovePropW(hwnd, w!("ShortcutCapture"));
+            RemovePropW(hwnd, w!("ShortcutZh"));
             RemovePropW(hwnd, w!("OwnerCombo"));
             RemoveWindowSubclass(hwnd, Some(control_proc), 1);
             return DefSubclassProc(hwnd, message, wp, lp);
@@ -3415,12 +3422,20 @@ unsafe extern "system" fn control_proc(
         let id = GetDlgCtrlID(hwnd);
         if !GetPropW(hwnd, w!("ShortcutCapture")).is_null() {
             let hint = GetDlgItem(GetParent(hwnd), id + 4);
+            let zh = !GetPropW(hwnd, w!("ShortcutZh")).is_null();
             if matches!(message, WM_SETFOCUS | WM_LBUTTONDOWN) {
                 SetPropW(hwnd, w!("ShortcutCapture"), 1 as HANDLE);
-                set_text(hint, "正在录入：请按一个键 / Press one key");
+                set_text(
+                    hint,
+                    if zh {
+                        "正在录入：请按一个键"
+                    } else {
+                        "Recording: press one key"
+                    },
+                );
             }
             if message == WM_KILLFOCUS {
-                set_text(hint, &shortcut_caption(&caption(hwnd), false));
+                set_text(hint, &shortcut_caption(&caption(hwnd), false, zh));
             }
             if message == WM_KEYDOWN || message == WM_SYSKEYDOWN {
                 if GetPropW(hwnd, w!("ShortcutCapture")) as usize == 2
@@ -3435,12 +3450,19 @@ unsafe extern "system" fn control_proc(
                     let name = config::shortcut_name(&format!("VK:{key:02X}"));
                     set_text(hwnd, &name);
                     SetPropW(hwnd, w!("ShortcutCapture"), 2 as HANDLE);
-                    set_text(hint, &shortcut_caption(&name, true));
+                    set_text(hint, &shortcut_caption(&name, true, zh));
                     SendMessageW(hwnd, EM_SETSEL, 0, -1);
                     return 0;
                 }
                 if config::reserved_key(key) && !matches!(wp,9|13|27|0x10..=0x12|0xa0..=0xa5) {
-                    set_text(hint, "该按键由系统保留，请换一个 / Reserved key");
+                    set_text(
+                        hint,
+                        if zh {
+                            "该按键由系统保留，请换一个"
+                        } else {
+                            "Reserved key; choose another"
+                        },
+                    );
                     return 0;
                 }
             }
@@ -6087,8 +6109,8 @@ mod tests {
                     }
                 }
                 // Mouse controls follow switches immediately and retain saved selections.
-                send(hwnd, WM_COMMAND, (TAB_BASE + 4) as usize, 0);
-                wait_tab(hwnd, 4)?;
+                send(hwnd, WM_COMMAND, (TAB_BASE + 6) as usize, 0);
+                wait_tab(hwnd, 6)?;
                 let fields = schema::fields(6, 0, &Config::parse(&doc).unwrap(), &doc);
                 let control_id = |key: &str| {
                     BASE + fields

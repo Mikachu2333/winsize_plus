@@ -231,6 +231,7 @@ impl Prompt {
                 return Err(desktop::err());
             }
             desktop::check(SetWindowSubclass(prompt.edit, Some(edit_proc), 1, 0))?;
+            desktop::check(SetWindowSubclass(prompt.status, Some(edit_proc), 1, 0))?;
             for child in [target_label, prompt.edit, prompt.status] {
                 SendMessageW(
                     child,
@@ -461,6 +462,13 @@ mod tests {
             );
         }
         assert!(prompt.appearance.borrow().font.height() >= before);
+        unsafe {
+            SendMessageW(prompt.status, WM_KEYDOWN, 27, 1);
+        }
+        let cancel = std::iter::from_fn(input::next_event)
+            .find(|e| e.message == input::COMMAND_CANCEL)
+            .unwrap();
+        assert_eq!(cancel.wParam, prompt.window as usize);
     }
     #[test]
     fn names_precede_expressions_and_punctuation_is_preserved() {

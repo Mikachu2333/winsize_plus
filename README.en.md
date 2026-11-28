@@ -1,5 +1,11 @@
 # WinSizeP
 
+Activation, mouse clicks, dragging and linked resizing are grouped under **Window actions**. A single Alt selector activates both keyboard and mouse actions; the mouse switch disables all mouse actions. Outline modes are **Show all after activation**, **Show after cumulative selection**, and **Hide throughout the session**. Esc turns off settings preview switches.
+
+Dropdown arrow keys browse without saving; Enter or a confirmed mouse choice commits, and Esc restores the previous value. Empty searches display “No matches”. Click a shortcut field and press one key to capture it, or paste a key name/VK value. Inline messages distinguish drafts, invalid input and saved settings. Region and shortcut rows link directly to each other.
+
+The command editor shows its target window and monitor, follows tip colors and fonts, and supports scrollable errors. Losing focus or pausing cancels it. Esc restores the starting placement for ordinary moves, ordinary resizing and linked resizing alike.
+
 After Alt activation, drag a highlighted shared window edge to resize its neighbors together. Left or right drag works by default; elsewhere the original move/resize action applies. Adjacency tolerates gaps or overlaps up to 5 physical pixels and requires shared length greater than 1/16 of the corresponding work-area dimension. Connected seams support T-shaped and other arrangements; initial motion selects the axis at intersections. Group motion respects every participant's size limits. Esc restores the original geometry.
 
 Default regions are numbered left to right, top to bottom: `1/9`–`9/9` use Q/W/E, A/S/D, Z/X/C; `1/4`–`4/4` use top-row 1–4, independently of the numpad. Regions tile the monitor work area, and cumulative selection uses the enclosing rectangle. Unmodified legacy default layouts migrate; custom layouts remain intact.

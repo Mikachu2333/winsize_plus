@@ -44,8 +44,9 @@ fn matching(options: &[(String, String)], query: &str) -> Vec<usize> {
         })
         .collect()
 }
-pub fn attach(combo: HWND) {
+pub fn attach(combo: HWND, zh: bool) {
     unsafe {
+        SetPropW(combo, w!("ComboZh"), usize::from(zh) as HANDLE);
         SetWindowSubclass(combo, Some(combo_proc), 2, 0);
         let mut info = COMBOBOXINFO {
             cbSize: size_of::<COMBOBOXINFO>() as u32,
@@ -57,7 +58,11 @@ pub fn attach(combo: HWND) {
                 info.hwndItem,
                 EM_SETCUEBANNER,
                 0,
-                w!("Search / 搜索") as isize,
+                if zh {
+                    w!("输入搜索词")
+                } else {
+                    w!("Type to search")
+                } as isize,
             );
         }
     }
@@ -100,11 +105,12 @@ fn rebuild(combo: HWND, search: &Search, indices: &[usize]) {
         }
     }
     if indices.is_empty() {
+        let zh = unsafe { !GetPropW(combo, w!("ComboZh")).is_null() };
         let row = send(
             combo,
             CB_ADDSTRING,
             0,
-            wide("无匹配结果 / No matches").as_ptr() as isize,
+            wide(if zh { "无匹配结果" } else { "No matches" }).as_ptr() as isize,
         );
         send(combo, CB_SETITEMDATA, row as usize, -1);
     }
@@ -271,6 +277,7 @@ unsafe extern "system" fn combo_proc(
             return result;
         }
         if msg == WM_NCDESTROY {
+            RemovePropW(hwnd, w!("ComboZh"));
             SEARCHES.with_borrow_mut(|s| {
                 s.remove(&(hwnd as usize));
             });
@@ -377,7 +384,7 @@ mod tests {
                 std::ptr::null_mut(),
                 std::ptr::null(),
             );
-            attach(combo);
+            attach(combo, true);
             populate(
                 combo,
                 &[
@@ -443,7 +450,7 @@ mod tests {
                 std::ptr::null_mut(),
                 std::ptr::null(),
             );
-            attach(combo);
+            attach(combo, true);
             let mut options = (0..400)
                 .map(|n| (format!("region{n}"), format!("区域 {n}")))
                 .collect::<Vec<_>>();

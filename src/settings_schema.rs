@@ -293,8 +293,8 @@ fn describe(section: &str, key: &str) -> (&'static str, &'static str, &'static s
         ("shortcuts", "alt") => (
             "Activation Alt key",
             "激活使用的 Alt",
-            "Hold Alt until activation, then press a key; or double-tap Alt then press a key. Double-tap timing follows Windows.",
-            "长按 Alt 触发后配合按键，或双击 Alt 后按键；双击时间跟随 Windows。",
+            "Hold or double-tap this Alt to activate keyboard and mouse actions. Alt can then be released. Double-tap timing follows Windows.",
+            "长按或双击此 Alt 激活键盘和鼠标操作，激活后可松开 Alt；双击时间跟随 Windows。",
         ),
         ("shortcuts", "mouse_enabled") => (
             "Enable mouse actions",
@@ -317,14 +317,14 @@ fn describe(section: &str, key: &str) -> (&'static str, &'static str, &'static s
         ("shortcuts", "resize_enabled") => (
             "Enable window resizing",
             "启用调整窗口大小",
-            "Keeps the top-left corner fixed and moves the bottom-right corner.",
-            "固定左上角，拖动右下角调整大小。",
+            "Normally keeps the top-left corner fixed; a shared edge takes priority when linked resizing is enabled. Esc restores the starting size.",
+            "普通缩放固定左上角；启用联动时共边优先。Esc 恢复拖动前的大小。",
         ),
         ("shortcuts", "move_button") => (
             "Button for moving",
             "移动窗口的鼠标按键",
-            "Hold Alt and drag with this button.",
-            "按住 Alt，用此按键拖动。",
+            "Activate with Alt, then drag with this button. Alt can be released after activation.",
+            "Alt 激活后用此按键拖动，激活后可以松开 Alt。",
         ),
         ("shortcuts", "resize_button") => (
             "Button for resizing",
