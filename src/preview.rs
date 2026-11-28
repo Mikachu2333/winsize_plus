@@ -137,9 +137,29 @@ fn nearest(regions: &[PresetRegion], point: POINT) -> Option<usize> {
             // Double coordinates preserve half-pixel centers; i128 prevents overflow.
             let dx = i128::from(point.x) * 2 - (i128::from(rect.x) * 2 + i128::from(rect.width));
             let dy = i128::from(point.y) * 2 - (i128::from(rect.y) * 2 + i128::from(rect.height));
-            (dx * dx + dy * dy, rect.y, rect.x, &region.name)
+            (
+                dx * dx + dy * dy,
+                center(rect).1,
+                center(rect).0,
+                i64::from(rect.width) * i64::from(rect.height),
+                &region.name,
+            )
         })
         .map(|(index, _)| index)
+}
+fn center(rect: Rect) -> (i64, i64) {
+    (
+        i64::from(rect.x) * 2 + i64::from(rect.width),
+        i64::from(rect.y) * 2 + i64::from(rect.height),
+    )
+}
+fn coincident(regions: &[PresetRegion], selected: usize) -> Vec<usize> {
+    let target = center(regions[selected].rect);
+    regions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, r)| (center(r.rect) == target).then_some(index))
+        .collect()
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Chosen {
@@ -172,6 +192,7 @@ fn enclosing(rects: impl Iterator<Item = Rect>) -> Option<Rect> {
 pub struct Preview {
     base: Panel,
     highlight: Panel,
+    overlaps: Vec<Panel>,
     label: Label,
     chosen: Vec<Chosen>,
     chosen_panels: Vec<Panel>,
@@ -200,6 +221,7 @@ impl Preview {
         Ok(Self {
             base: Panel::new()?,
             highlight: Panel::new()?,
+            overlaps: Vec::new(),
             label: Label::new()?,
             chosen: Vec::new(),
             chosen_panels: Vec::new(),
@@ -294,6 +316,9 @@ impl Preview {
     pub fn hide(&mut self) {
         self.base.hide();
         self.highlight.hide();
+        for panel in &self.overlaps {
+            panel.hide();
+        }
         self.label.hide();
         for panel in &self.chosen_panels {
             panel.hide();
@@ -395,6 +420,9 @@ impl Preview {
     }
     fn show_base(&mut self, _cfg: &Config) -> Result<(), String> {
         self.highlight.hide();
+        for panel in &self.overlaps {
+            panel.hide();
+        }
         self.label.hide();
         self.selected = None;
         self.focused = false;
@@ -408,14 +436,45 @@ impl Preview {
         }
         self.selected = selected;
         self.highlight.hide();
+        for panel in &self.overlaps {
+            panel.hide();
+        }
         self.label.hide();
         if let Some(index) = selected {
+            self.highlight.style(
+                unsafe { GetSysColor(COLOR_HIGHLIGHT) },
+                cfg.highlight_opacity,
+            );
+            let group = if self.locked.is_some() {
+                vec![index]
+            } else {
+                coincident(&self.regions, index)
+            };
+            while self.overlaps.len() + 1 < group.len() {
+                self.overlaps.push(Panel::new()?);
+            }
+            for (index, panel) in group
+                .iter()
+                .copied()
+                .filter(|other| *other != index)
+                .zip(&self.overlaps)
+            {
+                panel.style(
+                    unsafe { GetSysColor(COLOR_HIGHLIGHT) },
+                    cfg.highlight_opacity,
+                );
+                panel.show(self.regions[index].rect);
+            }
             let region = &self.regions[index];
             let dpi = region.dpi;
             // Selection uses a translucent interior fill; the ordinary outline stays unchanged.
             self.highlight.show(region.rect);
             self.label.show(
-                &cfg.region_caption(&region.name),
+                &group
+                    .iter()
+                    .map(|&index| cfg.region_caption(&self.regions[index].name))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
                 region.rect,
                 Self::color(cfg),
                 dpi,
@@ -579,6 +638,58 @@ mod tests {
         assert_eq!(nearest(&regions, POINT { x: 75, y: 50 }), Some(1));
         assert_eq!(nearest(&regions, POINT { x: 75, y: 75 }), Some(2));
         assert_eq!(nearest(&regions, POINT { x: -1, y: 20 }), None);
+    }
+    #[test]
+    fn coincident_centers_show_all_regions_but_choose_smallest_then_name() {
+        let regions = [
+            region("Big", 0, 0, 300, 300),
+            region("Small", 100, 100, 100, 100),
+            region("Alias", 100, 100, 100, 100),
+            region("Other", 101, 100, 100, 100),
+        ];
+        assert_eq!(nearest(&regions, POINT { x: 150, y: 150 }), Some(2));
+        assert_eq!(coincident(&regions, 2), [0, 1, 2]);
+        assert_eq!(coincident(&regions, 3), [3]);
+    }
+    #[test]
+    #[ignore = "shows layered highlights to verify coincident regions and their alpha"]
+    fn coincident_highlights_use_separate_translucent_windows() {
+        let _overlay = overlay::Overlay::new().unwrap();
+        let cfg = crate::test_support::cfg();
+        let mut preview = Preview::new().unwrap();
+        preview.regions = vec![
+            region("Big", 100, 100, 300, 300),
+            region("Small", 200, 200, 100, 100),
+        ];
+        preview.highlight(Some(1), &cfg).unwrap();
+        assert_eq!(preview.overlaps.len(), 1);
+        for hwnd in [preview.highlight.0, preview.overlaps[0].0] {
+            let mut alpha = 0;
+            let mut flags = 0;
+            unsafe {
+                assert_ne!(
+                    windows_sys::Win32::UI::WindowsAndMessaging::GetLayeredWindowAttributes(
+                        hwnd,
+                        std::ptr::null_mut(),
+                        &mut alpha,
+                        &mut flags
+                    ),
+                    0
+                );
+                assert_ne!(
+                    windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd),
+                    0
+                );
+            }
+            assert_eq!(alpha, cfg.highlight_opacity);
+        }
+        preview.hide();
+        assert_eq!(
+            unsafe {
+                windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible(preview.overlaps[0].0)
+            },
+            0
+        );
     }
     #[test]
     fn selection_encloses_disjoint_and_diagonal_regions() {
