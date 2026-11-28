@@ -4,7 +4,7 @@ use crate::{
     layout::Rect,
     overlay::{self, Label, Panel},
 };
-use std::time::{Duration, Instant};
+
 use windows_sys::Win32::{Foundation::*, Graphics::Gdi::*};
 
 fn strokes(rect: Rect, area: Rect, width: i32) -> [Rect; 4] {
@@ -197,14 +197,11 @@ pub struct Preview {
     chosen: Vec<Chosen>,
     chosen_panels: Vec<Panel>,
     envelope: Panel,
-    interactive: bool,
     frame: Rect,
     display: Option<(HMONITOR, Display)>,
     regions: Vec<PresetRegion>,
     selected: Option<usize>,
     locked: Option<String>,
-    focused: bool,
-    hover: Option<(u32, Instant)>,
     pointer: Option<(i32, i32)>,
     display_epoch: u64,
     warnings: Vec<String>,
@@ -212,10 +209,6 @@ pub struct Preview {
 impl Preview {
     pub fn visible(&self) -> bool {
         self.display.is_some()
-    }
-    #[cfg(test)]
-    pub fn focused(&self) -> bool {
-        self.focused
     }
     pub fn new() -> Result<Self, String> {
         Ok(Self {
@@ -226,14 +219,11 @@ impl Preview {
             chosen: Vec::new(),
             chosen_panels: Vec::new(),
             envelope: Panel::new()?,
-            interactive: false,
             frame: Rect::default(),
             display: None,
             regions: Vec::new(),
             selected: None,
             locked: None,
-            focused: false,
-            hover: None,
             pointer: None,
             display_epoch: desktop::display_epoch(),
             warnings: Vec::new(),
@@ -246,10 +236,7 @@ impl Preview {
         self.begin(hwnd, cfg, Some(crate::config::command_name(name)))
     }
     pub fn interactive(&mut self, hwnd: HWND, cfg: &Config) -> Result<(), String> {
-        self.begin(hwnd, cfg, None)?;
-        self.interactive = true;
-        self.hover = None;
-        Ok(())
+        self.begin(hwnd, cfg, None)
     }
     pub fn hit(&mut self, point: POINT, cfg: &Config) -> Result<Option<(String, Rect)>, String> {
         self.follow(point, cfg)?;
@@ -325,11 +312,8 @@ impl Preview {
         }
         self.chosen.clear();
         self.envelope.hide();
-        self.interactive = false;
         self.display = None;
         self.selected = None;
-        self.hover = None;
-        self.focused = false;
         self.pointer = None;
     }
     fn color(cfg: &Config) -> u32 {
@@ -425,8 +409,6 @@ impl Preview {
         }
         self.label.hide();
         self.selected = None;
-        self.focused = false;
-        self.hover = None;
         self.base.show(desktop::desktop());
         Ok(())
     }
@@ -483,18 +465,6 @@ impl Preview {
         }
         Ok(())
     }
-    pub fn reset(&mut self, cfg: &Config) -> Result<bool, String> {
-        if self.visible() && self.locked.is_none() && self.focused {
-            self.show_base(cfg)?;
-            return Ok(true);
-        }
-        Ok(false)
-    }
-    pub fn deadline(&self) -> Option<Instant> {
-        self.hover
-            .map(|(_, since)| since + Duration::from_secs(2))
-            .filter(|_| !self.focused)
-    }
     pub fn tick(&mut self, cfg: &Config) -> Result<(), String> {
         if self.visible() {
             let point = desktop::cursor()?;
@@ -502,7 +472,6 @@ impl Preview {
             // only changed coordinates avoids starting a fresh dwell at the old deadline.
             if self.pointer != Some((point.x, point.y))
                 || self.display_epoch != desktop::display_epoch()
-                || self.deadline().is_some_and(|when| Instant::now() >= when)
             {
                 self.follow(point, cfg)?;
             }
@@ -527,47 +496,12 @@ impl Preview {
             || point.y <= area.y + 1
             || point.x >= area.x + area.width - 2
             || point.y >= area.y + area.height - 2;
-        if self.focused {
-            if edge
-                || self
-                    .selected
-                    .is_none_or(|index| !contains(self.regions[index].rect, point))
-            {
-                self.show_base(cfg)?;
-            } else {
-                return Ok(());
-            }
-        }
         if edge {
-            self.hover = None;
             self.highlight(None, cfg)?;
             return Ok(());
         }
         let selected = nearest(&self.regions, point);
-        let key = selected.map_or(u32::MAX, |index| index as u32);
-        self.highlight(selected, cfg)?;
-        if self.interactive {
-            self.hover = None;
-            return Ok(());
-        }
-        if selected.is_none() {
-            self.hover = None;
-            return Ok(());
-        }
-        let now = Instant::now();
-        if self.hover.is_none_or(|(old, _)| old != key) {
-            self.hover = Some((key, now));
-        }
-        if self
-            .hover
-            .is_some_and(|(_, since)| now.duration_since(since) >= Duration::from_secs(2))
-        {
-            self.base.hide();
-            self.highlight(selected, cfg)?;
-            self.focused = true;
-            self.hover = None;
-        }
-        Ok(())
+        self.highlight(selected, cfg)
     }
 }
 

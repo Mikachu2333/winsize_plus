@@ -792,10 +792,6 @@ impl App {
                     drag.cancel()?;
                 }
                 self.clear();
-                if self.preview_until.is_none() && self.preview.reset(&self.cfg)? {
-                    self.preview_until = Some(later(self.cfg.duration));
-                    return Ok(());
-                }
                 self.close_preview()?;
                 Ok(())
             }
@@ -841,9 +837,6 @@ impl App {
                 self.preview_check = Some(later(100));
             }
         }
-        if self.preview.deadline().is_some_and(|when| now >= when) {
-            self.preview.tick(&self.cfg)?;
-        }
         if self.hide.is_some_and(|when| now >= when) {
             self.clear()
         }
@@ -858,7 +851,6 @@ impl App {
             self.cast.deadline(),
             self.hide,
             self.reload,
-            self.preview.deadline(),
             self.preview_until,
             self.preview_check,
         ]

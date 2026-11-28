@@ -494,7 +494,18 @@ pub fn fields(tab: usize, axis: usize, cfg: &Config, doc: &DocumentMut) -> Vec<F
         _ => &["selection"],
     };
     if matches!(tab, 2 | 3 | 5 | 6 | 7 | 8) {
-        fields.push(Field { section: String::new(), key: String::new(), label: cfg.tr("Live desktop preview", "实时桌面预览").into(), hint: cfg.tr("Esc closes or resets the preview. Region preview requires selecting a region below.", "Esc 关闭或重置预览；分区预览还需选中下方的分区。").into(), kind: Kind::Preview });
+        fields.push(Field {
+            section: String::new(),
+            key: String::new(),
+            label: cfg.tr("Live desktop preview", "实时桌面预览").into(),
+            hint: cfg
+                .tr(
+                    "Esc closes the preview. Region preview requires selecting a region below.",
+                    "Esc 关闭预览；分区预览还需选中下方的分区。",
+                )
+                .into(),
+            kind: Kind::Preview,
+        });
         if tab >= 7 {
             fields.last_mut().unwrap().hint=cfg.tr("Repeats a sample animation without capturing input. Esc stops it; previews pause while settings is inactive.","循环播放示例动画，不捕获输入。Esc 停止预览；设置窗口失焦时暂停。").into();
         }

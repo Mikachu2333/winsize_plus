@@ -3064,10 +3064,8 @@ impl Editor {
         }
         self.tooltip.hide();
         self.overlay.hide_tip();
-        if !self.preview.reset(&self.cfg)? {
-            self.preview.hide();
-            input::track_preview(false)?;
-        }
+        self.preview.hide();
+        input::track_preview(false)?;
         Ok(())
     }
 }
@@ -3587,15 +3585,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
             slot.try_borrow()
                 .ok()
                 .and_then(|guard| {
-                    guard.as_ref().map(|editor| {
-                        if editor.preview.focused() {
-                            2
-                        } else if editor.preview.visible() {
-                            1
-                        } else {
-                            0
-                        }
-                    })
+                    guard
+                        .as_ref()
+                        .map(|editor| if editor.preview.visible() { 1 } else { 0 })
                 })
                 .unwrap_or(-1)
         }),
@@ -4992,6 +4984,21 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "shows settings region outlines beyond the former dwell delay and closes them with one Escape"]
+    fn region_preview_keeps_all_outlines_and_escape_closes_once() {
+        let _hooks = input::Hooks::escape_only().unwrap();
+        let mut editor = test_editor(6, "settings-preview-no-dwell");
+        editor.live = true;
+        editor.render().unwrap();
+        assert!(editor.preview.visible());
+        std::thread::sleep(Duration::from_millis(2100));
+        editor.preview.tick(&editor.cfg).unwrap();
+        assert!(editor.preview.visible());
+        editor.escape().unwrap();
+        assert!(!editor.preview.visible());
+    }
+
+    #[test]
     #[ignore = "uses actual settings combos to verify filtering does not edit bindings until selection"]
     fn searchable_action_combo_saves_original_filtered_region() {
         let mut editor = test_editor(4, "settings-combo-filter");
@@ -5977,50 +5984,12 @@ mod tests {
                         return Err(format!("Preview did not resume on tab {tab}"));
                     }
                     if tab == 6 {
-                        let original = desktop::cursor()?;
-                        let screen = desktop::screen(original, 0)?.full;
-                        for cell in [1, 9, 1] {
-                            let point = POINT {
-                                x: screen.x + screen.width * if cell == 1 { 1 } else { 5 } / 6,
-                                y: screen.y + screen.height * if cell == 1 { 1 } else { 5 } / 6,
-                            };
-                            let started = Instant::now();
-                            unsafe {
-                                SetCursorPos(point.x, point.y);
-                            }
-                            // Observe the old focus being cleared before waiting for the new one.
-                            // A fixed sleep can still sample the previous region on a busy UI thread.
-                            // Query completed UI state; counting individual HWNDs
-                            // can see a transient pair halfway through a grid rebuild.
-                            while send(hwnd, PREVIEW_STATE, 0, 0) == 2
-                                && started.elapsed() < Duration::from_secs(1)
-                            {
-                                std::thread::sleep(Duration::from_millis(10));
-                            }
-                            if send(hwnd, PREVIEW_STATE, 0, 0) == 2 {
-                                return Err(
-                                    "Moving out of the focused region did not restore the grid"
-                                        .into(),
-                                );
-                            }
-                            while send(hwnd, PREVIEW_STATE, 0, 0) != 2
-                                && started.elapsed() < Duration::from_secs(5)
-                            {
-                                std::thread::sleep(Duration::from_millis(10));
-                            }
-                            let elapsed = started.elapsed();
-                            println!("grid cell={cell} dwell_ms={}", elapsed.as_millis());
-                            if elapsed < Duration::from_millis(1900)
-                                || elapsed > Duration::from_millis(2300)
-                            {
-                                return Err(format!("Grid dwell took {elapsed:?} for cell {cell}"));
-                            }
-                        }
-                        unsafe {
-                            SetCursorPos(original.x, original.y);
+                        if send(hwnd, PREVIEW_STATE, 0, 0) != 1 {
+                            return Err("Selection preview not visible".into());
                         }
                     }
                 }
+
                 // Change FPS through the native edit notification, then confirm persisted clamping.
                 unsafe {
                     PostMessageW(hwnd, WM_COMMAND, (TAB_BASE + 5) as usize, 0);
