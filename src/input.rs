@@ -607,6 +607,9 @@ impl Input {
                 if self.second {
                     self.hold_started = None;
                     self.hold_active = true;
+                    self.mode = Mode::Wait;
+                    self.tap = None;
+                    post(ARMED, self.gesture_target as usize, 0);
                 } else if start_hold && unmodified && self.mode == Mode::Idle {
                     self.hold_started = Some(time);
                     self.advance_hold(time);
@@ -630,10 +633,7 @@ impl Input {
                 && pressed == key
                 && time.wrapping_sub(when) <= self.double_ms
             {
-                if consumed {
-                    self.mode = Mode::Wait;
-                    post(ARMED, self.gesture_target as usize, 0)
-                } else {
+                if !consumed {
                     self.last_tap = Some((key, when))
                 }
             }
@@ -1713,6 +1713,7 @@ pub(super) mod tests {
                     input.second = double;
                     if double {
                         input.hold_active = true;
+                        input.mode = Mode::Wait;
                     } else {
                         input.advance_hold(2100);
                     }
@@ -2173,16 +2174,18 @@ pub(super) mod tests {
         assert_eq!(next_event().unwrap().message, ALT_HOLD);
     }
     #[test]
-    fn double_tap_still_arms_without_waiting_for_the_hold_delay() {
+    fn recognized_double_tap_survives_a_long_second_hold() {
         use super::*;
         let _hooks = Hooks::escape_only().unwrap();
         let mut input = pending_hold(100);
         input.second = true;
         input.hold_active = true;
-        assert!(input.keyboard(LEFT, false, 130));
+        input.hold_started = None;
+        input.mode = Mode::Wait;
+        input.tap = None;
+        assert!(input.keyboard(LEFT, false, 5000));
         assert_eq!(next_event().unwrap().message, ALT_RELEASE);
-        assert_eq!(next_event().unwrap().message, ARMED);
-        assert!(input.keyboard(0x51, true, 200));
+        assert!(input.keyboard(0x51, true, 5001));
         assert_eq!(next_event().unwrap().message, ACTION);
     }
     #[test]
