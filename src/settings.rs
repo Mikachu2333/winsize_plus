@@ -3061,16 +3061,20 @@ impl Editor {
         input::annotation_preview(false)?;
         self.cast.clear();
         self.cast_next = None;
-        if matches!(self.tab, 7 | 8) {
-            self.live = false;
-            for row in &self.rows {
-                if matches!(row.field.kind, Kind::Preview) {
-                    send(row.c(0), BM_SETCHECK, 0, 0);
-                }
+        self.live = false;
+        for row in self
+            .rows
+            .iter()
+            .chain(self.pages.values().flat_map(|(rows, _)| rows))
+        {
+            if matches!(row.field.kind, Kind::Preview) {
+                send(row.c(0), BM_SETCHECK, 0, 0);
             }
-            unsafe {
-                SetTimer(self.window.0, 1, 100, None);
-            }
+        }
+        self.overlay.guides(0, &self.cfg)?;
+        input::set_guides(false)?;
+        unsafe {
+            SetTimer(self.window.0, 1, 100, None);
         }
         self.tooltip.hide();
         self.overlay.hide_tip();
@@ -5025,6 +5029,14 @@ mod tests {
         assert!(editor.preview.visible());
         editor.escape().unwrap();
         assert!(!editor.preview.visible());
+        assert!(!editor.live);
+        editor.render().unwrap();
+        assert!(!editor.preview.visible());
+        for row in &editor.rows {
+            if matches!(row.field.kind, Kind::Preview) {
+                assert_eq!(send(row.c(0), BM_GETCHECK, 0, 0), 0);
+            }
+        }
     }
 
     #[test]
