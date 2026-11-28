@@ -39,12 +39,15 @@ pub fn cursor() -> Result<POINT, String> {
     Ok(point)
 }
 
-thread_local! { static DISPLAY_EPOCH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
+static DISPLAY_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+thread_local! {
+    static DISPLAY_CACHE: std::cell::RefCell<(u64, Vec<(usize, isize, Display)>)> = const { std::cell::RefCell::new((u64::MAX, Vec::new())) };
+}
 pub fn display_epoch() -> u64 {
-    DISPLAY_EPOCH.with(std::cell::Cell::get)
+    DISPLAY_EPOCH.load(std::sync::atomic::Ordering::Relaxed)
 }
 pub fn invalidate_displays() {
-    DISPLAY_EPOCH.with(|epoch| epoch.set(epoch.get().wrapping_add(1)));
+    DISPLAY_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[derive(Clone, Debug)]
@@ -55,6 +58,27 @@ pub struct Display {
     pub dpi: i32,
 }
 pub fn display(monitor: HMONITOR) -> Result<Display, String> {
+    let epoch = display_epoch();
+    let context = unsafe { GetThreadDpiAwarenessContext() } as isize;
+    if let Some(cached) = DISPLAY_CACHE.with_borrow_mut(|cache| {
+        if cache.0 != epoch {
+            cache.0 = epoch;
+            cache.1.clear();
+        }
+        cache
+            .1
+            .iter()
+            .find(|(handle, dpi, _)| *handle == monitor as usize && *dpi == context)
+            .map(|(_, _, display)| display.clone())
+    }) {
+        return Ok(cached);
+    }
+    let result = query_display(monitor)?;
+    DISPLAY_CACHE
+        .with_borrow_mut(|cache| cache.1.push((monitor as usize, context, result.clone())));
+    Ok(result)
+}
+fn query_display(monitor: HMONITOR) -> Result<Display, String> {
     unsafe {
         let mut info = MONITORINFOEXW::default();
         info.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
@@ -894,6 +918,23 @@ pub fn apply(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn monitor_cache_reuses_probes_and_invalidates_across_threads() {
+        use super::*;
+        let _dpi = crate::test_support::Dpi::new();
+        invalidate_displays();
+        let monitor = unsafe { MonitorFromPoint(POINT::default(), MONITOR_DEFAULTTONEAREST) };
+        let first = display(monitor).unwrap();
+        for _ in 0..100 {
+            assert_eq!(display(monitor).unwrap().dpi, first.dpi);
+        }
+        assert_eq!(DISPLAY_CACHE.with_borrow(|cache| cache.1.len()), 1);
+        std::thread::spawn(invalidate_displays).join().unwrap();
+        assert_ne!(DISPLAY_CACHE.with_borrow(|cache| cache.0), display_epoch());
+        assert_eq!(display(monitor).unwrap().work, first.work);
+        assert_eq!(DISPLAY_CACHE.with_borrow(|cache| cache.0), display_epoch());
+        assert_eq!(DISPLAY_CACHE.with_borrow(|cache| cache.1.len()), 1);
+    }
     #[test]
     fn centering_scales_dpi_and_clamps_only_oversized_edges() {
         use super::*;
