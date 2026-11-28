@@ -138,7 +138,12 @@ impl Updates {
                 return Err(error.clone());
             }
             if state.active.is_some_and(|(_, generation, at)| {
-                generation == self.generation && at.elapsed() > WAIT_LIMIT
+                (generation == self.generation
+                    || state
+                        .latest
+                        .values()
+                        .any(|job| job.generation == self.generation))
+                    && at.elapsed() > WAIT_LIMIT
             }) {
                 return Err("Linked resize timed out / 联动缩放响应超时".into());
             }
