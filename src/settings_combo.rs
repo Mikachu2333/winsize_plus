@@ -5,7 +5,7 @@ use windows_sys::{
     Win32::{
         Foundation::*,
         Graphics::Gdi::*,
-        UI::{Controls::*, Shell::*, WindowsAndMessaging::*},
+        UI::{Controls::*, Input::KeyboardAndMouse::GetFocus, Shell::*, WindowsAndMessaging::*},
     },
     core::w,
 };
@@ -79,6 +79,36 @@ fn center_edit(combo: HWND) {
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
         }
+    }
+}
+fn paint_edit_padding(combo: HWND) {
+    // SAFETY: all handles are borrowed from this combo for synchronous painting;
+    // the DC is released and its clipping state restored before returning.
+    unsafe {
+        let mut info = COMBOBOXINFO {
+            cbSize: size_of::<COMBOBOXINFO>() as u32,
+            ..Default::default()
+        };
+        if GetComboBoxInfo(combo, &mut info) == 0 || info.hwndItem.is_null() {
+            return;
+        }
+        let mut edit = RECT::default();
+        GetWindowRect(info.hwndItem, &mut edit);
+        MapWindowPoints(
+            std::ptr::null_mut(),
+            combo,
+            (&mut edit as *mut RECT).cast(),
+            2,
+        );
+        let dc = GetDC(combo);
+        if dc.is_null() {
+            return;
+        }
+        let saved = SaveDC(dc);
+        ExcludeClipRect(dc, edit.left, edit.top, edit.right, edit.bottom);
+        FillRect(dc, &info.rcItem, crate::settings_theme::control());
+        RestoreDC(dc, saved);
+        ReleaseDC(combo, dc);
     }
 }
 fn matching(options: &[(String, String)], query: &str) -> Vec<usize> {
@@ -314,6 +344,13 @@ unsafe extern "system" fn combo_proc(
     _: usize,
 ) -> LRESULT {
     unsafe {
+        if msg == WM_PAINT {
+            let result = DefSubclassProc(hwnd, msg, wp, lp);
+            // Native painting assumes the edit fills rcItem. Centering it leaves
+            // padding that the combo does not erase when moved or uncovered.
+            paint_edit_padding(hwnd);
+            return result;
+        }
         if matches!(
             msg,
             WM_WINDOWPOSCHANGED | WM_SETFONT | CB_SETITEMHEIGHT | WM_THEMECHANGED
@@ -355,6 +392,20 @@ unsafe extern "system" fn edit_proc(
 ) -> LRESULT {
     let combo = data as HWND;
     unsafe {
+        // The combo creates its EDIT with ES_NOHIDESEL, which cannot be changed
+        // after creation. Clear inactive selections before painting, including
+        // ones restored internally by CB_SETCURSEL or a page refresh.
+        if msg == WM_PAINT && GetFocus() != hwnd {
+            let selection = send(hwnd, EM_GETSEL, 0, 0) as u32;
+            if selection as u16 != (selection >> 16) as u16 {
+                send(hwnd, EM_SETSEL, 0, 0);
+            }
+        }
+        if msg == WM_KILLFOCUS {
+            let result = DefSubclassProc(hwnd, msg, wp, lp);
+            send(hwnd, EM_SETSEL, 0, 0);
+            return result;
+        }
         if msg == WM_IME_STARTCOMPOSITION {
             SEARCHES.with_borrow_mut(|s| {
                 if let Some(s) = s.get_mut(&data) {

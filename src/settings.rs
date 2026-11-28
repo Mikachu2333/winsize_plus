@@ -5269,6 +5269,162 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "compares unfocused dropdowns and their scrolled surfaces with clean repaints"]
+    fn dropdowns_do_not_highlight_without_focus_or_keep_scrolled_pixels() {
+        let _dpi = crate::test_support::Dpi::new();
+        let mut editor = test_editor(4, "settings-combo-repaint-test");
+        let root = editor.window.0;
+        unsafe {
+            SetWindowLongPtrW(root, GWLP_WNDPROC, window_proc as *const () as isize);
+            for pane in editor.panes {
+                SetWindowLongPtrW(pane, GWLP_WNDPROC, pane_proc as *const () as isize);
+            }
+            ShowWindow(root, SW_SHOW);
+            SetFocus(root);
+        }
+        let combo = editor.rows[0].c(0);
+        let mut info = COMBOBOXINFO {
+            cbSize: size_of::<COMBOBOXINFO>() as u32,
+            ..Default::default()
+        };
+        unsafe {
+            GetComboBoxInfo(combo, &mut info);
+        }
+        for dark in [false, true] {
+            crate::settings_theme::test_dark(Some(dark));
+            editor.update_values();
+            send(info.hwndItem, EM_SETSEL, 0, -1);
+            unsafe {
+                RedrawWindow(
+                    root,
+                    null(),
+                    null_mut(),
+                    RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW,
+                );
+            }
+            let initial = painted_pixels(combo, info.rcItem);
+            // Clearing an inactive edit's selection must not change its appearance.
+            send(info.hwndItem, EM_SETSEL, 0, 0);
+            unsafe {
+                RedrawWindow(
+                    combo,
+                    null(),
+                    null_mut(),
+                    RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW,
+                );
+            }
+            let unselected = painted_pixels(combo, info.rcItem);
+            let selection_diff = initial
+                .iter()
+                .zip(&unselected)
+                .filter(|(a, b)| a != b)
+                .count();
+            assert_eq!(
+                selection_diff, 0,
+                "unfocused dropdown paints a text selection"
+            );
+            unsafe {
+                SetFocus(info.hwndItem);
+                send(info.hwndItem, EM_SETSEL, 0, -1);
+                HideCaret(info.hwndItem);
+                RedrawWindow(
+                    combo,
+                    null(),
+                    null_mut(),
+                    RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW,
+                );
+            }
+            assert_ne!(
+                painted_pixels(combo, info.rcItem),
+                unselected,
+                "focused input must retain its visible selection"
+            );
+            unsafe {
+                SetFocus(root);
+                RedrawWindow(
+                    combo,
+                    null(),
+                    null_mut(),
+                    RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW,
+                );
+            }
+            assert_eq!(
+                painted_pixels(combo, info.rcItem),
+                unselected,
+                "blur must clear the highlight"
+            );
+            // The centered edit leaves padding inside the combo. A full repaint
+            // must erase old pixels there as well as the text child's surface.
+            unsafe {
+                let dc = GetDC(combo);
+                FillRect(dc, &info.rcItem, GetSysColorBrush(COLOR_HIGHLIGHT));
+                ReleaseDC(combo, dc);
+                RedrawWindow(
+                    combo,
+                    null(),
+                    null_mut(),
+                    RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW,
+                );
+            }
+            let repainted = painted_pixels(combo, info.rcItem);
+            let padding_diff = repainted
+                .iter()
+                .zip(&unselected)
+                .filter(|(a, b)| a != b)
+                .count();
+            assert_eq!(padding_diff, 0, "dropdown padding retains old pixels");
+            for delta in [37, 79, -63, -53, 180, -180] {
+                editor.scroll_by(1, u16::MAX, delta).unwrap();
+                unsafe {
+                    RedrawWindow(root, null(), null_mut(), RDW_ALLCHILDREN | RDW_UPDATENOW);
+                }
+                for row in editor.rows.iter().take(4) {
+                    let combo = row.c(0);
+                    let mut rect = RECT::default();
+                    let mut pane = RECT::default();
+                    unsafe {
+                        GetWindowRect(combo, &mut rect);
+                        MapWindowPoints(
+                            null_mut(),
+                            editor.panes[1],
+                            (&mut rect as *mut RECT).cast(),
+                            2,
+                        );
+                        GetClientRect(editor.panes[1], &mut pane);
+                    }
+                    if rect.top < 0 || rect.bottom > pane.bottom {
+                        continue;
+                    }
+                    let incremental = painted_pixels(editor.panes[1], rect);
+                    unsafe {
+                        RedrawWindow(
+                            combo,
+                            null(),
+                            null_mut(),
+                            RDW_INVALIDATE
+                                | RDW_ERASE
+                                | RDW_FRAME
+                                | RDW_ALLCHILDREN
+                                | RDW_UPDATENOW,
+                        );
+                    }
+                    let full = painted_pixels(editor.panes[1], rect);
+                    let differences = incremental
+                        .iter()
+                        .zip(&full)
+                        .filter(|(a, b)| a != b)
+                        .count();
+                    assert_eq!(
+                        differences, 0,
+                        "dropdown leaves pixels after scroll={delta}, dark={dark}"
+                    );
+                }
+            }
+        }
+        crate::settings_theme::test_dark(None);
+    }
+
+    #[test]
     #[ignore = "checks real region and shortcut control geometry at narrow and wide widths"]
     fn mapping_inputs_and_actions_share_rows_with_right_aligned_delete() {
         let _hooks = input::Hooks::escape_only().unwrap();
