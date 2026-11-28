@@ -5983,10 +5983,8 @@ mod tests {
                     if overlay_count() == 0 {
                         return Err(format!("Preview did not resume on tab {tab}"));
                     }
-                    if tab == 6 {
-                        if send(hwnd, PREVIEW_STATE, 0, 0) != 1 {
-                            return Err("Selection preview not visible".into());
-                        }
+                    if tab == 6 && send(hwnd, PREVIEW_STATE, 0, 0) != 1 {
+                        return Err("Selection preview not visible".into());
                     }
                 }
 

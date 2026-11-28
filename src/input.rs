@@ -667,10 +667,9 @@ impl Input {
             if let Some((pressed, when)) = self.tap.take()
                 && pressed == key
                 && time.wrapping_sub(when) <= self.double_ms
+                && !consumed
             {
-                if !consumed {
-                    self.last_tap = Some((key, when))
-                }
+                self.last_tap = Some((key, when))
             }
             if !consumed
                 && self.mode == Mode::Idle
