@@ -465,21 +465,8 @@ impl App {
                 })
             }
             "borders" => {
-                if self.preview.visible() {
-                    self.close_preview()?;
-                    self.notice(self.cfg.tr("Outlines hidden", "框线已隐藏"))
-                } else if self.cfg.preview_mode == "off" {
-                    self.close_preview()?;
-                    self.notice(self.cfg.tr(
-                        "Region outlines disabled in settings",
-                        "分区框线已在设置中禁用",
-                    ))
-                } else {
-                    self.held_window = Some(self.window);
-                    self.preview_latched = true;
-                    self.refresh_preview()?;
-                    self.notice(self.cfg.tr("Outlines shown", "框线已显示"))
-                }
+                input::arm(self.window)?;
+                self.begin_alt_preview(self.window, true)
             }
             name if self.cfg.presets.contains_key(name)
                 || matches!(name, "top" | "ignore" | "centerwindow" | "fullscreen") =>
@@ -770,11 +757,7 @@ impl App {
             input::ACTION => {
                 self.marker.hide();
                 let action = self.cfg.keys.get(&(msg.wParam as u32)).cloned();
-                // Borders must inspect the visible preview before deciding
-                // whether to show or hide it.
-                if action.as_deref() != Some("borders") {
-                    self.close_preview()?;
-                }
+                self.close_preview()?;
                 self.clear();
                 if let Some(action) = action {
                     self.act(&action)?
@@ -1580,79 +1563,27 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "opens temporary outlines, tips and a tray icon; no config is changed"]
-    fn borders_notice_reflects_visibility_and_clears_old_deadlines() {
-        let _dpi = crate::test_support::Dpi::new();
-        let mut cfg = crate::test_support::cfg();
-        cfg.preview_mode = "off".into();
-        let overlay = Overlay::new().unwrap();
-        let _hooks = input::Hooks::start(&cfg).unwrap();
-        let mut app = App {
-            marker: crate::target_marker::TargetMarker::default(),
-            topmost: crate::topmost_marker::Markers::default(),
-            paused: false,
-            cast: crate::cast::Visuals::new(),
-            mousecast: false,
-            keycast: false,
-            frames: FrameClock::new(cfg.fps).unwrap(),
-            cfg,
-            path: PathBuf::new(),
-            overlay,
-            tray: crate::tray::Tray::new().unwrap(),
-            preview: Preview::new().unwrap(),
-            neighbors: crate::neighbors::Hint::default(),
-            held_window: None,
-            preview_latched: false,
-            expired_selection: false,
-            selection_suspended: None,
-            selection_hint: String::new(),
-            preview_until: Some(Instant::now()),
-            preview_check: Some(Instant::now()),
-            window: null_mut(),
-            drag: None,
-            command: String::new(),
-            prompt: None,
-            hide: None,
-            reload: None,
-            snapshot: None,
-            exit: None,
-        };
-        app.act("borders").unwrap();
-        assert!(!app.preview.visible());
-        assert!(app.held_window.is_none());
-        assert!(app.preview_until.is_none() && app.preview_check.is_none());
-        assert_eq!(
-            app.overlay.tip_text(),
-            app.cfg.tr(
-                "Region outlines disabled in settings",
-                "分区框线已在设置中禁用"
-            )
-        );
-        app.cfg.preview_mode = "always".into();
-        app.cfg.keys.insert(0x42, "borders".into());
-        app.act("borders").unwrap();
-        assert!(app.preview.visible());
-        assert_eq!(
-            app.overlay.tip_text(),
-            app.cfg.tr("Outlines shown", "框线已显示")
-        );
-        app.preview_until = Some(Instant::now());
-        app.preview_check = Some(Instant::now());
-        app.handle_event(MSG {
-            message: input::ACTION,
-            wParam: 0x42,
-            ..Default::default()
-        })
-        .unwrap();
-        assert!(!app.preview.visible());
-        assert!(app.held_window.is_none() && !app.preview_latched);
-        assert!(app.preview_until.is_none() && app.preview_check.is_none());
-        app.deadlines().unwrap();
-        assert!(app.overlay.tip_visible());
-        assert_eq!(
-            app.overlay.tip_text(),
-            app.cfg.tr("Outlines hidden", "框线已隐藏")
-        );
+    #[ignore = "opens a temporary preview to check the legacy borders action uses the normal session"]
+    fn borders_action_uses_the_normal_selection_session() {
+        let _hooks = input::Hooks::start(&crate::test_support::cfg()).unwrap();
+        let mut app = test_app();
+        app.window = unsafe { GetForegroundWindow() };
+        if !desktop::allowed(app.window, &app.cfg.exclusions) {
+            return;
+        }
+        for mode in ["always", "off"] {
+            app.cfg.preview_mode = mode.into();
+            app.act("borders").unwrap();
+            assert!(app.held_window.is_some());
+            assert!(app.preview_until.is_some());
+            assert!(app.preview_check.is_some());
+            assert_eq!(app.preview.visible(), mode == "always");
+            app.handle_event(MSG {
+                message: input::CANCEL,
+                ..Default::default()
+            })
+            .unwrap();
+        }
     }
 
     #[test]

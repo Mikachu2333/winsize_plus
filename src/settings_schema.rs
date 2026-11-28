@@ -105,7 +105,7 @@ pub fn option(cfg: &Config, context: ChoiceContext, value: &str) -> String {
         (Action, "guide" | "cross") => ("Toggle crosshair", "显示 / 隐藏十字线"),
         (Action, "horizontal") => ("Horizontal crosshair", "水平十字线"),
         (Action, "vertical") => ("Vertical crosshair", "垂直十字线"),
-        (Action, "borders") => ("Toggle region outlines", "显示 / 隐藏框线"),
+        (Action, "borders") => ("Start region selection", "开始分区选择"),
         (Action, "reload") => ("Reload configuration", "重载配置"),
         (Action, "settings") => ("Open settings", "打开设置"),
         (Action, "mousecast") => ("Toggle mouse annotations", "开启 / 关闭鼠标标注"),

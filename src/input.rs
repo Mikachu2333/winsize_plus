@@ -1169,6 +1169,22 @@ pub fn cancel() {
         })
     });
 }
+pub fn arm(window: HWND) -> Result<(), String> {
+    let window = window as usize;
+    on_hook(move || {
+        INPUT.with_borrow_mut(|input| {
+            input.select_target(window as HWND);
+            input.cancel_hold();
+            input.tap = None;
+            input.last_tap = None;
+            if !input.target_allowed {
+                return Err("Window unavailable / 窗口不可操作".into());
+            }
+            input.mode = Mode::Wait;
+            input.update_mouse()
+        })
+    })?
+}
 #[cfg(test)]
 pub fn alt_held() -> bool {
     EVENTS.with_borrow(|events| {
