@@ -141,30 +141,47 @@ fn nearest(regions: &[PresetRegion], point: POINT) -> Option<usize> {
         })
         .map(|(index, _)| index)
 }
-fn grid_rect(area: Rect, cell: u32) -> Rect {
-    let column = (cell - 1) as i32 % 3;
-    let row = (cell - 1) as i32 / 3;
-    let x = area.width * column / 3;
-    let y = area.height * row / 3;
-    Rect {
-        x: area.x + x,
-        y: area.y + y,
-        width: area.width * (column + 1) / 3 - x,
-        height: area.height * (row + 1) / 3 - y,
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Chosen {
+    name: String,
+    rect: Rect,
+}
+
+fn enclosing(rects: impl Iterator<Item = Rect>) -> Option<Rect> {
+    let mut rects = rects;
+    let first = rects.next()?;
+    let (mut left, mut top) = (first.x, first.y);
+    let (mut right, mut bottom) = (
+        first.x.checked_add(first.width)?,
+        first.y.checked_add(first.height)?,
+    );
+    for rect in rects {
+        left = left.min(rect.x);
+        top = top.min(rect.y);
+        right = right.max(rect.x.checked_add(rect.width)?);
+        bottom = bottom.max(rect.y.checked_add(rect.height)?);
     }
+    Some(Rect {
+        x: left,
+        y: top,
+        width: right.checked_sub(left)?,
+        height: bottom.checked_sub(top)?,
+    })
 }
 
 pub struct Preview {
     base: Panel,
     highlight: Panel,
     label: Label,
-    grid_labels: Vec<Label>,
+    chosen: Vec<Chosen>,
+    chosen_panels: Vec<Panel>,
+    envelope: Panel,
+    interactive: bool,
     frame: Rect,
     display: Option<(HMONITOR, Display)>,
     regions: Vec<PresetRegion>,
     selected: Option<usize>,
     locked: Option<String>,
-    grid: bool,
     focused: bool,
     hover: Option<(u32, Instant)>,
     pointer: Option<(i32, i32)>,
@@ -184,13 +201,15 @@ impl Preview {
             base: Panel::new()?,
             highlight: Panel::new()?,
             label: Label::new()?,
-            grid_labels: Vec::new(),
+            chosen: Vec::new(),
+            chosen_panels: Vec::new(),
+            envelope: Panel::new()?,
+            interactive: false,
             frame: Rect::default(),
             display: None,
             regions: Vec::new(),
             selected: None,
             locked: None,
-            grid: false,
             focused: false,
             hover: None,
             pointer: None,
@@ -199,23 +218,66 @@ impl Preview {
         })
     }
     pub fn start(&mut self, hwnd: HWND, cfg: &Config) -> Result<(), String> {
-        self.begin(hwnd, cfg, false, None)
+        self.begin(hwnd, cfg, None)
     }
     pub fn select(&mut self, hwnd: HWND, name: &str, cfg: &Config) -> Result<(), String> {
-        self.begin(hwnd, cfg, false, Some(crate::config::command_name(name)))
+        self.begin(hwnd, cfg, Some(crate::config::command_name(name)))
     }
-    pub fn grid(&mut self, hwnd: HWND, cfg: &Config) -> Result<(), String> {
-        self.begin(hwnd, cfg, true, None)
+    pub fn interactive(&mut self, hwnd: HWND, cfg: &Config) -> Result<(), String> {
+        self.begin(hwnd, cfg, None)?;
+        self.interactive = true;
+        self.hover = None;
+        Ok(())
     }
-    fn begin(
-        &mut self,
-        hwnd: HWND,
-        cfg: &Config,
-        grid: bool,
-        locked: Option<String>,
-    ) -> Result<(), String> {
+    pub fn hit(&mut self, point: POINT, cfg: &Config) -> Result<Option<(String, Rect)>, String> {
+        self.follow(point, cfg)?;
+        Ok(self.selected.map(|index| {
+            let region = &self.regions[index];
+            (region.name.clone(), region.rect)
+        }))
+    }
+    pub fn hovered_name(&self) -> Option<&str> {
+        self.selected.map(|index| self.regions[index].name.as_str())
+    }
+    pub fn count(&self) -> usize {
+        self.chosen.len()
+    }
+    pub fn selection_rect(&self) -> Option<Rect> {
+        enclosing(self.chosen.iter().map(|region| region.rect))
+    }
+    pub fn toggle(&mut self, name: String, rect: Rect, cfg: &Config) -> Result<(), String> {
+        let chosen = Chosen { name, rect };
+        if let Some(index) = self.chosen.iter().position(|r| *r == chosen) {
+            self.chosen.remove(index);
+        } else {
+            self.chosen.push(chosen);
+        }
+        for panel in &self.chosen_panels {
+            panel.hide();
+        }
+        while self.chosen_panels.len() < self.chosen.len() {
+            self.chosen_panels.push(Panel::new()?);
+        }
+        for (region, panel) in self.chosen.iter().zip(&self.chosen_panels) {
+            panel.style(Self::color(cfg), cfg.highlight_opacity);
+            panel.show(region.rect);
+        }
+        self.envelope.hide();
+        if let Some(rect) = self.selection_rect() {
+            let area = desktop::desktop();
+            outline(
+                &self.envelope,
+                &[(rect, area, area, cfg.outline.width.max(2))],
+                area,
+            )?;
+            self.envelope
+                .style(unsafe { GetSysColor(COLOR_HIGHLIGHT) }, 255);
+            self.envelope.show(area);
+        }
+        Ok(())
+    }
+    fn begin(&mut self, hwnd: HWND, cfg: &Config, locked: Option<String>) -> Result<(), String> {
         self.hide();
-        self.grid = grid;
         self.locked = locked;
         let point = desktop::cursor()?;
         self.frame = desktop::bounds(hwnd)
@@ -233,9 +295,12 @@ impl Preview {
         self.base.hide();
         self.highlight.hide();
         self.label.hide();
-        for label in &self.grid_labels {
-            label.hide();
+        for panel in &self.chosen_panels {
+            panel.hide();
         }
+        self.chosen.clear();
+        self.envelope.hide();
+        self.interactive = false;
         self.display = None;
         self.selected = None;
         self.hover = None;
@@ -303,32 +368,20 @@ impl Preview {
         }
         self.regions.sort_by(|a, b| a.name.cmp(&b.name));
         let width = |dpi: i32| (cfg.outline.width * dpi / 96).max(1);
-        let all: Vec<_> = if self.grid {
-            (1..=9)
-                .map(|cell| {
-                    (
-                        grid_rect(display.full, cell),
-                        display.full,
-                        display.full,
-                        width(display.dpi),
-                    )
-                })
-                .collect()
-        } else {
-            self.regions
-                .iter()
-                .flat_map(|r| {
-                    if r.virtual_area {
-                        displays
-                            .iter()
-                            .map(|d| (r.rect, r.area, d.full, width(d.dpi)))
-                            .collect::<Vec<_>>()
-                    } else {
-                        vec![(r.rect, r.area, r.area, width(r.dpi))]
-                    }
-                })
-                .collect()
-        };
+        let all: Vec<_> = self
+            .regions
+            .iter()
+            .flat_map(|r| {
+                if r.virtual_area {
+                    displays
+                        .iter()
+                        .map(|d| (r.rect, r.area, d.full, width(d.dpi)))
+                        .collect::<Vec<_>>()
+                } else {
+                    vec![(r.rect, r.area, r.area, width(r.dpi))]
+                }
+            })
+            .collect();
         outline(&self.base, &all, virtual_area)?;
         self.base.style(Self::color(cfg), cfg.outline.opacity);
         self.highlight.style(
@@ -340,32 +393,13 @@ impl Preview {
         self.show_base(cfg)?;
         Ok(())
     }
-    fn show_base(&mut self, cfg: &Config) -> Result<(), String> {
+    fn show_base(&mut self, _cfg: &Config) -> Result<(), String> {
         self.highlight.hide();
         self.label.hide();
         self.selected = None;
         self.focused = false;
         self.hover = None;
         self.base.show(desktop::desktop());
-        if self.grid {
-            while self.grid_labels.len() < 9 {
-                self.grid_labels.push(Label::new()?);
-            }
-            let display = &self.display.as_ref().unwrap().1;
-            for cell in 1..=9 {
-                let name = cfg
-                    .cell(display.number, cell)
-                    .map(|name| cfg.region_caption(name))
-                    .unwrap_or_else(|| "—".into());
-                self.grid_labels[cell as usize - 1].show(
-                    &format!("{cell}\n{name}"),
-                    grid_rect(display.full, cell),
-                    Self::color(cfg),
-                    display.dpi,
-                    cfg,
-                )?;
-            }
-        }
         Ok(())
     }
     fn highlight(&mut self, selected: Option<usize>, cfg: &Config) -> Result<(), String> {
@@ -391,7 +425,7 @@ impl Preview {
         Ok(())
     }
     pub fn reset(&mut self, cfg: &Config) -> Result<bool, String> {
-        if self.visible() && self.locked.is_none() && (self.grid || self.focused) {
+        if self.visible() && self.locked.is_none() && self.focused {
             self.show_base(cfg)?;
             return Ok(true);
         }
@@ -435,17 +469,11 @@ impl Preview {
             || point.x >= area.x + area.width - 2
             || point.y >= area.y + area.height - 2;
         if self.focused {
-            // A grid cell may map to a region elsewhere (another monitor, a custom
-            // mapping, the taskbar strip), so there the pointer's cell decides.
-            let inside = |index: usize| {
-                if self.grid {
-                    cfg.cell(display.number, area.grid(point.x, point.y) as u32 + 1)
-                        .is_some_and(|name| self.regions[index].name == name)
-                } else {
-                    contains(self.regions[index].rect, point)
-                }
-            };
-            if edge || self.selected.is_none_or(|index| !inside(index)) {
+            if edge
+                || self
+                    .selected
+                    .is_none_or(|index| !contains(self.regions[index].rect, point))
+            {
                 self.show_base(cfg)?;
             } else {
                 return Ok(());
@@ -456,19 +484,12 @@ impl Preview {
             self.highlight(None, cfg)?;
             return Ok(());
         }
-        let (key, selected) = if self.grid {
-            let cell = area.grid(point.x, point.y) as u32 + 1;
-            let name = cfg.cell(self.display.as_ref().unwrap().1.number, cell);
-            (
-                cell,
-                name.and_then(|name| self.regions.iter().position(|r| r.name == name)),
-            )
-        } else {
-            let selected = nearest(&self.regions, point);
-            (selected.map_or(u32::MAX, |index| index as u32), selected)
-        };
-        if !self.grid {
-            self.highlight(selected, cfg)?;
+        let selected = nearest(&self.regions, point);
+        let key = selected.map_or(u32::MAX, |index| index as u32);
+        self.highlight(selected, cfg)?;
+        if self.interactive {
+            self.hover = None;
+            return Ok(());
         }
         if selected.is_none() {
             self.hover = None;
@@ -483,9 +504,6 @@ impl Preview {
             .is_some_and(|(_, since)| now.duration_since(since) >= Duration::from_secs(2))
         {
             self.base.hide();
-            for label in &self.grid_labels {
-                label.hide();
-            }
             self.highlight(selected, cfg)?;
             self.focused = true;
             self.hover = None;
@@ -563,34 +581,30 @@ mod tests {
         assert_eq!(nearest(&regions, POINT { x: -1, y: 20 }), None);
     }
     #[test]
-    fn grid_covers_odd_sized_negative_coordinate_screen() {
-        let area = Rect {
-            x: -1921,
-            y: -80,
-            width: 1921,
-            height: 1081,
+    fn selection_encloses_disjoint_and_diagonal_regions() {
+        let a = Rect {
+            x: -900,
+            y: 0,
+            width: 300,
+            height: 300,
         };
-        assert_eq!(grid_rect(area, 1).x, -1921);
-        let last = grid_rect(area, 9);
-        assert_eq!(last.x + last.width, 0);
-        assert_eq!(last.y + last.height, 1001);
+        let b = Rect {
+            x: -600,
+            y: 300,
+            width: 300,
+            height: 300,
+        };
         assert_eq!(
-            (1..=9)
-                .map(|cell| {
-                    let r = grid_rect(area, cell);
-                    r.width * r.height
-                })
-                .sum::<i32>(),
-            area.width * area.height
+            enclosing([a, b].into_iter()),
+            Some(Rect {
+                x: -900,
+                y: 0,
+                width: 600,
+                height: 600
+            })
         );
-        for cell in 1..=9 {
-            let rect = grid_rect(area, cell);
-            assert_eq!(area.grid(rect.x, rect.y), (cell - 1) as usize);
-            assert_eq!(
-                area.grid(rect.x + rect.width - 1, rect.y + rect.height - 1),
-                (cell - 1) as usize
-            );
-        }
+        assert_eq!(enclosing([].into_iter()), None);
+        assert_eq!(enclosing([a].into_iter()), Some(a));
     }
 }
 

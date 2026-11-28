@@ -8,7 +8,7 @@ pub const TABS: [(&str, &str); 9] = [
     ("Region outlines", "标识框线"),
     ("Quick actions", "快捷操作"),
     ("Crosshair", "十字线"),
-    ("Right-click grid", "右键九宫格"),
+    ("Region selection", "分区选择"),
     ("Mouse annotations", "鼠标标注"),
     ("Keyboard annotations", "键盘标注"),
 ];
@@ -83,6 +83,7 @@ pub fn option(cfg: &Config, context: ChoiceContext, value: &str) -> String {
         (MouseButton, "middle") => ("Middle button", "中键"),
         (MouseButton, "x1") => ("Side button 1", "侧键 1"),
         (MouseButton, "x2") => ("Side button 2", "侧键 2"),
+        (MouseButton, "off") => ("Disabled", "关闭"),
         (Theme, "system") => ("System theme", "跟随系统"),
         (Theme, "light") => ("Light", "明亮"),
         (Theme, "dark") => ("Dark", "黑暗"),
@@ -239,8 +240,8 @@ fn describe(section: &str, key: &str) -> (&'static str, &'static str, &'static s
         ("shortcuts", "center_button") => (
             "Center button",
             "居中按键",
-            "Enabled mouse actions must use distinct buttons. Right click is reserved for the grid.",
-            "已启用的鼠标操作不可使用重复按键；右键点击用于九宫格。",
+            "Centering must use a different button from selection and dragging.",
+            "居中按键不可与分区选择或拖动操作重复。",
         ),
         ("general", "language") => (
             "Interface language",
@@ -260,11 +261,23 @@ fn describe(section: &str, key: &str) -> (&'static str, &'static str, &'static s
             "Updates the logon task and restarts with the requested permission; Windows may request consent.",
             "更新自启任务，并按新权限重启；Windows 可能请求授权。",
         ),
+        ("selection", "add_button") => (
+            "Cumulative selection button",
+            "累计选择按键",
+            "Click to toggle a region; Enter or 3 seconds after the last change confirms.",
+            "单击添加或取消分区；Enter 或最后一次选择变更后 3 秒确认。",
+        ),
+        ("selection", "apply_button") => (
+            "Apply region immediately",
+            "立即应用分区按键",
+            "Click to apply the hovered region. Selection buttons must differ and cannot share the centering button.",
+            "单击立即应用悬停分区；两个选择按键须不同，且不能与居中按键重复。",
+        ),
         ("general", "preview") => (
             "Show region outlines after Alt",
             "Alt 触发后显示分区框线",
-            "Show with the tip after Alt activation and hide together. Releasing held Alt closes both.",
-            "Alt 触发后与提示框同步显示、隐藏；长按时松开 Alt 即关闭。",
+            "Hold or double-tap Alt to select regions. Esc cancels; empty selection closes after 10 seconds.",
+            "长按或双击 Alt 进入相同的选择状态；Esc 取消，未选择时 10 秒退出。",
         ),
         ("general", "target_marker") => (
             "Mark the window awaiting an Alt action",
@@ -288,7 +301,7 @@ fn describe(section: &str, key: &str) -> (&'static str, &'static str, &'static s
             "Alt key for mouse actions",
             "鼠标操作使用的 Alt",
             "Used for moving, resizing and right-click placement.",
-            "用于拖动窗口、调整大小和右键九宫格。",
+            "用于触发统一的分区选择、拖动和缩放操作。",
         ),
         ("shortcuts", "move_enabled") => (
             "Enable window dragging",
@@ -311,8 +324,8 @@ fn describe(section: &str, key: &str) -> (&'static str, &'static str, &'static s
         ("shortcuts", "resize_button") => (
             "Button for resizing",
             "调整大小的鼠标按键",
-            "A right click without dragging still places by the grid.",
-            "右键只点击、不拖动时，仍使用九宫格调整位置。",
+            "A click without dragging uses the configured region selection action.",
+            "只点击、不拖动时，执行该按键配置的分区选择操作。",
         ),
         ("tip", "show") => (
             "Default tip content",
@@ -323,8 +336,8 @@ fn describe(section: &str, key: &str) -> (&'static str, &'static str, &'static s
         ("tip", "duration_ms") => (
             "Display time (milliseconds)",
             "停留时间（毫秒）",
-            "Starts when the tip appears, and also controls Alt region previews. Help stays until Esc.",
-            "从提示框显示时开始计时，同时决定 Alt 分区预览的停留时间。帮助保持显示，直到按 Esc。",
+            "Starts when an action tip appears. Region selection uses its own 10-second / 3-second timers. Help stays until Esc.",
+            "控制操作提示的停留时间；分区选择使用独立的 10 秒／3 秒计时。帮助保持到按 Esc。",
         ),
         ("tip", "window_format") => (
             "Window information format",
@@ -478,7 +491,7 @@ pub fn fields(tab: usize, axis: usize, cfg: &Config, doc: &DocumentMut) -> Vec<F
         5 => &["crosshair", "vertical"],
         7 => &["mousecast"],
         8 => &["keycast"],
-        _ => &["grid"],
+        _ => &["selection"],
     };
     if matches!(tab, 2 | 3 | 5 | 6 | 7 | 8) {
         fields.push(Field { section: String::new(), key: String::new(), label: cfg.tr("Live desktop preview", "实时桌面预览").into(), hint: cfg.tr("Esc closes or resets the preview. Region preview requires selecting a region below.", "Esc 关闭或重置预览；分区预览还需选中下方的分区。").into(), kind: Kind::Preview });
@@ -493,9 +506,6 @@ pub fn fields(tab: usize, axis: usize, cfg: &Config, doc: &DocumentMut) -> Vec<F
     if tab == 2 {
         fields.push(Field { section: String::new(), key: String::new(), label: cfg.tr("Region expressions", "分区表达式").into(), hint: cfg.tr("x | y | width | height [| monitor]. sw/sh: work-area width/height; ww/wh: current window; vw/vh: virtual desktop. Units are percentages: 50sw-8 = half the work-area width minus 8 px. Monitor 0 follows the pointer; vw/vh use the virtual-desktop origin.", "x | y | 宽 | 高 [| 屏号]。sw/sh：工作区宽高；ww/wh：当前窗口宽高；vw/vh：虚拟桌面宽高。单位均为百分比，例如 50sw-8 为半屏宽减 8 像素。屏号 0 跟随鼠标；含 vw/vh 时从虚拟桌面原点计算。").into(), kind: Kind::Note });
     }
-    if tab == 6 {
-        fields.push(Field { section: String::new(), key: String::new(), label: cfg.tr("Monitor-specific cells", "设置指定屏幕的区块").into(), hint: cfg.tr("Use monitor number × 10 + cell. For monitor 3, bottom-left: 3*10+7=37. Hover for 2 seconds to preview the mapped region.", "想设置某块屏幕上的区块，只需要将对应的屏幕编号乘10，再加上格子号即可，例如想设置屏幕3的左下角，编号就是 3*10+7=37。悬停2秒预览对应区域。").into(), kind: Kind::Note });
-    }
     if tab == 7 {
         fields.push(Field{section:String::new(),key:String::new(),label:cfg.tr("Filled mouse indicators","填色鼠标指示").into(),
             hint:cfg.tr("Left/right: two halves of a circle; middle: a small wheel rectangle; scrolling: directional triangles. Held buttons and continuous scrolling stay visible. Fade timing is fixed at about 0.5 seconds.","左右键拼成完整圆形，中键为靠上的小长方形，滚动为方向三角形。长按和连续滚动保持显示；淡入淡出固定约 0.5 秒，不可调。").into(),kind:Kind::Note});
@@ -504,7 +514,7 @@ pub fn fields(tab: usize, axis: usize, cfg: &Config, doc: &DocumentMut) -> Vec<F
         let Some(table) = doc.get(section).and_then(|item| item.as_table()) else {
             continue;
         };
-        let mapping = matches!(*section, "presets" | "keys" | "commands" | "grid");
+        let mapping = matches!(*section, "presets" | "keys" | "commands");
         let mut entries: Vec<_> = table.iter().collect();
         if !mapping {
             let order = field_order(section);
@@ -562,6 +572,9 @@ pub fn fields(tab: usize, axis: usize, cfg: &Config, doc: &DocumentMut) -> Vec<F
                     ("general", "language") => &["auto", "zh-CN", "en"],
                     ("shortcuts", "alt") => &["left", "right", "both"],
                     ("shortcuts", "gesture") => &["left", "right", "both", "off"],
+                    ("selection", "add_button" | "apply_button") => {
+                        &["left", "right", "middle", "x1", "x2", "off"]
+                    }
                     ("shortcuts", "move_button" | "resize_button" | "center_button") => {
                         &["left", "right", "middle", "x1", "x2"]
                     }
@@ -576,7 +589,7 @@ pub fn fields(tab: usize, axis: usize, cfg: &Config, doc: &DocumentMut) -> Vec<F
                     let context = match (*section, key) {
                         ("general", "language") => ChoiceContext::Language,
                         ("shortcuts", "alt" | "gesture") => ChoiceContext::AltSide,
-                        ("shortcuts", _) => ChoiceContext::MouseButton,
+                        ("shortcuts" | "selection", _) => ChoiceContext::MouseButton,
                         ("tip", "show") => ChoiceContext::TipContent,
                         ("keycast" | "topmost_marker", "position") => ChoiceContext::Position,
                         _ => ChoiceContext::Theme,
@@ -612,13 +625,13 @@ pub fn fields(tab: usize, axis: usize, cfg: &Config, doc: &DocumentMut) -> Vec<F
                             "presets" => "Add region",
                             "keys" => "Add shortcut",
                             "commands" => "Add command",
-                            _ => "Add grid mapping",
+                            _ => "Add mapping",
                         },
                         match *section {
                             "presets" => "添加分区",
                             "keys" => "添加快捷键",
                             "commands" => "添加命令",
-                            _ => "添加九宫格映射",
+                            _ => "添加映射",
                         },
                     )
                     .into(),
@@ -814,7 +827,7 @@ mod tests {
         doc["presets"]["font"] = toml_edit::value("0|0|50sw|50sh");
         doc["presets"]["color"] = toml_edit::value("0|0|50sw|50sh");
         let cfg = Config::parse(&doc).unwrap();
-        for (tab, section) in [(2, "presets"), (4, "keys"), (4, "commands"), (6, "grid")] {
+        for (tab, section) in [(2, "presets"), (4, "keys"), (4, "commands")] {
             let actual = fields(tab, 0, &cfg, &doc);
             let names: Vec<_> = actual
                 .iter()

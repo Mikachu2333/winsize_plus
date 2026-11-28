@@ -55,6 +55,8 @@ struct App {
     preview: Preview,
     held_window: Option<HWND>,
     preview_latched: bool,
+    selection_suspended: Option<Duration>,
+    selection_hint: String,
     preview_until: Option<Instant>,
     preview_check: Option<Instant>,
     window: HWND,
@@ -72,7 +74,7 @@ impl App {
         if self.cfg.preview
             && let Some(hwnd) = self.held_window
         {
-            self.preview.start(hwnd, &self.cfg)?;
+            self.preview.interactive(hwnd, &self.cfg)?;
             input::track_preview(true)?;
         }
         Ok(())
@@ -83,28 +85,95 @@ impl App {
         self.preview_until = None;
         self.preview_check = None;
         self.preview_latched = false;
+        self.selection_suspended = None;
+        self.selection_hint.clear();
         self.preview.hide();
         input::track_preview(false)
     }
-    fn begin_alt_preview(&mut self, window: HWND, latched: bool) -> Result<(), String> {
+    fn begin_alt_preview(&mut self, window: HWND, _latched: bool) -> Result<(), String> {
         self.close_preview()?;
         self.clear();
         self.window = window;
         self.held_window = Some(window);
-        self.preview_latched = latched;
+        self.preview_latched = true;
         self.refresh_preview()?;
         if self.cfg.target_marker {
             self.marker.show(window)?;
         }
-        if self.preview.warnings().is_empty() {
-            self.status(&self.cfg.show.clone())?;
-        } else {
-            self.notice(&self.preview.warnings().join("\n"))?;
-        }
-        // The default tip and outlines share one deadline, including a hidden default tip.
-        self.preview_until = (!self.overlay.tip_scrollable())
-            .then(|| self.hide.unwrap_or_else(|| later(self.cfg.duration)));
+        self.preview_until = Some(later(10_000));
         self.preview_check = Some(later(100));
+        self.selection_tip()
+    }
+    fn selection_tip(&mut self) -> Result<(), String> {
+        if self.held_window.is_none() {
+            return Ok(());
+        }
+        let count = self.preview.count();
+        let text = if count == 0 {
+            let mut parts = Vec::new();
+            if let Some(name) = self.preview.hovered_name() {
+                parts.push(self.cfg.display_name(name).to_owned());
+            }
+            if self.cfg.gesture != "off" {
+                for (button, en, zh) in [
+                    (self.cfg.add_button, "select", "累计选择"),
+                    (self.cfg.apply_button, "apply", "立即应用"),
+                ] {
+                    if button.is_some() {
+                        parts.push(format!(
+                            "{} {}",
+                            self.cfg.button_name(button),
+                            self.cfg.tr(en, zh)
+                        ));
+                    }
+                }
+            }
+            parts.push(self.cfg.tr("Esc to exit", "Esc 退出").into());
+            parts.join(" · ")
+        } else {
+            let remaining = self.selection_suspended.unwrap_or_else(|| {
+                self.preview_until.map_or(Duration::ZERO, |end| {
+                    end.saturating_duration_since(Instant::now())
+                })
+            });
+            let seconds = remaining.as_millis().div_ceil(1000).max(1);
+            if self.cfg.zh {
+                format!("已选 {count} 个分区 · Enter 确认 · Esc 取消 · {seconds} 秒后应用")
+            } else {
+                format!("{count} selected · Enter to apply · Esc to cancel · Apply in {seconds}s")
+            }
+        };
+        if text != self.selection_hint {
+            self.overlay.tip(&text, &self.cfg)?;
+            self.selection_hint = text;
+        }
+        self.hide = None;
+        Ok(())
+    }
+    fn finish_selection(&mut self, rect: Option<crate::layout::Rect>) -> Result<(), String> {
+        let window = self.window;
+        self.close_preview()?;
+        self.clear();
+        input::cancel();
+        if let Some(rect) = rect {
+            if unsafe { GetForegroundWindow() } != window
+                || !desktop::allowed(window, &self.cfg.exclusions)
+            {
+                return Ok(());
+            }
+            desktop::apply(
+                window,
+                &Request {
+                    x: Some(rect.x),
+                    y: Some(rect.y),
+                    size: Some((rect.width, rect.height)),
+                    ..Default::default()
+                },
+                &self.cfg,
+                &self.path,
+                desktop::cursor()?,
+            )?;
+        }
         Ok(())
     }
     fn notice(&mut self, text: &str) -> Result<(), String> {
@@ -439,7 +508,7 @@ impl App {
     }
     fn handle_event(&mut self, msg: MSG) -> Result<(), String> {
         if self.paused
-            && (input::ARMED..=input::CENTER).contains(&msg.message)
+            && (input::ARMED..=input::CONFIRM).contains(&msg.message)
             && msg.message != input::DISPLAY_CHANGED
         {
             return Ok(());
@@ -474,6 +543,9 @@ impl App {
                 Ok(())
             }
             input::DISPLAY_CHANGED => {
+                if self.held_window.is_some() {
+                    self.finish_selection(None)?;
+                }
                 self.cfg.mousecast.color = crate::colors::accent();
                 self.cfg.mousecast.dark = crate::overlay::dark();
                 self.cast.tick(&self.cfg)?;
@@ -532,12 +604,10 @@ impl App {
             }
             input::ARMED => self.begin_alt_preview(msg.wParam as HWND, true),
             input::ALT_HOLD => self.begin_alt_preview(msg.wParam as HWND, false),
-            input::ALT_RELEASE => {
-                if !self.preview_latched
-                    && (self.preview_until.is_some() || self.preview_check.is_some())
-                {
-                    self.close_preview()?;
-                    self.clear();
+            input::ALT_RELEASE => Ok(()),
+            input::CONFIRM => {
+                if self.preview.count() > 0 {
+                    self.finish_selection(self.preview.selection_rect())?;
                 }
                 Ok(())
             }
@@ -563,6 +633,7 @@ impl App {
                 }
                 if self.preview.visible() {
                     self.preview.follow(point, &self.cfg)?;
+                    self.selection_tip()?;
                 }
                 if (self.overlay.mode() != 0 || self.drag.is_some())
                     && let Some(frame) = self.frames.moved(point)?
@@ -572,22 +643,28 @@ impl App {
                 Ok(())
             }
             input::CLICK => {
-                self.close_preview()?;
-                self.clear();
+                if self.held_window.is_none() {
+                    return Ok(());
+                }
                 let point = input::click_point();
-                let screen = desktop::screen(point, 0)?;
-                let cell = screen.full.grid(point.x, point.y) as u32 + 1;
-                if let Some(preset) = self.cfg.cell(screen.number, cell) {
-                    desktop::apply(
-                        msg.wParam as HWND,
-                        &Request {
-                            preset: Some(preset.to_owned()),
-                            ..Default::default()
-                        },
-                        &self.cfg,
-                        &self.path,
-                        point,
-                    )?
+                if !self.preview.visible() {
+                    self.preview.interactive(self.window, &self.cfg)?;
+                }
+                if let Some((name, rect)) = self.preview.hit(point, &self.cfg)? {
+                    if msg.lParam != 0 {
+                        self.preview.toggle(name, rect, &self.cfg)?;
+                        self.selection_suspended = None;
+                        self.preview_until = Some(later(if self.preview.count() == 0 {
+                            10_000
+                        } else {
+                            3000
+                        }));
+                        self.selection_tip()?;
+                    } else {
+                        self.finish_selection(Some(rect))?;
+                    }
+                } else if msg.lParam == 0 {
+                    self.finish_selection(None)?;
                 }
                 Ok(())
             }
@@ -605,13 +682,18 @@ impl App {
                     input::click_point(),
                 )
             }
-            input::GRID_SHOW => {
-                self.close_preview()?;
-                self.clear();
-                self.window = msg.wParam as HWND;
-                self.preview.grid(self.window, &self.cfg)?;
-                self.preview_check = Some(later(100));
-                input::track_preview(true)
+            input::POINTER_DOWN => {
+                self.selection_suspended = self
+                    .preview_until
+                    .take()
+                    .map(|end| end.saturating_duration_since(Instant::now()));
+                Ok(())
+            }
+            input::POINTER_UP => {
+                if let Some(remaining) = self.selection_suspended.take() {
+                    self.preview_until = Some(Instant::now() + remaining);
+                }
+                Ok(())
             }
             input::DRAG_START => {
                 let drag = desktop::Drag::start(
@@ -680,13 +762,10 @@ impl App {
             self.cast.tick(&self.cfg)?;
         }
         if self.preview_until.is_some_and(|when| now >= when) {
-            self.clear();
-            input::cancel();
-            self.close_preview()?;
+            self.finish_selection(self.preview.selection_rect())?;
         }
         if self.preview_check.is_some_and(|when| now >= when) {
             if unsafe { IsWindow(self.window) } == 0
-                || (!self.preview_latched && !input::alt_held())
                 || unsafe { GetForegroundWindow() } != self.window
             {
                 self.clear();
@@ -694,6 +773,7 @@ impl App {
                 self.close_preview()?;
             } else {
                 self.preview.tick(&self.cfg)?;
+                self.selection_tip()?;
                 self.marker.follow()?;
                 self.preview_check = Some(later(100));
             }
@@ -803,6 +883,8 @@ pub fn run(
             preview: Preview::new()?,
             held_window: None,
             preview_latched: false,
+            selection_suspended: None,
+            selection_hint: String::new(),
             preview_until: None,
             preview_check: None,
             window: null_mut(),
@@ -971,6 +1053,8 @@ mod tests {
             preview: Preview::new().unwrap(),
             held_window: None,
             preview_latched: false,
+            selection_suspended: None,
+            selection_hint: String::new(),
             preview_until: None,
             preview_check: None,
             window: null_mut(),
@@ -1023,6 +1107,63 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "opens temporary selection overlays to exercise confirmation and pointer timers"]
+    fn selection_session_survives_alt_release_and_pauses_only_during_pointer_hold() {
+        let _hooks = input::Hooks::start(&crate::test_support::cfg()).unwrap();
+        let mut app = test_app();
+        app.cfg.zh = true;
+        app.begin_alt_preview(unsafe { GetForegroundWindow() }, false)
+            .unwrap();
+        assert!(
+            app.preview_until
+                .unwrap()
+                .saturating_duration_since(Instant::now())
+                > Duration::from_secs(9)
+        );
+        assert!(app.overlay.tip_text().contains("Esc"));
+        assert!(!app.overlay.tip_text().contains("Q /"));
+        app.handle_event(MSG {
+            message: input::ALT_RELEASE,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(app.preview.visible());
+        app.handle_event(MSG {
+            message: input::POINTER_DOWN,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(app.preview_until.is_none() && app.selection_suspended.is_some());
+        app.handle_event(MSG {
+            message: input::POINTER_UP,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(app.preview_until.is_some() && app.selection_suspended.is_none());
+        app.preview
+            .toggle(
+                "one".into(),
+                crate::layout::Rect {
+                    x: 0,
+                    y: 0,
+                    width: 100,
+                    height: 100,
+                },
+                &app.cfg,
+            )
+            .unwrap();
+        app.preview_until = Some(later(3000));
+        app.selection_tip().unwrap();
+        assert!(app.overlay.tip_text().contains("Enter"));
+        app.handle_event(MSG {
+            message: input::CANCEL,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(!app.preview.visible() && !app.overlay.tip_visible());
+    }
+
+    #[test]
     #[ignore = "shows a temporary tip and closes its test tray menu automatically"]
     fn tip_expires_while_tray_menu_is_open() {
         unsafe extern "system" fn close_menu(_: HWND, _: u32, _: usize, _: u32) {
@@ -1061,6 +1202,9 @@ mod tests {
             app.begin_alt_preview(unsafe { GetForegroundWindow() }, false)
                 .unwrap();
             app.preview_until = expiry.then(Instant::now);
+            if !expiry {
+                app.window = null_mut();
+            }
             app.preview_check = Some(Instant::now());
             let resume = input::tests::pause_worker();
             let started = Instant::now();
@@ -1097,6 +1241,8 @@ mod tests {
             preview: Preview::new().unwrap(),
             held_window: None,
             preview_latched: false,
+            selection_suspended: None,
+            selection_hint: String::new(),
             preview_until: Some(Instant::now()),
             preview_check: Some(Instant::now()),
             window: null_mut(),
@@ -1167,6 +1313,8 @@ mod tests {
             preview: Preview::new().unwrap(),
             held_window: None,
             preview_latched: false,
+            selection_suspended: None,
+            selection_hint: String::new(),
             preview_until: None,
             preview_check: None,
             window: null_mut(),
@@ -1254,6 +1402,8 @@ mod tests {
             preview: Preview::new().unwrap(),
             held_window: None,
             preview_latched: false,
+            selection_suspended: None,
+            selection_hint: String::new(),
             preview_until: None,
             preview_check: None,
             window: null_mut(),
@@ -1526,6 +1676,8 @@ mod tests {
             preview: Preview::new().unwrap(),
             held_window: None,
             preview_latched: false,
+            selection_suspended: None,
+            selection_hint: String::new(),
             preview_until: None,
             preview_check: None,
             window: null_mut(),

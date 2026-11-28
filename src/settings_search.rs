@@ -321,7 +321,7 @@ fn group_aliases(section: &str) -> &'static [&'static str] {
             "keybinding",
         ],
         "commands" => &["指令", "命令", "快捷指令", "command"],
-        "grid" => &["九宫格", "宫格", "格子", "分格", "grid", "cell"],
+        "selection" => &["选择", "累计", "鼠标", "selection", "button"],
         "mousecast" => &["鼠标显示", "鼠标指示", "鼠标点击显示", "mouse annotations"],
         "keycast" => &["按键显示", "键盘显示", "输入显示", "keystrokes"],
         _ => &[],
@@ -355,6 +355,8 @@ fn aliases(_: usize, section: &str, key: &str) -> &'static [&'static str] {
         ("shortcuts", "resize_button") => &["缩放按键", "调整大小按键", "缩放鼠标键"],
         ("shortcuts", "center_enabled") => &["居中", "屏幕中央", "对齐中间", "center"],
         ("shortcuts", "center_button") => &["居中按键", "居中鼠标键", "中键"],
+        ("selection", "add_button") => &["累计选择", "多选", "选择按键"],
+        ("selection", "apply_button") => &["立即应用", "直接选择", "应用按键"],
         ("tip", "show") => &["提示内容", "默认内容", "内容类型", "显示内容"],
         ("tip", "window_format") => &["窗口信息格式", "窗口标题", "进程名称", "占位符", "格式化"],
         ("tip", "time_format") => &[
@@ -611,14 +613,8 @@ mod tests {
     fn unselected_candidates_do_not_match_and_value_changes_update_the_index() {
         let mut doc = config::help().parse::<DocumentMut>().unwrap();
         let index = Index::build(&doc).unwrap();
-        assert_eq!(doc["grid"]["6"].as_str(), Some("FullRight"));
-        for query in ["left", "LEFT", "LeftTop", "Q"] {
-            assert!(!matches(&index, query, 6, "grid", "6"), "{query}");
-        }
-        for key in ["1", "4", "7"] {
-            assert!(matches(&index, "left", 6, "grid", key), "{key}");
-        }
-        assert!(matches(&index, "FullRight", 6, "grid", "6"));
+        assert!(matches(&index, "right", 6, "selection", "apply_button"));
+        assert!(!matches(&index, "x2", 6, "selection", "apply_button"));
         assert!(!matches(
             &index,
             "bottom-right",
@@ -629,7 +625,7 @@ mod tests {
         assert!(!matches(&index, "A Test Font", 1, "tip", "font"));
         assert!(!matches(&index, "退出", 4, "keys", "Q"));
 
-        doc["grid"]["6"] = toml_edit::value("LeftTop");
+        doc["selection"]["apply_button"] = toml_edit::value("x2");
         doc["topmost_marker"]["position"] = toml_edit::value("bottom-right");
         doc["topmost_marker"]["size"] = toml_edit::value(32);
         doc["tip"]["font"] = toml_edit::value("A Test Font");
@@ -640,10 +636,8 @@ mod tests {
         doc["keys"]["Q"] = toml_edit::value("quit");
         doc["keys"]["T"] = toml_edit::value("LeftTop");
         let index = Index::build(&doc).unwrap();
-        assert!(matches(&index, "left", 6, "grid", "6"));
-        assert!(matches(&index, "T", 6, "grid", "6"));
-        assert!(!matches(&index, "Q", 6, "grid", "6"));
-        assert!(!matches(&index, "FullRight", 6, "grid", "6"));
+        assert!(matches(&index, "x2", 6, "selection", "apply_button"));
+        assert!(!matches(&index, "right", 6, "selection", "apply_button"));
         assert!(matches(&index, "右下", 0, "topmost_marker", "position"));
         assert!(!matches(
             &index,

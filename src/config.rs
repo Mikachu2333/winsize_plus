@@ -100,6 +100,8 @@ pub struct Config {
     pub move_button: Option<u32>,
     pub resize_button: Option<u32>,
     pub center_button: Option<u32>,
+    pub add_button: Option<u32>,
+    pub apply_button: Option<u32>,
     pub warnings: Vec<String>,
     pub preset_names: HashMap<String, String>,
     pub lines: [Line; 2],
@@ -108,7 +110,6 @@ pub struct Config {
     pub presets: HashMap<String, Layout>,
     pub keys: HashMap<u32, String>,
     pub commands: HashMap<String, String>,
-    pub grid: HashMap<u32, String>,
     pub exclusions: Vec<Identity>,
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -181,7 +182,7 @@ fn merge(table: &mut Table, defaults: &Table, named: bool) -> bool {
                 changed |= merge(
                     child,
                     default,
-                    matches!(key, "presets" | "keys" | "commands" | "grid"),
+                    matches!(key, "presets" | "keys" | "commands"),
                 )
             }
         } else {
@@ -333,7 +334,7 @@ fn canonicalize(doc: &mut DocumentMut) {
         .map(|(key, _)| (command_name(key), key.to_owned()))
         .collect();
     // Preserve custom names as authored; normalize action references and built-in spelling.
-    for section in ["keys", "commands", "grid"] {
+    for section in ["keys", "commands"] {
         if let Some(table) = doc.get_mut(section).and_then(Item::as_table_mut) {
             for (_, item) in table.iter_mut() {
                 if let Some(text) = item.as_str() {
@@ -357,12 +358,15 @@ fn canonicalize(doc: &mut DocumentMut) {
 }
 
 impl Config {
-    pub fn cell(&self, monitor: u32, cell: u32) -> Option<&str> {
-        [monitor * 10 + cell, cell]
-            .iter()
-            .find_map(|key| self.grid.get(key))
-            .filter(|name| !name.is_empty())
-            .map(String::as_str)
+    pub fn button_name(&self, button: Option<u32>) -> &str {
+        match button {
+            Some(1) => self.tr("Left click", "左键"),
+            Some(2) => self.tr("Right click", "右键"),
+            Some(4) => self.tr("Middle click", "中键"),
+            Some(5) => self.tr("Side button 1", "侧键 1"),
+            Some(6) => self.tr("Side button 2", "侧键 2"),
+            _ => self.tr("Disabled", "已禁用"),
+        }
     }
     pub fn preset(&self, name_or_key: &str) -> Option<&Layout> {
         self.presets.get(&command_name(name_or_key)).or_else(|| {
@@ -460,8 +464,8 @@ impl Config {
             }
             mouse.push(
                 self.tr(
-                    "Alt + right click = place by the 3×3 grid",
-                    "Alt + 右键点击屏幕位置 = 九宫格位置调整",
+                    "After Alt activation: select actual regions; Enter confirms, Esc cancels",
+                    "Alt 触发后：按实际分区选择；Enter 确认，Esc 取消",
                 )
                 .into(),
             );
@@ -755,18 +759,6 @@ impl Config {
                 action(item).map_err(|err| format!("commands.{key}: {err}"))?,
             );
         }
-        let mut grid = HashMap::new();
-        for (key, item) in entries("grid")? {
-            let name = command_name(item.as_str().ok_or_else(|| format!("grid.{key}"))?);
-            if !name.is_empty() && !presets.contains_key(&name) {
-                return Err(format!("grid.{key}: {name}"));
-            }
-            let number: u32 = key.parse().map_err(|_| format!("grid.{key}"))?;
-            if number == 0 || number.is_multiple_of(10) || number > 9999 {
-                return Err(format!("grid.{key}: expected monitor * 10 + cell"));
-            }
-            grid.insert(number, name);
-        }
         let mut exclusions = Vec::new();
         if let Some(item) = doc.get("exclusions") {
             for table in item.as_array_of_tables().ok_or("[[exclusions]]")? {
@@ -858,6 +850,32 @@ impl Config {
         let move_button = button("move")?;
         let resize_button = button("resize")?;
         let center_button = button("center")?;
+        let selection_button = |key| -> Result<Option<u32>, String> {
+            Ok(
+                match choice(
+                    "selection",
+                    key,
+                    &["left", "right", "middle", "x1", "x2", "off"],
+                )?
+                .as_str()
+                {
+                    "left" => Some(1),
+                    "right" => Some(2),
+                    "middle" => Some(4),
+                    "x1" => Some(5),
+                    "x2" => Some(6),
+                    _ => None,
+                },
+            )
+        };
+        let add_button = selection_button("add_button")?;
+        let apply_button = selection_button("apply_button")?;
+        if add_button.is_some() && add_button == apply_button {
+            return Err(
+                "selection.apply_button: conflicts with cumulative selection / 与累计选择按键冲突"
+                    .into(),
+            );
+        }
         let mut used_buttons = HashSet::new();
         for (name, button) in [
             ("move", move_button),
@@ -872,8 +890,11 @@ impl Config {
                 ));
             }
         }
-        if center_button == Some(2) {
-            return Err("shortcuts.center_button: right click is reserved for the grid / 右键点击已用于九宫格".into());
+        if center_button.is_some() && [add_button, apply_button].contains(&center_button) {
+            return Err(
+                "shortcuts.center_button: conflicts with region selection / 与分区选择按键冲突"
+                    .into(),
+            );
         }
         Ok(Self {
             topmost_marker: TopmostStyle {
@@ -941,6 +962,8 @@ impl Config {
             move_button,
             resize_button,
             center_button,
+            add_button,
+            apply_button,
             warnings: Vec::new(),
             preset_names,
             crosshair_unified,
@@ -961,7 +984,6 @@ impl Config {
             presets,
             keys,
             commands,
-            grid,
             exclusions,
         })
     }
@@ -1098,6 +1120,8 @@ fn document(text: &str) -> Result<(DocumentMut, bool), String> {
 }
 
 fn migrate(doc: &mut DocumentMut) -> Result<(), String> {
+    // Fixed grid mappings no longer participate in input; keep their region definitions.
+    doc.as_table_mut().remove("grid");
     if doc
         .get("shortcuts")
         .and_then(|v| v.get("center_button"))
@@ -1341,8 +1365,10 @@ fn recover(doc: &mut DocumentMut) -> Result<Config, String> {
                         == semantic(Some(&default))
                     {
                         // A removed preset can invalidate an otherwise default binding.
-                        if matches!(section, "keys" | "commands" | "grid") {
+                        if matches!(section, "keys" | "commands") {
                             assign(&mut doc[section][key], value(""));
+                        } else if section == "selection" {
+                            assign(&mut doc[section][key], value("off"));
                         } else if section == "shortcuts"
                             && let Some(action) = key.strip_suffix("_button")
                         {

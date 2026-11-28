@@ -30,13 +30,15 @@ pub const ALT_HOLD: u32 = WM_APP + 7;
 pub const ALT_RELEASE: u32 = WM_APP + 8;
 pub const DRAG_START: u32 = WM_APP + 9;
 pub const DRAG_END: u32 = WM_APP + 10;
-pub const GRID_SHOW: u32 = WM_APP + 11;
+pub const POINTER_DOWN: u32 = WM_APP + 11;
 pub const DISPLAY_CHANGED: u32 = WM_APP + 12;
 pub const TIP_SCROLL: u32 = WM_APP + 13;
 pub const CAST_KEY: u32 = WM_APP + 14;
 pub const CAST_MOUSE: u32 = WM_APP + 15;
 pub const RECOVERED: u32 = WM_APP + 16;
 pub const CENTER: u32 = WM_APP + 17;
+pub const POINTER_UP: u32 = WM_APP + 18;
+pub const CONFIRM: u32 = WM_APP + 19;
 thread_local! { static DISPLAY_PENDING: Cell<bool> = const { Cell::new(false) }; }
 pub fn display_changed() {
     desktop::invalidate_displays();
@@ -94,6 +96,8 @@ struct Input {
     move_button: Option<u32>,
     resize_button: Option<u32>,
     center_button: Option<u32>,
+    add_button: Option<u32>,
+    apply_button: Option<u32>,
     centered_button: Option<u32>,
     cast_mouse: bool,
     cast_buttons: u32,
@@ -355,6 +359,7 @@ impl Input {
                 self.last_tap = None;
             }
             if self.target_allowed {
+                self.mode = Mode::Wait;
                 self.mask_alt_menu = true;
                 post(ALT_HOLD, self.gesture_target as usize, 0);
             }
@@ -457,7 +462,8 @@ impl Input {
                     || self.drag.is_some()
                     || self.centered_button.is_some()
                     || (self.tip_scrollable && self.tip_window != 0)
-                    || (self.target_allowed && self.pressed & self.gesture_mask != 0));
+                    || (self.target_allowed
+                        && (self.mode == Mode::Wait || self.pressed & self.gesture_mask != 0)));
             if needed && self.mouse.is_null() {
                 self.mouse =
                     SetWindowsHookExW(WH_MOUSE_LL, Some(mouse), GetModuleHandleW(null()), 0);
@@ -505,6 +511,7 @@ impl Input {
         }
         if down
             && self.hold_active
+            && self.mode == Mode::Idle
             && self.pressed & self.alt_mask != 0
             && self.cast_toggles[index] & flag != 0
         {
@@ -512,6 +519,7 @@ impl Input {
             self.eaten[index] |= flag;
             self.tap = None;
             self.last_tap = None;
+            self.cancel_hold();
             return true;
         }
         if down && self.tip_scrollable && matches!(key, 0x21..=0x24 | 0x26 | 0x28) {
@@ -552,7 +560,7 @@ impl Input {
                 if self.pressed & side != 0 {
                     return self.second;
                 }
-                if self.pressed == 0 {
+                if self.pressed == 0 && self.mode == Mode::Idle {
                     self.select_target(unsafe { GetForegroundWindow() });
                 }
                 let start_hold = self.pressed & (self.gesture_mask | self.alt_mask) == 0
@@ -565,7 +573,10 @@ impl Input {
                         .all(|code| GetAsyncKeyState(*code as i32) >= 0)
                 };
                 let clean = self.pressed == side && unmodified;
-                self.tap = (clean && self.target_allowed && self.alt_mask & side != 0)
+                self.tap = (clean
+                    && self.mode == Mode::Idle
+                    && self.target_allowed
+                    && (self.alt_mask | self.gesture_mask) & side != 0)
                     .then_some((key, time));
                 self.second = self.tap.is_some()
                     && self.last_tap.is_some_and(|(last, when)| {
@@ -575,7 +586,7 @@ impl Input {
                 if self.second {
                     self.hold_started = None;
                     self.hold_active = true;
-                } else if start_hold && unmodified {
+                } else if start_hold && unmodified && self.mode == Mode::Idle {
                     self.hold_started = Some(time);
                     self.advance_hold(time);
                 }
@@ -592,7 +603,6 @@ impl Input {
                 }
                 self.cancel_hold();
             }
-            let _ = self.update_mouse();
             let consumed = self.second;
             self.second = false;
             if let Some((pressed, when)) = self.tap.take()
@@ -606,9 +616,14 @@ impl Input {
                     self.last_tap = Some((key, when))
                 }
             }
-            if !consumed && self.pressed & self.gesture_mask == 0 && self.drag.is_none() {
+            if !consumed
+                && self.mode == Mode::Idle
+                && self.pressed & self.gesture_mask == 0
+                && self.drag.is_none()
+            {
                 self.target_allowed = false;
             }
+            let _ = self.update_mouse();
             return consumed;
         }
         if !down {
@@ -622,20 +637,6 @@ impl Input {
         if matches!(key, 0x10 | 0xa0 | 0xa1) {
             return false;
         }
-        if self.mode == Mode::Idle
-            && self.hold_active
-            && self.target_allowed
-            && self.pressed & self.alt_mask != 0
-            && self.bound[index] & flag != 0
-        {
-            post(ARMED, self.gesture_target as usize, 0);
-            post(ACTION, key as usize, 0);
-            self.eaten[index] |= flag;
-            if self.command[index] & flag != 0 {
-                self.mode = Mode::Command;
-            }
-            return true;
-        }
         if self.mode == Mode::Idle {
             // Ordinary Alt shortcuts (for example Alt+Tab) abandon the pending preview.
             if self.pressed != 0 {
@@ -646,7 +647,13 @@ impl Input {
         }
         let eat = match self.mode {
             Mode::Wait => {
+                if key == u32::from(VK_RETURN) {
+                    post(CONFIRM, 0, 0);
+                    self.eaten[index] |= flag;
+                    return true;
+                }
                 let bound = self.bound[index] & flag != 0;
+                self.cancel_hold();
                 self.mode = if self.command[index] & flag != 0 {
                     Mode::Command
                 } else {
@@ -870,6 +877,8 @@ unsafe extern "system" fn mouse(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
                             if let Some(mut drag) = input.drag
                                 && drag.draggable && !drag.canceled && !drag.active && ((data.pt.x as i64 - drag.start.x as i64).abs() >= GetSystemMetrics(SM_CXDRAG) as i64 || (data.pt.y as i64 - drag.start.y as i64).abs() >= GetSystemMetrics(SM_CYDRAG) as i64) {
                                     drag.active = true;
+                                    input.mode = Mode::Idle;
+                                    input.cancel_hold();
                                     post_event(DRAG_START, input.gesture_target as usize, isize::from(drag.resize), Some(drag.start));
                                     input.drag = Some(drag);
                                 }
@@ -884,29 +893,38 @@ unsafe extern "system" fn mouse(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
                                 input.point = data.pt;
                                 if drag.canceled { /* Consume the matching release without a click. */ }
                                 else if drag.active { post_event(DRAG_END, 0, 0, Some(data.pt)); }
-                                else if button == 2 {
-                                    post_event(CLICK, input.gesture_target as usize, 0, Some(data.pt));
+                                else if input.add_button == Some(button) || input.apply_button == Some(button) {
+                                    let cumulative = input.add_button == Some(button);
+                                    post_event(CLICK, input.gesture_target as usize, isize::from(cumulative), Some(data.pt));
+                                    if !cumulative { input.mode = Mode::Idle; input.cancel_hold(); }
                                 }
+                                post(POINTER_UP, 0, 0);
                                 let _ = input.update_mouse();
                                 return true;
                             }
                             if !down { return false; }
-                            if input.preview_tracking && input.pressed==0 {post(CANCEL,0,0);input.mode=Mode::Idle;}
                             input.tap = None;
                             input.last_tap = None;
-                            if input.hold_active && input.target_allowed && input.pressed & input.gesture_mask != 0 && input.drag.is_none() {
+                            if input.mode == Mode::Wait && input.target_allowed && input.gesture_mask != 0 && input.drag.is_none() {
                                 if input.center_button == Some(button) {
                                     input.centered_button = Some(button);
+                                    input.mode = Mode::Idle;
+                                    input.cancel_hold();
                                     post_event(CENTER, input.gesture_target as usize, 0, Some(data.pt));
                                     return true;
                                 }
                                 let resize = input.resize_button == Some(button);
                                 let draggable = resize || input.move_button == Some(button);
-                                if draggable || button == 2 {
-                                    if button == 2 { post(GRID_SHOW, input.gesture_target as usize, 0); }
+                                if draggable || input.add_button == Some(button) || input.apply_button == Some(button) {
+                                    post(POINTER_DOWN, 0, 0);
                                     input.drag = Some(PointerAction { start: data.pt, button, resize, draggable, active: false, canceled: false });
                                     return true;
                                 }
+                            }
+                            if input.preview_tracking && input.mode == Mode::Wait {
+                                input.mode = Mode::Idle;
+                                input.cancel_hold();
+                                post(CANCEL, 0, 0);
                             }
                             false
                         }
@@ -1070,12 +1088,17 @@ pub fn cancel() {
     let _ = queue_hook(|| {
         INPUT.with_borrow_mut(|input| {
             input.mode = Mode::Idle;
+            input.cancel_hold();
+            input.tap = None;
+            input.last_tap = None;
+            input.target_allowed = false;
             if let Some(drag) = &mut input.drag {
                 drag.canceled = true;
             }
         })
     });
 }
+#[cfg(test)]
 pub fn alt_held() -> bool {
     EVENTS.with_borrow(|events| {
         events.as_ref().map_or_else(
@@ -1119,6 +1142,7 @@ pub fn track_preview(on: bool) -> Result<(), String> {
 }
 pub fn configure(cfg: &Config) -> Result<(), String> {
     let center_button = cfg.center_button;
+    let (add_button, apply_button) = (cfg.add_button, cfg.apply_button);
     let (alt, gesture, hold_ms, exclusions, move_button, resize_button, double_ms) = (
         mask(&cfg.alt),
         mask(&cfg.gesture),
@@ -1142,6 +1166,8 @@ pub fn configure(cfg: &Config) -> Result<(), String> {
             input.move_button = move_button;
             input.resize_button = resize_button;
             input.center_button = center_button;
+            input.add_button = add_button;
+            input.apply_button = apply_button;
             input.double_ms = double_ms;
             input.command = [0; 4];
             input.bound = [0; 4];
@@ -1510,6 +1536,7 @@ pub(super) mod tests {
         let _hooks = Hooks::escape_only().unwrap();
         on_hook(|| {
             INPUT.with_borrow_mut(|input| {
+                input.mode = Mode::Wait;
                 input.hold_active = true;
                 input.pressed = 1;
                 input.target_allowed = true;
@@ -1552,8 +1579,63 @@ pub(super) mod tests {
         .unwrap();
         assert_eq!(next_event().unwrap().message, CENTER);
         assert_eq!((click_point().x, click_point().y), (-900, 250));
-        assert_eq!(next_event().unwrap().message, ALT_RELEASE);
         assert!(next_event().is_none());
+    }
+
+    #[test]
+    fn held_and_double_alt_sessions_accept_clicks_after_release_and_do_not_rearm() {
+        use super::*;
+        let _hooks = Hooks::escape_only().unwrap();
+        for double in [false, true] {
+            on_hook(move || {
+                INPUT.with_borrow_mut(|input| {
+                    *input = pending_hold(100);
+                    input.gesture_mask = 1;
+                    input.second = double;
+                    if double {
+                        input.hold_active = true;
+                    } else {
+                        input.advance_hold(2100);
+                    }
+                    input.keyboard(LEFT, false, if double { 130 } else { 2101 });
+                    assert!(input.mode == Mode::Wait);
+                });
+                for message in [WM_LBUTTONDOWN, WM_LBUTTONUP, WM_RBUTTONDOWN, WM_RBUTTONUP] {
+                    let data = MSLLHOOKSTRUCT {
+                        time: 2200,
+                        ..Default::default()
+                    };
+                    assert_eq!(
+                        unsafe {
+                            mouse(
+                                HC_ACTION as i32,
+                                message as usize,
+                                (&data as *const _) as isize,
+                            )
+                        },
+                        1
+                    );
+                }
+                INPUT.with_borrow_mut(|input| {
+                    assert!(input.mode == Mode::Idle);
+                    assert!(!input.keyboard(0x51, true, 2300));
+                    input.advance_hold(10000);
+                    assert!(!input.hold_active);
+                });
+            })
+            .unwrap();
+            let events: Vec<_> = std::iter::from_fn(next_event).collect();
+            let clicks: Vec<_> = events
+                .iter()
+                .filter(|e| e.message == CLICK)
+                .map(|e| e.lParam)
+                .collect();
+            assert_eq!(clicks, [1, 0]);
+            assert_eq!(
+                events.iter().filter(|e| e.message == POINTER_DOWN).count(),
+                2
+            );
+        }
     }
 
     #[test]
@@ -1592,6 +1674,8 @@ pub(super) mod tests {
     fn pending_hold(when: u32) -> super::Input {
         let mut input = super::Input {
             alt_mask: 1,
+            add_button: Some(1),
+            apply_button: Some(2),
             hold_ms: 2000,
             hold_started: Some(when),
             pressed: 1,
@@ -1900,10 +1984,8 @@ pub(super) mod tests {
         assert!(next_event().is_none());
         assert!(input.tap.is_none());
         assert!(input.keyboard(0x51, true, 2301));
-        assert_eq!(next_event().unwrap().message, ARMED);
         assert_eq!(next_event().unwrap().message, ACTION);
         assert!(!input.keyboard(LEFT, false, 2302));
-        assert_eq!(next_event().unwrap().message, ALT_RELEASE);
         assert!(input.keyboard(0x51, false, 2303));
         assert!(!input.hold_active);
         assert!(next_event().is_none());
@@ -1963,7 +2045,6 @@ pub(super) mod tests {
         input.hold_ms = 0;
         assert!(input.keyboard(0x51, true, 100));
         assert_eq!(next_event().unwrap().message, ALT_HOLD);
-        assert_eq!(next_event().unwrap().message, ARMED);
         assert_eq!(next_event().unwrap().message, ACTION);
         let mut input = pending_hold(u32::MAX - 999);
         input.advance_hold(999);
@@ -2018,8 +2099,9 @@ pub(super) mod tests {
         })
         .unwrap();
         assert_eq!(next_event().unwrap().message, ALT_HOLD);
-        assert_eq!(next_event().unwrap().message, GRID_SHOW);
+        assert_eq!(next_event().unwrap().message, POINTER_DOWN);
         assert_eq!(next_event().unwrap().message, CLICK);
+        assert_eq!(next_event().unwrap().message, POINTER_UP);
         assert!(next_event().is_none());
     }
     pub fn pause_worker() -> super::mpsc::Sender<()> {
@@ -2143,6 +2225,7 @@ pub(super) mod tests {
                 assert_eq!(input.pressed, 2);
                 input.alt_mask = 1;
                 input.gesture_mask = 1;
+                input.apply_button = Some(2);
                 input.hold_ms = 0;
                 input.target_allowed = true;
             });
@@ -2174,7 +2257,7 @@ pub(super) mod tests {
         })
         .unwrap();
         assert_eq!(next_event().unwrap().message, ALT_HOLD);
-        assert_eq!(next_event().unwrap().message, GRID_SHOW);
+        assert_eq!(next_event().unwrap().message, POINTER_DOWN);
         assert_eq!(next_event().unwrap().message, ALT_RELEASE);
         assert!(next_event().is_none());
     }

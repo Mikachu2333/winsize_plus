@@ -1417,7 +1417,7 @@ impl Editor {
                             0,
                         );
                     } else {
-                        row.options = schema::actions(&self.cfg, row.field.section == "grid");
+                        row.options = schema::actions(&self.cfg, false);
                         self.control(
                             &mut row,
                             index,
@@ -1710,11 +1710,7 @@ impl Editor {
                 }
                 Kind::Mapping => {
                     let preset = row.field.section == "presets";
-                    let input_width = if row.field.section == "grid" {
-                        number_width
-                    } else {
-                        name_width
-                    };
+                    let input_width = name_width;
                     place(row.c(3), padding, y - self.scroll[1], input_width, h);
                     if preset {
                         let delete_x = if input_width + gap + button_width <= width {
@@ -2117,7 +2113,7 @@ impl Editor {
                         }
                         rename_entry(draft[section].as_table_mut().unwrap(), key, &name);
                         if section == "presets" {
-                            for bindings in ["keys", "commands", "grid"] {
+                            for bindings in ["keys", "commands"] {
                                 for (_, item) in draft[bindings].as_table_mut().unwrap().iter_mut()
                                 {
                                     if item.as_str().is_some_and(|v| {
@@ -2408,7 +2404,7 @@ impl Editor {
             if !matches!(row.field.kind, Kind::Mapping) || row.field.section == "presets" {
                 continue;
             }
-            let options = schema::actions(&self.cfg, row.field.section == "grid");
+            let options = schema::actions(&self.cfg, false);
             if row.options != options {
                 let selected = self
                     .doc
@@ -2464,7 +2460,7 @@ impl Editor {
                     }
                 }
                 3 => self.preview.start(self.window.0, &self.cfg)?,
-                6 => self.preview.grid(self.window.0, &self.cfg)?,
+                6 => self.preview.start(self.window.0, &self.cfg)?,
                 7 | 8 => {
                     self.cast
                         .preview(self.tab == 7, desktop::cursor()?, &self.cfg)?;
@@ -2516,10 +2512,6 @@ impl Editor {
                 .filter(|n| !config::reserved_key(0x6f + n))
                 .map(|n| format!("F{n}"))
                 .collect(),
-            "grid" => (1..=999)
-                .filter(|n| n % 10 != 0)
-                .map(|n| n.to_string())
-                .collect(),
             "presets" => (1..=999).map(|n| format!("Region{n}")).collect(),
             _ => (1..=999).map(|n| format!("Command{n}")).collect(),
         };
@@ -2540,13 +2532,6 @@ impl Editor {
             .ok_or("No free name")?;
         let text = if section == "presets" {
             "10sw|10sh|80sw|80sh".to_owned()
-        } else if section == "grid" {
-            self.cfg
-                .preset_names
-                .values()
-                .min()
-                .cloned()
-                .unwrap_or_default()
         } else {
             "Help".into()
         };
@@ -2568,7 +2553,7 @@ impl Editor {
         let mut draft = self.doc.clone();
         draft[&section].as_table_mut().unwrap().remove(&key);
         if section == "presets" {
-            for section in ["keys", "commands", "grid"] {
+            for section in ["keys", "commands"] {
                 for (_, item) in draft[section].as_table_mut().unwrap().iter_mut() {
                     if item
                         .as_str()

@@ -8,16 +8,6 @@ pub struct Rect {
     pub height: i32,
 }
 
-impl Rect {
-    pub fn grid(self, x: i32, y: i32) -> usize {
-        let third = |point, start, length: i32| {
-            (((i64::from(point) - i64::from(start) + 1) * 3 - 1) / i64::from(length.max(1)))
-                .clamp(0, 2) as usize
-        };
-        third(y, self.y, self.height) * 3 + third(x, self.x, self.width)
-    }
-}
-
 #[derive(Clone, Debug, PartialEq)]
 struct Expr(Vec<(f64, usize)>);
 

@@ -7,7 +7,7 @@ A Windows window management tool that uses Alt shortcuts and mouse actions to mo
 ## Features
 
 - Move, resize, center, and maximize windows across multiple monitors.
-- Arrange windows with screen regions and a right-click grid; customize regions and shortcuts.
+- Arrange windows with actual screen regions, cumulative selection and customizable shortcuts.
 - Always-on-top control, crosshairs, and a marker for the window awaiting an action.
 - Mouse and keyboard annotations for recordings and presentations.
 - Pause / enable capture from the tray; settings save automatically and follow the Windows light/dark theme.
@@ -23,7 +23,7 @@ After an Alt hold activates capture or a WinSizeP action consumes input, releasi
 | --- | --- |
 | Alt + left drag | Move the window |
 | Alt + right drag | Resize the window |
-| Alt + right click | Arrange using the grid |
+| Left / right click after Alt activation | Toggle a region / apply it immediately |
 | Alt + middle click | Center on the pointer's monitor |
 | Alt + F | Maximize; when unavailable, fill the work area |
 | Alt + Q/W/E, A/S/D, Z/X/C | Apply nine region presets |
@@ -59,3 +59,5 @@ cargo test
 ```
 
 Executable: `target/release/winsizep.exe`.
+
+Hold or double-tap Alt to enter the same selection session, which survives Alt release. Enter confirms; Esc cancels. Empty selection closes after 10 seconds; selection changes restart a 3-second apply timer. Configure the click buttons under Region selection. Dragging cancels pending selection.

@@ -22,9 +22,13 @@ resize_button = "right"
 center_enabled = true
 center_button = "middle"
 
+[selection]
+add_button = "left"
+apply_button = "right"
+
 [tip]
 show = "window"
-duration_ms = 3000 # Starts when the tip and Alt region preview appear.
+duration_ms = 3000 # Starts when an action tip appears.
 window_format = "{title}" # {hwnd}, {title}, {pid}, {process}, {display_name}, {class}
 time_format = "hh:mm" # YYYY, MM, DD, hh, mm, ss
 theme = "system"
@@ -130,18 +134,6 @@ Pin = "Top"
 Exclude = "Ignore"
 Screen = "Monitor"
 G = "Guide"
-
-# Monitor-specific cell: monitor * 10 + cell; e.g. monitor 3, bottom-left: 3*10+7=37.
-[grid]
-1 = "LeftTop"
-2 = "FullTop"
-3 = "RightTop"
-4 = "FullLeft"
-5 = "Center"
-6 = "FullRight"
-7 = "LeftBottom"
-8 = "FullBottom"
-9 = "RightBottom"
 
 # Windows 11 and Windows 10 system tray overflow menus.
 [[exclusions]]
