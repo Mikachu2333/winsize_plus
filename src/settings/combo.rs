@@ -1,6 +1,6 @@
 //! Searchable native combos keep item identity separate from the filtered row index.
 use crate::desktop::wide;
-use std::{cell::RefCell, collections::HashMap};
+use std::{cell::RefCell, collections::HashMap, rc::Rc};
 use windows_sys::{
     Win32::{
         Foundation::*,
@@ -13,7 +13,10 @@ pub const COMMIT: u32 = 0x7f01;
 
 #[derive(Clone)]
 struct Search {
-    options: Vec<(String, String)>,
+    options: Rc<Vec<(String, String)>>,
+    terms: Rc<Vec<String>>,
+    visible: Option<Rc<Vec<usize>>>,
+    restored: bool,
     committed: Option<usize>,
     query: String,
     busy: bool,
@@ -111,15 +114,15 @@ fn paint_edit_padding(combo: HWND) {
         ReleaseDC(combo, dc);
     }
 }
-fn matching(options: &[(String, String)], query: &str) -> Vec<usize> {
+fn matching(options: &[String], query: &str) -> Vec<usize> {
     let query = query.trim().to_lowercase();
+    let words: Vec<_> = query.split_whitespace().collect();
     options
         .iter()
         .enumerate()
-        .filter_map(|(i, (value, label))| {
-            let candidate = format!("{value} {label}").to_lowercase();
-            query
-                .split_whitespace()
+        .filter_map(|(i, candidate)| {
+            words
+                .iter()
                 .all(|word| candidate.contains(word))
                 .then_some(i)
         })
@@ -153,7 +156,15 @@ pub fn populate(combo: HWND, options: &[(String, String)], selected: &str) {
         all.insert(
             combo as usize,
             Search {
-                options: options.to_vec(),
+                options: Rc::new(options.to_vec()),
+                terms: Rc::new(
+                    options
+                        .iter()
+                        .map(|(value, label)| format!("{value} {label}").to_lowercase())
+                        .collect(),
+                ),
+                visible: None,
+                restored: false,
                 committed: options
                     .iter()
                     .position(|(v, _)| v.eq_ignore_ascii_case(selected)),
@@ -172,6 +183,13 @@ fn rebuild(combo: HWND, search: &Search, indices: &[usize]) {
             s.busy = true;
         }
     });
+    if search
+        .visible
+        .as_deref()
+        .is_some_and(|shown| shown.as_slice() == indices)
+    {
+        return;
+    }
     send(combo, WM_SETREDRAW, 0, 0);
     send(combo, CB_RESETCONTENT, 0, 0);
     for &original in indices {
@@ -196,6 +214,11 @@ fn rebuild(combo: HWND, search: &Search, indices: &[usize]) {
         send(combo, CB_SETITEMDATA, row as usize, -1);
     }
     send(combo, WM_SETREDRAW, 1, 0);
+    SEARCHES.with_borrow_mut(|all| {
+        if let Some(s) = all.get_mut(&(combo as usize)) {
+            s.visible = Some(Rc::new(indices.to_vec()));
+        }
+    });
 }
 fn finish_rebuild(combo: HWND) {
     SEARCHES.with_borrow_mut(|all| {
@@ -207,8 +230,12 @@ fn finish_rebuild(combo: HWND) {
 fn restore(combo: HWND) {
     let search = SEARCHES.with_borrow_mut(|all| {
         let s = all.get_mut(&(combo as usize))?;
+        if s.restored && !s.editing {
+            return None;
+        }
         s.query.clear();
         s.editing = false;
+        s.restored = true;
         Some(s.clone())
     });
     let Some(search) = search else {
@@ -274,12 +301,13 @@ pub fn filter(combo: HWND) {
         }
         s.query = query.clone();
         s.editing = true;
+        s.restored = false;
         Some(s.clone())
     });
     let Some(search) = search else {
         return;
     };
-    let indices = matching(&search.options, &query);
+    let indices = matching(&search.terms, &query);
     rebuild(combo, &search, &indices);
     send(combo, CB_SHOWDROPDOWN, 1, 0);
     unsafe {
@@ -615,10 +643,7 @@ mod tests {
     }
     #[test]
     fn searches_values_labels_and_multiple_unicode_terms() {
-        let options = vec![
-            ("1/4".into(), "左上区域".into()),
-            ("custom".into(), "工作区 二".into()),
-        ];
+        let options = vec!["1/4 左上区域".into(), "custom 工作区 二".into()];
         assert_eq!(matching(&options, "1/4"), [0]);
         assert_eq!(matching(&options, "CUSTOM 二"), [1]);
         assert!(matching(&options, "missing").is_empty());
@@ -661,8 +686,27 @@ mod tests {
                 .collect::<Vec<_>>();
             options.push(("special".into(), "特殊分区".into()));
             populate(combo, &options, "region10");
+            let full = SEARCHES.with_borrow(|all| all[&(combo as usize)].visible.clone().unwrap());
+            notification(combo, CBN_CLOSEUP);
+            assert!(
+                SEARCHES.with_borrow(|all| Rc::ptr_eq(
+                    &full,
+                    all[&(combo as usize)].visible.as_ref().unwrap()
+                )),
+                "closing an unchanged list must not rebuild it"
+            );
             SetWindowTextW(combo, wide("特殊").as_ptr());
             filter(combo);
+            let filtered =
+                SEARCHES.with_borrow(|all| all[&(combo as usize)].visible.clone().unwrap());
+            filter(combo);
+            assert!(
+                SEARCHES.with_borrow(|all| Rc::ptr_eq(
+                    &filtered,
+                    all[&(combo as usize)].visible.as_ref().unwrap()
+                )),
+                "unchanged matches must reuse their list"
+            );
             assert_eq!(send(combo, CB_GETCOUNT, 0, 0), 1);
             assert_eq!(selected_index(combo), Some(10));
             send(combo, CB_SETCURSEL, 0, 0);
