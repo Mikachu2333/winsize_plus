@@ -115,6 +115,7 @@ struct Input {
     mouse: HHOOK,
     point: POINT,
     tip_visible: bool,
+    operation_pending: bool,
     tip_scrollable: bool,
     tip_window: usize,
     target_allowed: bool,
@@ -612,6 +613,7 @@ impl Input {
         if down
             && key == VK_ESCAPE as u32
             && (self.tip_visible
+                || self.operation_pending
                 || self.annotation_preview
                 || self.preview_tracking
                 || self.mode != Mode::Idle
@@ -1136,6 +1138,13 @@ pub fn tip_scrollable(scrollable: bool, window: usize) {
             let _ = input.update_mouse();
         })
     });
+}
+pub fn operation_pending(pending: bool) {
+    thread_local! {static LAST:Cell<bool>=const{Cell::new(false)};}
+    if LAST.with(|last| last.replace(pending)) != pending {
+        let _ =
+            queue_hook(move || INPUT.with_borrow_mut(|input| input.operation_pending = pending));
+    }
 }
 pub fn click_point() -> POINT {
     CURRENT

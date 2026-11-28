@@ -54,6 +54,7 @@ struct App {
     tray: crate::tray::Tray,
     frames: FrameClock,
     drag_frames: FrameClock,
+    operations: desktop::operations::Operations,
     preview: Preview,
     neighbors: crate::neighbors::Hint,
     held_window: Option<HWND>,
@@ -65,7 +66,7 @@ struct App {
     preview_until: Option<Instant>,
     preview_check: Option<Instant>,
     window: HWND,
-    drag: Option<desktop::Drag>,
+    drag: Option<desktop::operations::Drag>,
     command: String,
     hide: Option<Instant>,
     reload: Option<Instant>,
@@ -96,6 +97,7 @@ impl App {
         input::track_preview(false)
     }
     fn begin_alt_preview(&mut self, window: HWND, _latched: bool) -> Result<(), String> {
+        self.operations.cancel();
         self.close_prompt_without_focus();
         self.close_preview()?;
         self.clear();
@@ -221,16 +223,14 @@ impl App {
             {
                 return Ok(());
             }
-            desktop::apply(
+            self.apply_geometry(
                 window,
-                &Request {
+                Request {
                     x: Some(rect.x),
                     y: Some(rect.y),
                     size: Some((rect.width, rect.height)),
                     ..Default::default()
                 },
-                &self.cfg,
-                &self.path,
                 desktop::cursor()?,
             )?;
         }
@@ -318,6 +318,7 @@ impl App {
         }
         let preserve_session = !restart && self.cfg.same_interaction(&cfg);
         if !preserve_session {
+            self.operations.cancel();
             input::configure(&cfg)?;
         }
         input::set_casting(self.mousecast, self.keycast)?;
@@ -376,6 +377,7 @@ impl App {
     fn act(&mut self, action: &str) -> Result<(), String> {
         match action {
             "pause" => {
+                self.operations.cancel();
                 self.close_prompt_without_focus();
                 let paused = !self.paused;
                 input::set_paused(paused)?;
@@ -520,7 +522,11 @@ impl App {
                         ..Default::default()
                     },
                 };
-                desktop::apply(self.window, &req, &self.cfg, &self.path, desktop::cursor()?)?;
+                if req.geometry() {
+                    self.apply_geometry(self.window, req, desktop::cursor()?)?;
+                } else {
+                    desktop::apply(self.window, &req, &self.cfg, &self.path, desktop::cursor()?)?;
+                }
                 if name == "ignore" {
                     // Adopt our own write so the folder watcher does not reload it again
                     // and replace this notice.
@@ -687,6 +693,7 @@ impl App {
                 Ok(())
             }
             input::RECOVERED => {
+                self.operations.cancel();
                 self.drag = None;
                 self.cast.clear();
                 self.close_preview()?;
@@ -875,14 +882,12 @@ impl App {
             input::CENTER => {
                 self.close_preview()?;
                 self.clear();
-                desktop::apply(
+                self.apply_geometry(
                     msg.wParam as HWND,
-                    &Request {
+                    Request {
                         center: true,
                         ..Default::default()
                     },
-                    &self.cfg,
-                    &self.path,
                     input::click_point(),
                 )
             }
@@ -900,20 +905,13 @@ impl App {
                 self.selection_tip()
             }
             input::DRAG_START => {
-                let drag = desktop::Drag::start(
+                let drag = self.operations.start_drag(
                     msg.wParam as HWND,
                     input::drag_origin(),
                     msg.lParam != 0,
-                    &self.cfg,
+                    self.cfg.clone(),
                 );
-                self.drag = match drag {
-                    Ok(drag) => Some(drag),
-                    Err(error) => {
-                        input::cancel();
-                        self.drag = None;
-                        return Err(error);
-                    }
-                };
+                self.drag = Some(drag);
                 self.close_preview()?;
                 self.clear();
                 self.drag_frames.reset(120.0);
@@ -930,6 +928,7 @@ impl App {
                 moved.and(drawn)
             }
             input::CANCEL => {
+                self.operations.cancel();
                 input::cancel();
                 self.drag_frames.reset(120.0);
                 if let Some(drag) = self.drag.take() {
@@ -955,6 +954,17 @@ impl App {
     fn follow_frame(&mut self, point: POINT) -> Result<(), String> {
         self.overlay.follow(point, &self.cfg)
     }
+    fn apply_geometry(
+        &mut self,
+        window: HWND,
+        request: Request,
+        point: POINT,
+    ) -> Result<(), String> {
+        self.operations
+            .apply(window, request, self.cfg.clone(), self.path.clone(), point);
+        input::operation_pending(true);
+        Ok(())
+    }
     fn follow_drag(&mut self, point: POINT) -> Result<(), String> {
         if let Some(drag) = &self.drag {
             drag.follow(point)?;
@@ -962,6 +972,8 @@ impl App {
         Ok(())
     }
     fn deadlines(&mut self) -> Result<(), String> {
+        input::operation_pending(self.operations.pending());
+        self.operations.poll()?;
         self.topmost.poll()?;
         let now = Instant::now();
         if self.selection_paint.is_some_and(|when| now >= when) {
@@ -1017,6 +1029,11 @@ impl App {
         .min()
         .map_or(INFINITE, |when| {
             when.saturating_duration_since(Instant::now()).as_millis() as u32 + 1
+        })
+        .min(if self.operations.pending() {
+            16
+        } else {
+            INFINITE
         })
     }
     fn flush_selection_paint(&mut self) -> Result<(), String> {
@@ -1097,6 +1114,7 @@ pub fn run(
             keycast: cfg.keycast.enabled,
             frames: FrameClock::new(cfg.fps)?,
             drag_frames: FrameClock::new(120.0)?,
+            operations: desktop::operations::Operations::new()?,
             cfg,
             path: path.into(),
             overlay,
@@ -1271,6 +1289,7 @@ mod tests {
             keycast: false,
             frames: FrameClock::new(cfg.fps).unwrap(),
             drag_frames: FrameClock::new(120.0).unwrap(),
+            operations: desktop::operations::Operations::new().unwrap(),
             cfg,
             path: PathBuf::new(),
             overlay: Overlay::new().unwrap(),
@@ -1763,6 +1782,7 @@ mod tests {
             keycast: false,
             frames: FrameClock::new(cfg.fps).unwrap(),
             drag_frames: FrameClock::new(120.0).unwrap(),
+            operations: desktop::operations::Operations::new().unwrap(),
             cfg,
             path: PathBuf::new(),
             overlay,
@@ -1857,6 +1877,7 @@ mod tests {
             keycast: false,
             frames: FrameClock::new(cfg.fps).unwrap(),
             drag_frames: FrameClock::new(120.0).unwrap(),
+            operations: desktop::operations::Operations::new().unwrap(),
             cfg,
             path: path.clone(),
             overlay,
@@ -2111,6 +2132,14 @@ mod tests {
                 while let Some(event) = input::next_event() {
                     app.handle_event(event).unwrap();
                 }
+                let until = Instant::now() + Duration::from_secs(3);
+                while app.operations.pending() && app.drag.is_none() {
+                    assert!(Instant::now() < until, "background geometry did not finish");
+                    app.operations.poll().unwrap();
+                    crate::test_support::pump();
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                app.operations.poll().unwrap();
             };
             for double in [false, true] {
                 unsafe {

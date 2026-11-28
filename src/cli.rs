@@ -1,4 +1,4 @@
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Selector {
     pub pid: Option<u32>,
     pub hwnd: Option<usize>,
@@ -23,7 +23,7 @@ impl Switch {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Request {
     pub target: Selector,
     pub x: Option<i32>,

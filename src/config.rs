@@ -64,7 +64,7 @@ pub struct MouseStyle {
     pub color: u32,
     pub dark: bool,
 }
-#[derive(PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct Config {
     pub topmost_marker: TopmostStyle,
     pub mousecast: MouseStyle,

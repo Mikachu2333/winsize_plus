@@ -146,6 +146,19 @@ impl Updates {
     }
     pub fn submit(&self, positions: Vec<(usize, Rect)>) -> Result<(), String> {
         self.status()?;
+        self.replace(positions)
+    }
+    pub fn pending(&self) -> bool {
+        self.lanes.lock().unwrap().iter().any(|lane| {
+            let state = lane.state.lock().unwrap();
+            state.active.is_some_and(|(_, id, _)| id == self.generation)
+                || state
+                    .latest
+                    .values()
+                    .any(|job| job.generation == self.generation)
+        })
+    }
+    pub fn replace(&self, positions: Vec<(usize, Rect)>) -> Result<(), String> {
         let mut groups: HashMap<Key, Vec<Job>> = HashMap::new();
         for (handle, rect) in positions {
             let mut pid = 0;

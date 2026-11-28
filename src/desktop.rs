@@ -3,6 +3,7 @@ use crate::{
     config::{self, Config, Identity},
     layout::Rect,
 };
+pub(crate) mod operations;
 use std::{
     ffi::OsStr,
     os::windows::ffi::OsStrExt,
@@ -469,6 +470,7 @@ pub struct Drag {
     minimum: (i32, i32),
 }
 fn restore(hwnd: HWND) -> Result<(), String> {
+    operations::check_cancelled()?;
     // SAFETY: HWND is validated by the caller. Posting a restore never waits for
     // the target's window procedure; polling only queries window-manager state.
     unsafe {
@@ -479,6 +481,7 @@ fn restore(hwnd: HWND) -> Result<(), String> {
         check(ShowWindowAsync(hwnd, SW_RESTORE))?;
         let mut deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
         while IsZoomed(hwnd) != 0 || IsIconic(hwnd) != 0 {
+            operations::check_cancelled()?;
             if minimized && IsIconic(hwnd) == 0 {
                 // A window minimized while maximized is restored to maximized first.
                 minimized = false;
@@ -521,7 +524,11 @@ impl Drag {
                 ..Default::default()
             };
             check(GetWindowPlacement(hwnd, &mut original))?;
-            restore(hwnd)?;
+            if let Err(error) = restore(hwnd) {
+                original.flags |= WPF_ASYNCWINDOWPLACEMENT;
+                SetWindowPlacement(hwnd, &original);
+                return Err(error);
+            }
             let (outer, frame) = bounds(hwnd)?;
             let mut limits = MINMAXINFO::default();
             let mut result = 0;
@@ -564,10 +571,20 @@ impl Drag {
         if let Some(linked) = &self.linked {
             linked.cancel()
         } else if let Some(original) = &self.original {
-            unsafe { check(SetWindowPlacement(self.hwnd, original)) }
+            let mut placement = *original;
+            placement.flags |= WPF_ASYNCWINDOWPLACEMENT;
+            unsafe { check(SetWindowPlacement(self.hwnd, &placement)) }
         } else {
             Ok(())
         }
+    }
+    pub fn pending(&self) -> bool {
+        self.linked.as_ref().is_some_and(|linked| linked.pending())
+    }
+    pub fn status(&self) -> Result<(), String> {
+        self.linked
+            .as_ref()
+            .map_or(Ok(()), |linked| linked.status())
     }
 }
 #[cfg(test)]
@@ -666,6 +683,7 @@ fn position(hwnd: HWND, req: &Request, cfg: &Config, point: POINT) -> Result<(),
         let mut refused = None;
         let mut answered: Option<Instant> = None;
         while Instant::now() < until {
+            operations::check_cancelled()?;
             std::thread::sleep(Duration::from_millis(10));
             let (outer, frame) = bounds(hwnd)?;
             let current = (outer, frame, GetDpiForWindow(hwnd));
@@ -785,6 +803,7 @@ fn fullscreen_window(hwnd: HWND, cfg: &Config, point: POINT) -> Result<(), Strin
             {
                 let deadline = Instant::now() + Duration::from_millis(250);
                 while Instant::now() < deadline {
+                    operations::check_cancelled()?;
                     if IsZoomed(hwnd) != 0 {
                         return Ok(());
                     }
@@ -807,6 +826,7 @@ fn fullscreen_window(hwnd: HWND, cfg: &Config, point: POINT) -> Result<(), Strin
     )
 }
 fn set_frame(hwnd: HWND, wanted: Rect, outer: Rect, frame: Rect) -> Result<(), String> {
+    operations::check_cancelled()?;
     let Rect {
         x,
         y,

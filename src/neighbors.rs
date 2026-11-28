@@ -389,7 +389,13 @@ impl Drag {
             }
         }
         let mut members = Vec::new();
+        let budget = Instant::now() + Duration::from_millis(200);
         for (index, before) in sides {
+            desktop::operations::check_cancelled()?;
+            let remaining = budget.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err("Resize limit queries timed out / 尺寸约束查询超时".into());
+            }
             let window = windows[index].clone();
             let (outer, frame) = desktop::bounds(window.hwnd)?;
             let border = match axis {
@@ -406,7 +412,7 @@ impl Drag {
                     0,
                     from_mut(&mut info) as isize,
                     SMTO_ABORTIFHUNG,
-                    100,
+                    remaining.as_millis().clamp(1, 100) as u32,
                     &mut reply,
                 ) == 0
                 {
@@ -489,12 +495,18 @@ impl Drag {
     }
     pub fn cancel(&self) -> Result<(), String> {
         self.last_delta.set(None);
-        self.updates.submit(
+        self.updates.replace(
             self.members
                 .iter()
                 .map(|m| (m.window.hwnd as usize, m.outer))
                 .collect::<Vec<_>>(),
         )
+    }
+    pub fn pending(&self) -> bool {
+        self.updates.pending()
+    }
+    pub fn status(&self) -> Result<(), String> {
+        self.updates.status()
     }
 }
 fn resize(mut rect: Rect, axis: Axis, before: bool, delta: i64) -> Rect {
@@ -924,6 +936,86 @@ mod tests {
                 single.cancel().unwrap();
                 settle(&placements);
             }
+            // The resident returns immediately while the foreign UI thread queries
+            // its constraints, and still applies the last point when released early.
+            let operations = desktop::operations::Operations::new().unwrap();
+            let start = Instant::now();
+            let pending = operations.start_drag(handles[1], origin, false, cfg.clone());
+            assert!(start.elapsed() < Duration::from_millis(40));
+            pending
+                .follow(POINT {
+                    x: origin.x + 30,
+                    y: origin.y,
+                })
+                .unwrap();
+            drop(pending);
+            let end = Instant::now() + Duration::from_secs(3);
+            while operations.pending() {
+                assert!(Instant::now() < end);
+                operations.poll().unwrap();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            operations.poll().unwrap();
+            settle(&[
+                (handles[0], original[0]),
+                (handles[1], resize(original[1], Axis::X, true, 30)),
+                (handles[2], resize(original[2], Axis::X, false, 30)),
+            ]);
+            desktop::set_frames(&placements).unwrap();
+            settle(&placements);
+            let pending = operations.start_drag(handles[1], origin, false, cfg.clone());
+            pending
+                .follow(POINT {
+                    x: origin.x + 60,
+                    y: origin.y,
+                })
+                .unwrap();
+            pending.cancel().unwrap();
+            drop(pending);
+            std::thread::sleep(Duration::from_millis(250));
+            settle(&placements);
+            unsafe {
+                SendMessageW(handles[2], WM_APP + 71, 300, 0);
+            }
+            let started = Instant::now();
+            operations.apply(
+                handles[2],
+                crate::cli::Request {
+                    x: Some(original[2].x),
+                    y: Some(original[2].y),
+                    size: Some((original[2].width - 10, original[2].height)),
+                    ..Default::default()
+                },
+                cfg.clone(),
+                std::path::PathBuf::new(),
+                origin,
+            );
+            let dispatch = started.elapsed();
+            assert!(
+                dispatch < Duration::from_millis(40),
+                "UI blocked during apply: {dispatch:?}"
+            );
+            let until = Instant::now() + Duration::from_secs(3);
+            while operations.pending() {
+                assert!(Instant::now() < until);
+                operations.poll().unwrap();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            operations.poll().unwrap();
+            println!(
+                "async apply dispatch_us={} completion_ms={}",
+                dispatch.as_micros(),
+                started.elapsed().as_millis()
+            );
+            assert_eq!(
+                desktop::bounds(handles[2]).unwrap().1.width,
+                original[2].width - 10
+            );
+            unsafe {
+                SendMessageW(handles[2], WM_APP + 71, 0, 0);
+            }
+            desktop::set_frames(&placements).unwrap();
+            settle(&placements);
             for hwnd in handles {
                 unsafe {
                     PostMessageW(hwnd, WM_CLOSE, 0, 0);
