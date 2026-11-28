@@ -3286,6 +3286,9 @@ impl Editor {
         )?;
         let _old_font = std::mem::replace(&mut self.font, font);
         let _old_hint = std::mem::replace(&mut self.hint_font, hint);
+        // Hidden pages have no pending edits (page changes commit them). Recreate
+        // them lazily instead of sending font/layout messages to every HWND now.
+        self.invalidate_pages();
         crate::settings::paint::reset_fonts();
         MEASUREMENTS.with_borrow_mut(HashMap::clear);
         for handle in self
@@ -3298,11 +3301,7 @@ impl Editor {
         {
             send(*handle, WM_SETFONT, self.font.0 as usize, 1);
         }
-        for row in self
-            .rows
-            .iter()
-            .chain(self.pages.values().flat_map(|(rows, _)| rows))
-        {
+        for row in &self.rows {
             for (slot, handle) in row.controls.iter().enumerate() {
                 if !handle.is_null() {
                     send(
