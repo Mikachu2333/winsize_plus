@@ -98,7 +98,7 @@ font_size = 18
 "2/4" = "50sw|0sh|50sw|50sh"
 "3/4" = "0sw|50sh|50sw|50sh"
 "4/4" = "50sw|50sh|50sw|50sh"
-center = "10sw|10sh|80sw|80sh"
+center = "20sw|20sh|60sw|60sh"
 
 # Hold Alt for general.alt_hold_ms then press a key, or double-tap Alt then key.
 # Empty values disable bindings.

@@ -2038,7 +2038,7 @@ mod tests {
         }
         assert_eq!(cfg.keys.get(&0x47).map(String::as_str), Some("center"));
         let center = cfg.preset("G").unwrap().resolve(area, area, area).unwrap();
-        assert_eq!((center.width, center.height), (1537, 865));
+        assert_eq!((center.width, center.height), (1153, 649));
         assert!((center.x * 2 + center.width - (area.x * 2 + area.width)).abs() <= 1);
         assert!((center.y * 2 + center.height - (area.y * 2 + area.height)).abs() <= 1);
     }

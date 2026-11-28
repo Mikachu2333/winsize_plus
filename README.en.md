@@ -19,7 +19,7 @@ Run `winsizep.exe`. Open Settings or pause input capture from the tray menu.
 | Drag a highlighted shared edge | Resize adjacent windows together |
 | Q/W/E, A/S/D, Z/X/C | Select one of nine default regions |
 | Top-row 1–4 | Select one of four default regions |
-| G | Center at 80% of the work area's width and height |
+| G | Center at 60% of the work area's width and height |
 | Middle click / F | Center / maximize |
 | P / L | Toggle always on top / crosshair |
 | M / K | Toggle mouse / keyboard annotations |
