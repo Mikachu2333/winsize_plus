@@ -1325,14 +1325,7 @@ impl Editor {
                 kind,
                 Kind::Note | Kind::Preview | Kind::Add | Kind::OpenConfig
             ) {
-                self.control(
-                    &mut row,
-                    index,
-                    12,
-                    "STATIC",
-                    self.cfg.tr("Saved", "已保存"),
-                    SS_LEFT,
-                )?;
+                self.control(&mut row, index, 12, "STATIC", "", SS_LEFT)?;
                 send(row.c(12), WM_SETFONT, self.hint_font.0 as usize, 0);
             }
             send(row.c(2), WM_SETFONT, self.hint_font.0 as usize, 0);
@@ -1899,11 +1892,21 @@ impl Editor {
                 y += hint;
             }
             if !row.c(12).is_null() {
-                let state_height = measured(&caption(row.c(12)), &self.hint_font, width)
-                    .max(self.hint_font.height());
-                y += self.s(2);
-                place(row.c(12), padding, y - self.scroll[1], width, state_height);
-                y += state_height;
+                let state = caption(row.c(12));
+                if state.is_empty() {
+                    unsafe {
+                        ShowWindow(row.c(12), SW_HIDE);
+                    }
+                } else {
+                    let state_height =
+                        measured(&state, &self.hint_font, width).max(self.hint_font.height());
+                    y += self.s(2);
+                    place(row.c(12), padding, y - self.scroll[1], width, state_height);
+                    y += state_height;
+                    unsafe {
+                        ShowWindow(row.c(12), SW_SHOW);
+                    }
+                }
             }
             y += self.s(12);
             if self.tab == 5 && row.field.section == "crosshair" {
@@ -2271,7 +2274,7 @@ impl Editor {
         }
         for &index in &self.dirty {
             if let Some(row) = self.rows.get(index) {
-                set_text(row.c(12), self.cfg.tr("Saved", "已保存"));
+                set_text(row.c(12), "");
             }
         }
         self.dirty.clear();
@@ -5217,7 +5220,7 @@ mod tests {
         editor.command(id, EN_CHANGE, edit).unwrap();
         assert!(caption(state).contains("Not saved") || caption(state).contains("未保存"));
         editor.save().unwrap();
-        assert!(caption(state) == "Saved" || caption(state) == "已保存");
+        assert!(caption(state).is_empty());
         assert_eq!(config::load(&editor.path, None).unwrap().fps, 60.0);
     }
 
