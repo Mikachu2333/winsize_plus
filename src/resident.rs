@@ -191,7 +191,6 @@ impl App {
                 self.notice(&format!("{} {number}", self.cfg.tr("Monitor", "屏幕")))
             }
             "time" => self.notice(&desktop::time_text(&self.cfg.time_format)),
-            "window" => self.notice(&desktop::window_text(self.window, &self.cfg.window_format)),
             _ => {
                 self.clear();
                 Ok(())
@@ -1488,7 +1487,6 @@ mod tests {
         let _hooks = input::Hooks::escape_only().unwrap();
         let mut app = test_app();
         for expiry in [true, false] {
-            app.cfg.show = "time".into();
             app.begin_alt_preview(unsafe { GetForegroundWindow() }, false)
                 .unwrap();
             app.preview_until = expiry.then(Instant::now);

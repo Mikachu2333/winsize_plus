@@ -807,7 +807,6 @@ impl Editor {
                 ("shortcuts", "move_button") => Some(("shortcuts", "move_enabled")),
                 ("shortcuts", "resize_button") => Some(("shortcuts", "resize_enabled")),
                 ("shortcuts", "center_button") => Some(("shortcuts", "center_enabled")),
-                ("tip", "window_format") => Some(("tip", "show")),
                 _ => None,
             };
             focus_control = enabler
@@ -2230,17 +2229,6 @@ impl Editor {
                 |row| send(row.c(0), BM_GETCHECK, 0, 0) == 1,
             )
         };
-        let choice = |section: &str, key: &str, default: &str| {
-            field(section, key).map_or_else(
-                || {
-                    saved(section, key)
-                        .and_then(Item::as_str)
-                        .unwrap_or(default)
-                        .to_ascii_lowercase()
-                },
-                |row| Self::selected_value(row, 0),
-            )
-        };
         let gestures = checked("shortcuts", "mouse_enabled");
         for (section, key, active) in [
             ("shortcuts", "move_enabled", gestures),
@@ -2272,12 +2260,6 @@ impl Editor {
                 "shortcuts",
                 "center_button",
                 gestures && checked("shortcuts", "center_enabled"),
-            ),
-            // Only the window tip expands this format; the time format also serves a command.
-            (
-                "tip",
-                "window_format",
-                choice("tip", "show", "window") == "window",
             ),
         ] {
             if let Some(row) = field(section, key) {
@@ -2456,17 +2438,14 @@ impl Editor {
             0
         };
         self.overlay.guides(guides, &self.cfg)?;
-        if self.tab == 1 && self.cfg.show != "off" {
-            let text = match self.cfg.show.as_str() {
-                "time" => desktop::time_text(&self.cfg.time_format),
-                "monitor" => format!(
-                    "{} {}",
-                    self.cfg.tr("Monitor", "屏幕"),
-                    desktop::screen(desktop::cursor()?, 0)?.number
+        if self.tab == 1 {
+            self.overlay.tip(
+                self.cfg.tr(
+                    "Left click to select · Right click to apply · Esc to exit",
+                    "左键累计选择 · 右键立即应用 · Esc 退出",
                 ),
-                _ => desktop::window_text(self.window.0, &self.cfg.window_format),
-            };
-            self.overlay.tip(&text, &self.cfg)?;
+                &self.cfg,
+            )?;
         } else if self.live {
             match self.tab {
                 2 => {
@@ -5921,38 +5900,6 @@ mod tests {
                     }
                 }
                 send(mouse, BM_CLICK, 0, 0);
-                // The window format is editable only while the window tip is selected.
-                send(hwnd, WM_COMMAND, (TAB_BASE + 1) as usize, 0);
-                wait_tab(hwnd, 1)?;
-                let fields = schema::fields(1, 0, &Config::parse(&doc).unwrap(), &doc);
-                let tip_id = |key: &str| {
-                    BASE + fields
-                        .iter()
-                        .position(|field| field.section == "tip" && field.key == key)
-                        .unwrap() as i32
-                        * STRIDE
-                };
-                let show = unsafe { GetDlgItem(pane, tip_id("show")) };
-                let format = unsafe { GetDlgItem(pane, tip_id("window_format")) };
-                let selection = send(show, CB_GETCURSEL, 0, 0);
-                let text = caption(format);
-                for (index, expected) in [(1, false), (selection as usize, true)] {
-                    send(show, CB_SETCURSEL, index, 0);
-                    send(
-                        hwnd,
-                        WM_COMMAND,
-                        tip_id("show") as usize | ((crate::settings_combo::COMMIT as usize) << 16),
-                        show as isize,
-                    );
-                    if (unsafe { IsWindowEnabled(format) } != 0) != expected
-                        || caption(format) != text
-                    {
-                        return Err(format!(
-                            "window_format enabled state or text is wrong for tip choice {index}"
-                        ));
-                    }
-                }
-
                 // Every preview pauses in the background and resumes with its checkbox intact.
                 let overlay_count = || unsafe {
                     let mut count = 0;

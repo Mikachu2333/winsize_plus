@@ -60,7 +60,6 @@ pub enum ChoiceContext {
     Language,
     AltSide,
     MouseButton,
-    TipContent,
     Theme,
     PreviewMode,
     Font,
@@ -91,10 +90,6 @@ pub fn option(cfg: &Config, context: ChoiceContext, value: &str) -> String {
         (Theme, "system") => ("System theme", "跟随系统"),
         (Theme, "light") => ("Light", "明亮"),
         (Theme, "dark") => ("Dark", "黑暗"),
-        (TipContent, "window") => ("Window information", "窗口信息"),
-        (TipContent, "time") => ("Time", "时间"),
-        (TipContent, "monitor") => ("Monitor number", "屏幕编号"),
-        (TipContent, "off") => ("No default tip", "不显示默认提示"),
         (Font, "systemfont") => ("System UI font", "系统默认 UI 字体"),
         (Action, "top") => ("Toggle always on top", "置顶 / 取消置顶"),
         (Action, "centerwindow") => ("Center on pointer's monitor", "在鼠标所在屏幕居中"),
@@ -331,23 +326,11 @@ fn describe(section: &str, key: &str) -> (&'static str, &'static str, &'static s
             "A click without dragging uses the configured region selection action.",
             "只点击、不拖动时，执行该按键配置的分区选择操作。",
         ),
-        ("tip", "show") => (
-            "Default tip content",
-            "默认提示内容",
-            "Choose window information, time, monitor number, or hide the default tip.",
-            "选择窗口信息、时间、屏幕编号，或不显示默认提示。",
-        ),
         ("tip", "duration_ms") => (
             "Display time (milliseconds)",
             "停留时间（毫秒）",
             "Starts when an action tip appears. Region selection uses its own 10-second / 3-second timers. Help stays until Esc.",
             "控制操作提示的停留时间；分区选择使用独立的 10 秒／3 秒计时。帮助保持到按 Esc。",
-        ),
-        ("tip", "window_format") => (
-            "Window information format",
-            "窗口信息格式",
-            "Tokens: {hwnd}, {title}, {pid}, {process}, {display_name}, {class}.",
-            "可用：{hwnd}、{title}、{pid}、{process}、{display_name}、{class}。",
         ),
         ("tip", "time_format") => (
             "Time format",
@@ -601,7 +584,6 @@ pub fn fields(tab: usize, axis: usize, cfg: &Config, doc: &DocumentMut) -> Vec<F
                     ("shortcuts", "move_button" | "resize_button" | "center_button") => {
                         &["left", "right", "middle", "x1", "x2"]
                     }
-                    ("tip", "show") => &["window", "time", "monitor", "off"],
                     ("tip", "theme") => &["system", "light", "dark"],
                     ("keycast", "position") => {
                         &["bottom-left", "bottom-right", "top-left", "top-right"]
@@ -614,7 +596,6 @@ pub fn fields(tab: usize, axis: usize, cfg: &Config, doc: &DocumentMut) -> Vec<F
                         ("general", "preview_mode") => ChoiceContext::PreviewMode,
                         ("shortcuts", "alt" | "gesture") => ChoiceContext::AltSide,
                         ("shortcuts" | "selection", _) => ChoiceContext::MouseButton,
-                        ("tip", "show") => ChoiceContext::TipContent,
                         ("keycast" | "topmost_marker", "position") => ChoiceContext::Position,
                         _ => ChoiceContext::Theme,
                     };
@@ -700,9 +681,7 @@ fn field_order(section: &str) -> &'static [&'static str] {
             "center_button",
         ],
         "tip" => &[
-            "show",
             "duration_ms",
-            "window_format",
             "time_format",
             "theme",
             "background",
@@ -937,7 +916,6 @@ mod tests {
         doc["general"]["language"] = toml_edit::value("zh-CN");
         let cfg = Config::parse(&doc).unwrap();
         for spelling in ["time", "Time", "TIME"] {
-            assert_eq!(option(&cfg, ChoiceContext::TipContent, spelling), "时间");
             assert_eq!(option(&cfg, ChoiceContext::Action, spelling), "显示时间");
         }
         assert_eq!(option(&cfg, ChoiceContext::Font, "Time"), "Time");

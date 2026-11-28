@@ -27,9 +27,7 @@ add_button = "left"
 apply_button = "right"
 
 [tip]
-show = "window"
 duration_ms = 3000 # Starts when an action tip appears.
-window_format = "{title}" # {hwnd}, {title}, {pid}, {process}, {display_name}, {class}
 time_format = "hh:mm" # YYYY, MM, DD, hh, mm, ss
 theme = "system"
 background = "#FFFFFF"

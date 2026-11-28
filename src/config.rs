@@ -78,7 +78,6 @@ pub struct Config {
     pub autostart: bool,
     pub preview_mode: String,
     pub target_marker: bool,
-    pub show: String,
     pub duration: u32,
     pub theme: String,
     pub colors: [u32; 4],
@@ -92,7 +91,6 @@ pub struct Config {
     pub region_font_size: i32,
     pub region_bold: bool,
     pub region_italic: bool,
-    pub window_format: String,
     pub time_format: String,
     pub outline: Line,
     pub outline_dark: u32,
@@ -977,7 +975,6 @@ impl Config {
             preview_mode: choice("general", "preview_mode", &["always", "selected", "off"])?,
             target_marker: boolean("general", "target_marker")?,
             alt_hold_ms: number("general", "alt_hold_ms", 0, 60000)? as u32,
-            show: choice("tip", "show", &["off", "time", "monitor", "window"])?,
             duration: number("tip", "duration_ms", 100, 120000)? as u32,
             theme: choice("tip", "theme", &["system", "dark", "light"])?,
             colors: [
@@ -996,7 +993,6 @@ impl Config {
             region_font_size: number("regions", "font_size", 6, 128)? as i32,
             region_bold: boolean("regions", "font_bold")?,
             region_italic: boolean("regions", "font_italic")?,
-            window_format: text("tip", "window_format")?.into(),
             time_format: text("tip", "time_format")?.into(),
             outline: Line {
                 width: number("outline", "width", 1, 16)? as i32,
@@ -1225,8 +1221,7 @@ fn migrate_default_regions(doc: &mut DocumentMut) {
 
 fn migrate(doc: &mut DocumentMut) -> Result<(), String> {
     migrate_default_regions(doc);
-    // Fixed grid mappings no longer participate in input; keep their region definitions.
-    doc.as_table_mut().remove("grid");
+    // Obsolete sections are ignored by the UI and retained in the user's document.
     if doc
         .get("shortcuts")
         .and_then(|v| v.get("center_button"))
@@ -1891,6 +1886,32 @@ fn load_snapshot_inner(path: &Path, edit: Option<(&Identity, Switch)>) -> Result
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn retired_options_are_ignored_and_missing_options_are_filled() {
+        let mut doc = help().parse::<DocumentMut>().unwrap();
+        doc["tip"]["show"] = value("obsolete");
+        doc["tip"]["window_format"] = value("{title}");
+        doc["shortcuts"]["gesture"] = value("off");
+        doc["general"]["preview"] = value(false);
+        doc["general"]
+            .as_table_mut()
+            .unwrap()
+            .remove("preview_mode");
+        doc["shortcuts"]
+            .as_table_mut()
+            .unwrap()
+            .remove("mouse_enabled");
+        let cfg = recover(&mut doc).unwrap();
+        assert_eq!(cfg.preview_mode, "always");
+        assert!(cfg.mouse_enabled);
+        assert_eq!(doc["tip"]["show"].as_str(), Some("obsolete"));
+        let fields = crate::settings_schema::fields(1, 0, &cfg, &doc);
+        assert!(
+            !fields
+                .iter()
+                .any(|f| matches!(f.key.as_str(), "show" | "window_format"))
+        );
+    }
     #[test]
     fn default_regions_tile_odd_work_areas_and_use_only_top_row_digits() {
         let cfg = crate::test_support::cfg();

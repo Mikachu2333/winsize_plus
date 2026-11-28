@@ -357,8 +357,6 @@ fn aliases(_: usize, section: &str, key: &str) -> &'static [&'static str] {
         ("shortcuts", "center_button") => &["居中按键", "居中鼠标键", "中键"],
         ("selection", "add_button") => &["累计选择", "多选", "选择按键"],
         ("selection", "apply_button") => &["立即应用", "直接选择", "应用按键"],
-        ("tip", "show") => &["提示内容", "默认内容", "内容类型", "显示内容"],
-        ("tip", "window_format") => &["窗口信息格式", "窗口标题", "进程名称", "占位符", "格式化"],
         ("tip", "time_format") => &[
             "时钟格式",
             "日期格式",
@@ -590,7 +588,6 @@ mod tests {
         for (query, tab, section, key) in [
             ("准星", 5, "horizontal", "width"),
             ("TIME_FORMAT", 1, "tip", "time_format"),
-            ("{display_name}", 1, "tip", "window_format"),
             ("左上", 0, "topmost_marker", "position"),
             ("20", 0, "topmost_marker", "size"),
             ("crshair", 5, "horizontal", "color"),
