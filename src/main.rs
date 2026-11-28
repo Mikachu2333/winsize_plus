@@ -16,6 +16,7 @@ mod launch;
 mod layout;
 mod logon;
 mod mouse_cast;
+mod neighbors;
 mod overlay;
 mod preview;
 mod resident;

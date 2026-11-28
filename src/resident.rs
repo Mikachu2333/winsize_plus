@@ -53,6 +53,7 @@ struct App {
     tray: crate::tray::Tray,
     frames: FrameClock,
     preview: Preview,
+    neighbors: crate::neighbors::Hint,
     held_window: Option<HWND>,
     preview_latched: bool,
     selection_suspended: Option<Duration>,
@@ -81,6 +82,7 @@ impl App {
         Ok(())
     }
     fn close_preview(&mut self) -> Result<(), String> {
+        self.neighbors.hide();
         self.marker.hide();
         self.held_window = None;
         self.preview_until = None;
@@ -693,6 +695,9 @@ impl App {
                     self.preview.follow(point, &self.cfg)?;
                     self.selection_tip()?;
                 }
+                if self.held_window.is_some() && self.selection_suspended.is_none() {
+                    self.neighbors.follow(point, &self.cfg)?;
+                }
                 if (self.overlay.mode() != 0 || self.drag.is_some())
                     && let Some(frame) = self.frames.moved(point)?
                 {
@@ -785,7 +790,9 @@ impl App {
             }
             input::CANCEL => {
                 input::cancel();
-                self.drag = None;
+                if let Some(drag) = self.drag.take() {
+                    drag.cancel()?;
+                }
                 self.clear();
                 if self.preview_until.is_none() && self.preview.reset(&self.cfg)? {
                     self.preview_until = Some(later(self.cfg.duration));
@@ -939,6 +946,7 @@ pub fn run(
             overlay,
             tray: crate::tray::Tray::new()?,
             preview: Preview::new()?,
+            neighbors: crate::neighbors::Hint::default(),
             held_window: None,
             preview_latched: false,
             selection_suspended: None,
@@ -1079,19 +1087,10 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{
-        process::{Command, Stdio},
-        sync::{
-            Arc,
-            atomic::{AtomicBool, Ordering},
-        },
-    };
+    use std::process::{Command, Stdio};
     use windows_sys::Win32::{
         System::LibraryLoader::GetModuleHandleW,
-        UI::{
-            Controls::{EM_REPLACESEL, EM_SETSEL},
-            Input::KeyboardAndMouse::*,
-        },
+        UI::Controls::{EM_REPLACESEL, EM_SETSEL},
     };
     const TARGET: &str = "WinSizeP preview test target";
 
@@ -1110,6 +1109,7 @@ mod tests {
             overlay: Overlay::new().unwrap(),
             tray: crate::tray::Tray::new().unwrap(),
             preview: Preview::new().unwrap(),
+            neighbors: crate::neighbors::Hint::default(),
             held_window: None,
             preview_latched: false,
             selection_suspended: None,
@@ -1299,6 +1299,7 @@ mod tests {
             overlay,
             tray: crate::tray::Tray::new().unwrap(),
             preview: Preview::new().unwrap(),
+            neighbors: crate::neighbors::Hint::default(),
             held_window: None,
             preview_latched: false,
             selection_suspended: None,
@@ -1372,6 +1373,7 @@ mod tests {
             overlay,
             tray: crate::tray::Tray::new().unwrap(),
             preview: Preview::new().unwrap(),
+            neighbors: crate::neighbors::Hint::default(),
             held_window: None,
             preview_latched: false,
             selection_suspended: None,
@@ -1462,6 +1464,7 @@ mod tests {
             overlay,
             tray: crate::tray::Tray::new().unwrap(),
             preview: Preview::new().unwrap(),
+            neighbors: crate::neighbors::Hint::default(),
             held_window: None,
             preview_latched: false,
             selection_suspended: None,
@@ -1676,353 +1679,103 @@ mod tests {
             DestroyWindow(hwnd);
         }
     }
-    fn key(vk: u16, down: bool) {
-        unsafe {
-            let event = INPUT {
-                r#type: INPUT_KEYBOARD,
-                Anonymous: INPUT_0 {
-                    ki: KEYBDINPUT {
-                        wVk: vk,
-                        dwFlags: if down { 0 } else { KEYEVENTF_KEYUP },
-                        ..Default::default()
-                    },
-                },
-            };
-            assert_eq!(SendInput(1, &event, size_of::<INPUT>() as i32), 1);
-        }
-    }
-    fn visible(state: &AtomicBool, wanted: bool) -> Result<(), String> {
-        let until = Instant::now() + Duration::from_secs(2);
-        while state.load(Ordering::SeqCst) != wanted {
-            if Instant::now() >= until {
-                return Err(format!("Preview did not become {wanted}"));
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        Ok(())
-    }
     #[test]
-    #[ignore = "sends Alt/Esc to a temporary test window; needs an interactive desktop"]
+    #[ignore = "uses a temporary foreign window and hook callbacks to verify unified selection and application"]
     fn alt_preview_lifecycle() {
+        let _dpi = crate::test_support::Dpi::new();
         let mut child = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--ignored",
-                "--exact",
-                "resident::tests::target_window",
-                "--nocapture",
-            ])
+            .args(["--ignored", "--exact", "resident::tests::target_window"])
             .env("WINSIZEP_PREVIEW_TARGET", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        let mut doc = config::help().parse::<toml_edit::DocumentMut>().unwrap();
-        doc["tip"]["duration_ms"] = toml_edit::value(900);
-        doc["general"]["alt_hold_ms"] = toml_edit::value(200);
-        doc["shortcuts"]["resize_enabled"] = toml_edit::value(false);
-        let cfg = Config::parse(&doc).unwrap();
-        let overlay = Overlay::new().unwrap();
-        let _hooks = input::Hooks::start(&cfg).unwrap();
-        let mut app = App {
-            marker: crate::target_marker::TargetMarker::default(),
-            topmost: crate::topmost_marker::Markers::default(),
-            paused: false,
-            cast: crate::cast::Visuals::new(),
-            mousecast: false,
-            keycast: false,
-            frames: FrameClock::new(cfg.fps).unwrap(),
-            cfg,
-            path: PathBuf::new(),
-            overlay,
-            tray: crate::tray::Tray::new().unwrap(),
-            preview: Preview::new().unwrap(),
-            held_window: None,
-            preview_latched: false,
-            selection_suspended: None,
-            selection_hint: String::new(),
-            preview_until: None,
-            preview_check: None,
-            window: null_mut(),
-            drag: None,
-            command: String::new(),
-            prompt: None,
-            hide: None,
-            reload: None,
-            snapshot: None,
-            exit: None,
-        };
-        let state = Arc::new(AtomicBool::new(false));
-        let done = Arc::new(AtomicBool::new(false));
-        let observed = state.clone();
-        let tips = Arc::new(AtomicBool::new(false));
-        let observed_tips = tips.clone();
-        let focused = Arc::new(AtomicBool::new(false));
-        let observed_focus = focused.clone();
-        let finished = done.clone();
-        let physical_alt = input::tests::physical_alt_sender();
-        let controller = std::thread::spawn(move || {
-            let key = |vk, down| {
-                key(vk, down);
-                if matches!(vk, VK_LMENU | VK_RMENU) {
-                    physical_alt(vk, down);
+        let result = std::panic::catch_unwind(|| {
+            let until = Instant::now() + Duration::from_secs(5);
+            let target = loop {
+                let hwnd = unsafe { FindWindowW(null(), wide(TARGET).as_ptr()) };
+                if !hwnd.is_null() {
+                    break hwnd;
+                }
+                assert!(Instant::now() < until);
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            unsafe {
+                SetForegroundWindow(target);
+            }
+            let mut app = test_app();
+            let _hooks = input::Hooks::start(&app.cfg).unwrap();
+            let drain = |app: &mut App| {
+                while let Some(event) = input::next_event() {
+                    app.handle_event(event).unwrap();
                 }
             };
-            let result = (|| {
-                let until = Instant::now() + Duration::from_secs(5);
-                let target = loop {
-                    let hwnd = unsafe { FindWindowW(w!("STATIC"), wide(TARGET).as_ptr()) };
-                    if !hwnd.is_null() {
-                        break hwnd;
-                    }
-                    if Instant::now() > until {
-                        return Err("Target window missing".into());
-                    }
-                    std::thread::sleep(Duration::from_millis(20));
-                };
+            for double in [false, true] {
                 unsafe {
-                    // Tests share a desktop with the terminal. Attach only for this explicit
-                    // activation so foreground-lock policy does not invalidate the hook test.
-                    let current = GetCurrentThreadId();
-                    let foreground = GetWindowThreadProcessId(GetForegroundWindow(), null_mut());
-                    let target_thread = GetWindowThreadProcessId(target, null_mut());
-                    windows_sys::Win32::System::Threading::AttachThreadInput(
-                        current, foreground, 1,
-                    );
-                    windows_sys::Win32::System::Threading::AttachThreadInput(
-                        current,
-                        target_thread,
-                        1,
-                    );
                     SetForegroundWindow(target);
-                    windows_sys::Win32::System::Threading::AttachThreadInput(
-                        current,
-                        target_thread,
-                        0,
-                    );
-                    windows_sys::Win32::System::Threading::AttachThreadInput(
-                        current, foreground, 0,
-                    );
-                    SetCursorPos(600, 400);
                 }
-                std::thread::sleep(Duration::from_millis(100));
-                if unsafe { GetForegroundWindow() } != target {
-                    unsafe {
-                        let mut rect = RECT::default();
-                        GetWindowRect(target, &mut rect);
-                        SetWindowPos(target, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-                        SetCursorPos(rect.left + 100, rect.top + 12);
-                        let down = INPUT {
-                            r#type: INPUT_MOUSE,
-                            Anonymous: INPUT_0 {
-                                mi: MOUSEINPUT {
-                                    dwFlags: MOUSEEVENTF_LEFTDOWN,
-                                    ..Default::default()
-                                },
-                            },
-                        };
-                        let up = INPUT {
-                            r#type: INPUT_MOUSE,
-                            Anonymous: INPUT_0 {
-                                mi: MOUSEINPUT {
-                                    dwFlags: MOUSEEVENTF_LEFTUP,
-                                    ..Default::default()
-                                },
-                            },
-                        };
-                        SendInput(2, [down, up].as_ptr(), size_of::<INPUT>() as i32);
-                        SetWindowPos(target, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-                        SetCursorPos(600, 400);
-                    }
-                    std::thread::sleep(Duration::from_millis(150));
-                    if unsafe { GetForegroundWindow() } != target {
-                        return Err(format!(
-                            "Cannot focus test target {target:?}; foreground={:?}",
-                            unsafe { GetForegroundWindow() }
-                        ));
-                    }
-                }
-                for vk in [VK_LMENU, VK_RMENU] {
-                    for down in [true, false, true, false] {
-                        self::key(vk, down);
-                        std::thread::sleep(Duration::from_millis(30));
-                    }
-                    std::thread::sleep(Duration::from_millis(150));
-                    if observed.load(Ordering::SeqCst) || observed_tips.load(Ordering::SeqCst) {
-                        return Err("Injected Alt opened a preview or tip".into());
-                    }
-                }
-                println!("injected Alt did not open a preview or tip");
-                let started = Instant::now();
-                key(VK_LMENU, true);
-                visible(&observed, true)?;
-                println!(
-                    "held Alt first_preview_ms={}",
-                    started.elapsed().as_millis()
-                );
+                input::tests::activate_session(double);
+                drain(&mut app);
+                assert!(app.preview.visible() && app.held_window == Some(target));
                 assert!(
-                    (Duration::from_millis(180)..Duration::from_millis(450))
-                        .contains(&started.elapsed()),
-                    "Alt preview did not respect the configured hold delay"
+                    app.preview_until
+                        .unwrap()
+                        .saturating_duration_since(Instant::now())
+                        > Duration::from_secs(9)
                 );
-                key(VK_LMENU, false);
-                visible(&observed, false)?;
-                visible(&observed_tips, false)?;
-                println!("held Alt preview appeared and released cleanly");
-                std::thread::sleep(Duration::from_millis(650));
-                let started = Instant::now();
-                key(VK_LMENU, true);
-                visible(&observed, true)?;
-                visible(&observed, false)?;
-                visible(&observed_tips, false)?;
-                // 200 ms hold + 900 ms tip, plus scheduling and the 20 ms polling above.
-                assert!(
-                    started.elapsed() < Duration::from_millis(1500),
-                    "Held preview outlived the tip: {:?}",
-                    started.elapsed()
-                );
-                key(VK_LMENU, false);
-                println!("held Alt preview and tip expired together");
-                std::thread::sleep(Duration::from_millis(650));
-                key(VK_LMENU, true);
-                std::thread::sleep(Duration::from_millis(30));
-                key(VK_LMENU, false);
-                std::thread::sleep(Duration::from_millis(50));
-                key(VK_LMENU, true);
-                std::thread::sleep(Duration::from_millis(30));
-                let started = Instant::now();
-                key(VK_LMENU, false);
-                visible(&observed, true)?;
-                println!(
-                    "double Alt first_preview_ms={}",
-                    started.elapsed().as_millis()
-                );
-                assert!(
-                    started.elapsed() < Duration::from_millis(450),
-                    "Double Alt preview was delayed"
-                );
-                visible(&observed, false)?;
-                visible(&observed_tips, false)?;
-                assert!(
-                    started.elapsed() < Duration::from_millis(1200),
-                    "Double Alt preview outlived the tip"
-                );
-                println!("double Alt preview appeared and expired without Escape");
-                std::thread::sleep(Duration::from_millis(650));
-                key(VK_LMENU, true);
-                visible(&observed, true)?;
-                key(VK_ESCAPE, true);
-                key(VK_ESCAPE, false);
-                visible(&observed, false)?;
-                key(VK_LMENU, false);
-                println!("Escape canceled held preview");
-                std::thread::sleep(Duration::from_millis(650));
-                key(VK_LMENU, true);
-                visible(&observed, true)?;
-                key(b'H' as u16, true);
-                key(b'H' as u16, false);
-                key(VK_LMENU, false);
-                visible(&observed, false)?;
-                visible(&observed_tips, true)?;
-                std::thread::sleep(Duration::from_millis(1100));
-                if !observed_tips.load(Ordering::SeqCst) {
-                    return Err("Releasing Alt or the default timer dismissed Help".into());
-                }
-                key(VK_ESCAPE, true);
-                key(VK_ESCAPE, false);
-                visible(&observed_tips, false)?;
-                println!("Help stays visible after Alt release until Escape");
-                std::thread::sleep(Duration::from_millis(650));
-                key(VK_LMENU, true);
-                visible(&observed, true)?;
-                let mouse = |flags| unsafe {
-                    let event = INPUT {
-                        r#type: INPUT_MOUSE,
-                        Anonymous: INPUT_0 {
-                            mi: MOUSEINPUT {
-                                dwFlags: flags,
-                                ..Default::default()
-                            },
-                        },
-                    };
-                    SendInput(1, &event, size_of::<INPUT>() as i32);
+                // Both activation methods accept top-row keyboard bindings after Alt release.
+                input::tests::session_key(0x31);
+                drain(&mut app);
+                assert!(!app.preview.visible());
+                let point = desktop::cursor().unwrap();
+                let work = desktop::screen(point, 0).unwrap().work;
+                let actual = desktop::bounds(target).unwrap().1;
+                let expected = app.cfg.presets["1/4"]
+                    .resolve(work, actual, desktop::desktop())
+                    .unwrap();
+                assert_eq!(actual, expected);
+                input::tests::activate_session(double);
+                drain(&mut app);
+                let a = POINT {
+                    x: work.x + work.width / 4,
+                    y: work.y + work.height / 4,
                 };
-                mouse(MOUSEEVENTF_RIGHTDOWN);
-                visible(&observed_tips, false)?;
-                let area = desktop::screen(desktop::cursor()?, 0)?.full;
-                for cell in [1, 9] {
-                    let started = Instant::now();
-                    // SetCursorPos deliberately exercises the polling path even when no
-                    // low-level mouse notification reaches the preview.
-                    unsafe {
-                        SetCursorPos(
-                            area.x + area.width * if cell == 1 { 1 } else { 5 } / 6,
-                            area.y + area.height * if cell == 1 { 1 } else { 5 } / 6,
-                        );
+                let b = POINT {
+                    x: work.x + work.width * 3 / 4,
+                    y: work.y + work.height / 4,
+                };
+                input::tests::session_click(a, false);
+                drain(&mut app);
+                input::tests::session_click(b, false);
+                drain(&mut app);
+                assert_eq!(app.preview.count(), 2);
+                input::tests::session_key(13);
+                drain(&mut app);
+                assert_eq!(
+                    desktop::bounds(target).unwrap().1,
+                    crate::layout::Rect {
+                        x: work.x,
+                        y: work.y,
+                        width: work.width,
+                        height: (work.height as f64 / 2.0).round() as i32
                     }
-                    visible(&observed_focus, false)?;
-                    while !observed_focus.load(Ordering::SeqCst)
-                        && started.elapsed() < Duration::from_secs(5)
-                    {
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    let elapsed = started.elapsed();
-                    println!("resident grid cell={cell} dwell_ms={}", elapsed.as_millis());
-                    if elapsed < Duration::from_millis(1900)
-                        || elapsed > Duration::from_millis(2300)
-                    {
-                        return Err(format!("Resident grid dwell took {elapsed:?}"));
-                    }
-                }
-                key(VK_ESCAPE, true);
-                key(VK_ESCAPE, false);
-                mouse(MOUSEEVENTF_RIGHTUP);
-                key(VK_LMENU, false);
-                visible(&observed, false)?;
-                Ok::<_, String>(())
-            })();
-            key(VK_LMENU, false);
-            finished.store(true, Ordering::SeqCst);
-            result
-        });
-        let until = Instant::now() + Duration::from_secs(20);
-        let mut failure = None;
-        while !done.load(Ordering::SeqCst) && Instant::now() < until {
-            if let Err(err) = app.deadlines() {
-                failure = Some(err);
-                break;
-            }
-            unsafe {
-                MsgWaitForMultipleObjectsEx(
-                    0,
-                    null(),
-                    app.timeout().min(50),
-                    QS_ALLINPUT,
-                    MWMO_INPUTAVAILABLE,
                 );
-                let mut msg = MSG::default();
-                while PeekMessageW(&mut msg, null_mut(), 0, 0, PM_REMOVE) != 0 {
-                    if let Err(err) = app.event(msg) {
-                        failure = Some(err);
-                        break;
-                    }
-                }
+                input::tests::activate_session(double);
+                drain(&mut app);
+                input::tests::session_click(a, false);
+                drain(&mut app);
+                let before = desktop::bounds(target).unwrap().1;
+                input::tests::session_key(27);
+                drain(&mut app);
+                assert!(!app.preview.visible());
+                assert_eq!(desktop::bounds(target).unwrap().1, before);
             }
-            if app.held_window.is_some()
-                && app.preview_until.is_some()
-                && app.preview.visible() != app.overlay.tip_visible()
-            {
-                failure = Some("Alt preview and tip visibility differed".into());
-                break;
-            }
-            tips.store(app.overlay.tip_visible(), Ordering::SeqCst);
-            focused.store(app.preview.focused(), Ordering::SeqCst);
-            state.store(app.preview.visible(), Ordering::SeqCst);
-        }
-        let result = controller.join().unwrap();
+        });
         let _ = child.kill();
         let _ = child.wait();
-        assert!(failure.is_none(), "{failure:?}");
-        result.unwrap();
+        if let Err(error) = result {
+            std::panic::resume_unwind(error);
+        }
     }
 }

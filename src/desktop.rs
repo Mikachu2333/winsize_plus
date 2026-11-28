@@ -435,6 +435,7 @@ pub fn bounds(hwnd: HWND) -> Result<(Rect, Rect), String> {
 }
 
 pub struct Drag {
+    linked: Option<crate::neighbors::Drag>,
     hwnd: HWND,
     origin: POINT,
     frame: Rect,
@@ -468,6 +469,16 @@ fn restore(hwnd: HWND) -> Result<(), String> {
 }
 impl Drag {
     pub fn start(hwnd: HWND, origin: POINT, resize: bool, cfg: &Config) -> Result<Self, String> {
+        if let Some(linked) = crate::neighbors::Drag::start(origin, cursor()?, cfg)? {
+            return Ok(Self {
+                linked: Some(linked),
+                hwnd,
+                origin,
+                frame: Rect::default(),
+                resize,
+                minimum: (1, 1),
+            });
+        }
         if !allowed(hwnd, &cfg.exclusions) {
             return Err(cfg.tr("Window unavailable", "窗口不可操作").into());
         }
@@ -493,6 +504,7 @@ impl Drag {
                 (limits.ptMinTrackSize.y - (outer.height - frame.height)).max(1),
             );
             Ok(Self {
+                linked: None,
                 hwnd,
                 origin,
                 frame,
@@ -502,6 +514,9 @@ impl Drag {
         }
     }
     pub fn follow(&self, point: POINT) -> Result<(), String> {
+        if let Some(linked) = &self.linked {
+            return linked.follow(point);
+        }
         let wanted = drag_rect(self.frame, self.origin, point, self.resize, self.minimum);
         let (outer, frame) = bounds(self.hwnd)?;
         if wanted != frame {
@@ -509,6 +524,41 @@ impl Drag {
         }
         Ok(())
     }
+    pub fn cancel(&self) -> Result<(), String> {
+        if let Some(linked) = &self.linked {
+            linked.cancel()
+        } else {
+            Ok(())
+        }
+    }
+}
+pub(crate) fn set_frames(wanted: &[(HWND, Rect)]) -> Result<(), String> {
+    // Validate every participant before posting any move. Coordinates are converted
+    // from visible frames using each window's own invisible resize margins.
+    let positions = wanted
+        .iter()
+        .map(|&(hwnd, rect)| {
+            if unsafe { IsWindow(hwnd) } == 0 {
+                return Err("Linked window closed / 联动窗口已关闭".into());
+            }
+            let (outer, frame) = bounds(hwnd)?;
+            Ok((hwnd, frame_position(rect, outer, frame)?))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    for (hwnd, rect) in positions {
+        unsafe {
+            check(SetWindowPos(
+                hwnd,
+                null_mut(),
+                rect.x,
+                rect.y,
+                rect.width,
+                rect.height,
+                SWP_ASYNCWINDOWPOS | SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER,
+            ))?;
+        }
+    }
+    Ok(())
 }
 fn drag_rect(frame: Rect, origin: POINT, point: POINT, resize: bool, minimum: (i32, i32)) -> Rect {
     let dx = point.x.saturating_sub(origin.x);

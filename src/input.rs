@@ -81,6 +81,7 @@ struct Input {
     paused: bool,
     mode: Mode,
     native_text: bool,
+    edge_cursor: u8,
     alt_mask: u8,
     gesture_mask: u8,
     gesture_target: HWND,
@@ -951,6 +952,13 @@ unsafe extern "system" fn mouse(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
                         _ => false,
                     })
             });
+            let edge = INPUT.with(|cell| cell.try_borrow().map_or(0, |input| input.edge_cursor));
+            if wp as u32 == WM_MOUSEMOVE && edge != 0 {
+                SetCursor(LoadCursorW(
+                    null_mut(),
+                    if edge == 1 { IDC_SIZEWE } else { IDC_SIZENS },
+                ));
+            }
             if eaten {
                 return 1;
             }
@@ -1142,6 +1150,28 @@ pub fn native_text(on: bool) {
             input.last_tap = None;
         })
     });
+}
+pub fn edge_cursor(axis: Option<crate::neighbors::Axis>) {
+    thread_local! { static LAST: Cell<u8> = const {Cell::new(0)}; }
+    let value = match axis {
+        Some(crate::neighbors::Axis::X) => 1,
+        Some(crate::neighbors::Axis::Y) => 2,
+        None => 0,
+    };
+    if LAST.with(|last| last.replace(value)) == value {
+        return;
+    }
+    let _ = queue_hook(move || INPUT.with_borrow_mut(|input| input.edge_cursor = value));
+    unsafe {
+        SetCursor(LoadCursorW(
+            null_mut(),
+            match value {
+                1 => IDC_SIZEWE,
+                2 => IDC_SIZENS,
+                _ => IDC_ARROW,
+            },
+        ));
+    }
 }
 pub fn set_guides(on: bool) -> Result<(), String> {
     on_hook(move || {
@@ -1534,6 +1564,63 @@ impl Drop for Hooks {
 
 #[cfg(test)]
 pub(super) mod tests {
+    pub fn activate_session(double: bool) {
+        use super::*;
+        on_hook(move || {
+            INPUT.with_borrow_mut(|input| {
+                let now = unsafe { GetTickCount() };
+                if double {
+                    input.keyboard(LEFT, true, now.wrapping_sub(90));
+                    input.keyboard(LEFT, false, now.wrapping_sub(60));
+                    input.keyboard(LEFT, true, now.wrapping_sub(30));
+                    input.keyboard(LEFT, false, now);
+                } else {
+                    input.keyboard(LEFT, true, now.wrapping_sub(input.hold_ms));
+                    input.advance_hold(now);
+                    input.keyboard(LEFT, false, now);
+                }
+            })
+        })
+        .unwrap();
+    }
+    pub fn session_key(key: u32) {
+        use super::*;
+        on_hook(move || {
+            INPUT.with_borrow_mut(|input| {
+                let now = unsafe { GetTickCount() };
+                input.keyboard(key, true, now);
+                input.keyboard(key, false, now);
+            })
+        })
+        .unwrap();
+    }
+    pub fn session_click(point: super::POINT, right: bool) {
+        use super::*;
+        on_hook(move || {
+            for message in if right {
+                [WM_RBUTTONDOWN, WM_RBUTTONUP]
+            } else {
+                [WM_LBUTTONDOWN, WM_LBUTTONUP]
+            } {
+                let data = MSLLHOOKSTRUCT {
+                    pt: point,
+                    time: unsafe { GetTickCount() },
+                    ..Default::default()
+                };
+                assert_eq!(
+                    unsafe {
+                        mouse(
+                            HC_ACTION as i32,
+                            message as usize,
+                            (&data as *const _) as isize,
+                        )
+                    },
+                    1
+                );
+            }
+        })
+        .unwrap();
+    }
     #[test]
     fn configured_hold_delay_keeps_the_saved_value_and_handles_boundaries() {
         use super::*;
@@ -2191,28 +2278,6 @@ pub(super) mod tests {
                 if down { WM_SYSKEYDOWN } else { WM_SYSKEYUP } as usize,
                 (&event as *const _) as isize,
             )
-        }
-    }
-    /// Replay physical Alt events on the hook thread for interactive UI tests.
-    /// Those tests also use SendInput to maintain the async key state for polling.
-    pub fn physical_alt_sender() -> impl Fn(u16, bool) + Send {
-        use super::*;
-        let (commands, wake) = DRIVER.with_borrow(|driver| {
-            let driver = driver.as_ref().unwrap();
-            (driver.commands.clone(), driver.wake.clone())
-        });
-        move |key, down| {
-            assert!(matches!(u32::from(key), LEFT | RIGHT));
-            let (sent, received) = mpsc::sync_channel(1);
-            commands
-                .send(Control::Run(Box::new(move || {
-                    alt_event(u32::from(key), down, 0);
-                    sent.send(()).unwrap();
-                })))
-                .unwrap();
-            // SAFETY: this closure retains the Arc owning the worker's wake event.
-            assert_ne!(unsafe { SetEvent(wake.0 as HANDLE) }, 0);
-            received.recv_timeout(Duration::from_secs(2)).unwrap();
         }
     }
     #[test]

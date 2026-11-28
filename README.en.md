@@ -1,5 +1,7 @@
 # WinSizeP
 
+After Alt activation, drag a highlighted shared window edge to resize its neighbors together. Left or right drag works by default; elsewhere the original move/resize action applies. Adjacency tolerates gaps or overlaps up to 5 physical pixels and requires shared length greater than 1/16 of the corresponding work-area dimension. Connected seams support T-shaped and other arrangements; initial motion selects the axis at intersections. Group motion respects every participant's size limits. Esc restores the original geometry.
+
 Default regions are numbered left to right, top to bottom: `1/9`–`9/9` use Q/W/E, A/S/D, Z/X/C; `1/4`–`4/4` use top-row 1–4, independently of the numpad. Regions tile the monitor work area, and cumulative selection uses the enclosing rectangle. Unmodified legacy default layouts migrate; custom layouts remain intact.
 
 After Alt activation, press grave to open the native command editor. It supports IME input, caret editing and paste. Enter a region name, a layout such as `0|0|100sw|50sh`, or a command; Enter applies and Esc cancels. Layouts also accept `｜` and `、` separators. Invalid input remains available for correction.
