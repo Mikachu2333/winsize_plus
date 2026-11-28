@@ -2231,6 +2231,7 @@ impl Editor {
         };
         let gestures = checked("shortcuts", "mouse_enabled");
         for (section, key, active) in [
+            ("shortcuts", "linked_resize", gestures),
             ("shortcuts", "move_enabled", gestures),
             ("shortcuts", "resize_enabled", gestures),
             ("shortcuts", "center_enabled", gestures),

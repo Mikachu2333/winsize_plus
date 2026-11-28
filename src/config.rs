@@ -72,6 +72,7 @@ pub struct Config {
     pub zh: bool,
     pub alt: String,
     pub mouse_enabled: bool,
+    pub linked_resize: bool,
     pub double_ms: u32,
     pub alt_hold_ms: u32,
     pub elevate: bool,
@@ -389,6 +390,7 @@ impl Config {
     pub fn same_interaction(&self, other: &Self) -> bool {
         self.alt == other.alt
             && self.mouse_enabled == other.mouse_enabled
+            && self.linked_resize == other.linked_resize
             && self.alt_hold_ms == other.alt_hold_ms
             && self.double_ms == other.double_ms
             && self.move_button == other.move_button
@@ -967,6 +969,7 @@ impl Config {
             zh: language == "zh-CN" || (language == "auto" && system_zh()),
             alt: choice("shortcuts", "alt", &["left", "right", "both"])?,
             mouse_enabled: boolean("shortcuts", "mouse_enabled")?,
+            linked_resize: boolean("shortcuts", "linked_resize")?,
             double_ms: unsafe {
                 windows_sys::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime()
             },

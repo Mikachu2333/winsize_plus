@@ -254,6 +254,10 @@ impl Hint {
         crate::input::edge_cursor(None);
     }
     pub fn follow(&mut self, point: POINT, cfg: &Config) -> Result<(), String> {
+        if !cfg.mouse_enabled || !cfg.linked_resize {
+            self.hide();
+            return Ok(());
+        }
         if self
             .refreshed
             .is_none_or(|t| t.elapsed() >= Duration::from_millis(100))
@@ -268,7 +272,7 @@ impl Hint {
             return Ok(());
         };
         let group = connected(&self.links, seed);
-        let rectangles = group
+        let mut rectangles = group
             .iter()
             .map(|&i| {
                 let l = &self.links[i];
@@ -288,6 +292,44 @@ impl Hint {
                 }
             })
             .collect::<Vec<_>>();
+        let mut members = Vec::new();
+        for &edge in &group {
+            for index in [self.links[edge].before, self.links[edge].after] {
+                if !members.contains(&index) {
+                    members.push(index);
+                }
+            }
+        }
+        for index in members {
+            let r = self.windows[index].rect;
+            let stroke = 2;
+            rectangles.extend([
+                Rect {
+                    x: r.x,
+                    y: r.y,
+                    width: r.width,
+                    height: stroke,
+                },
+                Rect {
+                    x: r.x,
+                    y: r.y + r.height - stroke,
+                    width: r.width,
+                    height: stroke,
+                },
+                Rect {
+                    x: r.x,
+                    y: r.y,
+                    width: stroke,
+                    height: r.height,
+                },
+                Rect {
+                    x: r.x + r.width - stroke,
+                    y: r.y,
+                    width: stroke,
+                    height: r.height,
+                },
+            ]);
+        }
         self.show(&rectangles)?;
         crate::input::edge_cursor(Some(self.links[seed].axis));
         Ok(())
@@ -771,6 +813,33 @@ mod tests {
             ]);
             drag.cancel().unwrap();
             settle(&placements);
+            let mut single_cfg = crate::test_support::cfg();
+            single_cfg.linked_resize = false;
+            for resizing in [false, true] {
+                let origin = POINT {
+                    x: x + w / 2,
+                    y: y + h + h / 2,
+                };
+                let single =
+                    desktop::Drag::start(handles[1], origin, resizing, &single_cfg).unwrap();
+                single
+                    .follow(POINT {
+                        x: origin.x + 20,
+                        y: origin.y + 20,
+                    })
+                    .unwrap();
+                let mut expected = original[1];
+                if resizing {
+                    expected.width += 20;
+                    expected.height += 20;
+                } else {
+                    expected.x += 20;
+                    expected.y += 20;
+                }
+                settle(&[(handles[1], expected), (handles[2], original[2])]);
+                single.cancel().unwrap();
+                settle(&placements);
+            }
             for hwnd in handles {
                 unsafe {
                     PostMessageW(hwnd, WM_CLOSE, 0, 0);

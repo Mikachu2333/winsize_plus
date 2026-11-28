@@ -435,6 +435,7 @@ pub fn bounds(hwnd: HWND) -> Result<(Rect, Rect), String> {
 }
 
 pub struct Drag {
+    original: Option<WINDOWPLACEMENT>,
     linked: Option<crate::neighbors::Drag>,
     hwnd: HWND,
     origin: POINT,
@@ -469,8 +470,12 @@ fn restore(hwnd: HWND) -> Result<(), String> {
 }
 impl Drag {
     pub fn start(hwnd: HWND, origin: POINT, resize: bool, cfg: &Config) -> Result<Self, String> {
-        if let Some(linked) = crate::neighbors::Drag::start(origin, cursor()?, cfg)? {
+        if cfg.mouse_enabled
+            && cfg.linked_resize
+            && let Some(linked) = crate::neighbors::Drag::start(origin, cursor()?, cfg)?
+        {
             return Ok(Self {
+                original: None,
                 linked: Some(linked),
                 hwnd,
                 origin,
@@ -486,6 +491,11 @@ impl Drag {
             if IsHungAppWindow(hwnd) != 0 {
                 return Err(cfg.tr("Window unresponsive", "窗口无响应").into());
             }
+            let mut original = WINDOWPLACEMENT {
+                length: size_of::<WINDOWPLACEMENT>() as u32,
+                ..Default::default()
+            };
+            check(GetWindowPlacement(hwnd, &mut original))?;
             restore(hwnd)?;
             let (outer, frame) = bounds(hwnd)?;
             let mut limits = MINMAXINFO::default();
@@ -504,6 +514,7 @@ impl Drag {
                 (limits.ptMinTrackSize.y - (outer.height - frame.height)).max(1),
             );
             Ok(Self {
+                original: Some(original),
                 linked: None,
                 hwnd,
                 origin,
@@ -527,6 +538,8 @@ impl Drag {
     pub fn cancel(&self) -> Result<(), String> {
         if let Some(linked) = &self.linked {
             linked.cancel()
+        } else if let Some(original) = &self.original {
+            unsafe { check(SetWindowPlacement(self.hwnd, original)) }
         } else {
             Ok(())
         }

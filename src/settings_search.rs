@@ -350,6 +350,9 @@ fn aliases(_: usize, section: &str, key: &str) -> &'static [&'static str] {
         ("shortcuts", "alt") => &["快捷键Alt", "左右Alt", "激活键", "keyboard activation"],
         ("shortcuts", "mouse_enabled") => &["启用鼠标", "鼠标总开关", "鼠标操作", "mouse actions"],
         ("shortcuts", "move_enabled") => &["拖动", "拖拽", "移动窗口", "窗口移动", "move"],
+        ("shortcuts", "linked_resize") => {
+            &["联动缩放", "公共边", "相邻窗口", "共同调整", "shared edge"]
+        }
         ("shortcuts", "move_button") => &["拖动按键", "拖拽按键", "移动鼠标键"],
         ("shortcuts", "resize_enabled") => &["缩放窗口", "调整尺寸", "放大缩小", "resize"],
         ("shortcuts", "resize_button") => &["缩放按键", "调整大小按键", "缩放鼠标键"],

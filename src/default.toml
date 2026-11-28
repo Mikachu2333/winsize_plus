@@ -15,6 +15,7 @@ position = "top-left"
 [shortcuts]
 alt = "left"
 mouse_enabled = true
+linked_resize = true
 move_enabled = true
 move_button = "left"
 resize_enabled = true

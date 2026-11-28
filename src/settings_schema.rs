@@ -305,8 +305,14 @@ fn describe(section: &str, key: &str) -> (&'static str, &'static str, &'static s
         ("shortcuts", "move_enabled") => (
             "Enable window dragging",
             "启用拖动窗口",
-            "Moves the window selected when Alt was pressed.",
-            "移动按下 Alt 时选中的窗口。",
+            "Drag after activation to move the target; a shared edge takes priority when linked resizing is enabled. Esc restores the starting position.",
+            "激活后拖动目标窗口；启用联动时共边优先。Esc 恢复拖动前的位置。",
+        ),
+        ("shortcuts", "linked_resize") => (
+            "Resize adjacent windows together",
+            "联动缩放相邻窗口",
+            "Drag a highlighted shared edge with the move or resize button to resize the outlined windows together. Gaps up to 5 px are accepted. Esc restores all starting positions.",
+            "使用移动或缩放按键拖动高亮共边，联动调整轮廓标出的窗口。容忍 5 px 间隙；Esc 恢复拖动前的位置。",
         ),
         ("shortcuts", "resize_enabled") => (
             "Enable window resizing",
@@ -673,6 +679,7 @@ fn field_order(section: &str) -> &'static [&'static str] {
         "shortcuts" => &[
             "alt",
             "mouse_enabled",
+            "linked_resize",
             "move_enabled",
             "move_button",
             "resize_enabled",
