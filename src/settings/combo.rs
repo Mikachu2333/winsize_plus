@@ -190,8 +190,22 @@ fn rebuild(combo: HWND, search: &Search, indices: &[usize]) {
     {
         return;
     }
+    let mut info = COMBOBOXINFO {
+        cbSize: size_of::<COMBOBOXINFO>() as u32,
+        ..Default::default()
+    };
+    unsafe {
+        GetComboBoxInfo(combo, &mut info);
+    }
+    let list_visible = unsafe { GetWindowLongW(info.hwndList, GWL_STYLE) } as u32 & WS_VISIBLE != 0;
+    send(info.hwndList, WM_SETREDRAW, 0, 0);
     send(combo, WM_SETREDRAW, 0, 0);
     send(combo, CB_RESETCONTENT, 0, 0);
+    let bytes: usize = indices
+        .iter()
+        .map(|&i| (search.options[i].1.encode_utf16().count() + 1) * 2)
+        .sum();
+    send(combo, CB_INITSTORAGE, indices.len(), bytes as isize);
     for &original in indices {
         let index = send(
             combo,
@@ -214,6 +228,12 @@ fn rebuild(combo: HWND, search: &Search, indices: &[usize]) {
         send(combo, CB_SETITEMDATA, row as usize, -1);
     }
     send(combo, WM_SETREDRAW, 1, 0);
+    send(info.hwndList, WM_SETREDRAW, 1, 0);
+    if !list_visible {
+        unsafe {
+            ShowWindow(info.hwndList, SW_HIDE);
+        }
+    }
     SEARCHES.with_borrow_mut(|all| {
         if let Some(s) = all.get_mut(&(combo as usize)) {
             s.visible = Some(Rc::new(indices.to_vec()));
