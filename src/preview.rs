@@ -224,6 +224,8 @@ pub struct Preview {
     candidates: Vec<usize>,
     cycled: Option<usize>,
     wheel_remainder: i32,
+    defer_paint: bool,
+    paint_pending: bool,
     locked: Option<String>,
     pointer: Option<(i32, i32)>,
     display_epoch: u64,
@@ -256,6 +258,8 @@ impl Preview {
             candidates: Vec::new(),
             cycled: None,
             wheel_remainder: 0,
+            defer_paint: false,
+            paint_pending: false,
             locked: None,
             pointer: None,
             display_epoch: desktop::display_epoch(),
@@ -311,6 +315,25 @@ impl Preview {
             self.highlight(self.cycled, cfg)?;
         }
         Ok(true)
+    }
+    pub fn cycle_deferred(
+        &mut self,
+        point: POINT,
+        delta: i32,
+        cfg: &Config,
+    ) -> Result<bool, String> {
+        self.defer_paint = true;
+        let result = self.cycle(point, delta, cfg);
+        self.defer_paint = false;
+        result
+    }
+    pub fn flush_paint(&mut self, cfg: &Config) -> Result<(), String> {
+        if self.paint_pending {
+            self.paint_pending = false;
+            let selected = self.selected.take();
+            self.highlight(selected, cfg)?;
+        }
+        Ok(())
     }
     pub fn count(&self) -> usize {
         self.chosen.len()
@@ -430,6 +453,7 @@ impl Preview {
         self.cycled = None;
         self.wheel_remainder = 0;
         self.pointer = None;
+        self.paint_pending = false;
     }
     fn color(cfg: &Config) -> u32 {
         if overlay::dark() {
@@ -538,6 +562,11 @@ impl Preview {
             return Ok(());
         }
         self.selected = selected;
+        if self.defer_paint {
+            self.paint_pending = true;
+            return Ok(());
+        }
+        self.paint_pending = false;
         self.highlight.hide();
         self.candidate_outline.hide();
         for panel in &self.overlaps {

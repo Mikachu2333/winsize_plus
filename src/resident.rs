@@ -60,6 +60,7 @@ struct App {
     expired_selection: bool,
     selection_suspended: Option<Duration>,
     selection_hint: String,
+    selection_paint: Option<Instant>,
     preview_until: Option<Instant>,
     preview_check: Option<Instant>,
     window: HWND,
@@ -89,6 +90,7 @@ impl App {
         self.preview_latched = false;
         self.selection_suspended = None;
         self.selection_hint.clear();
+        self.selection_paint = None;
         self.preview.hide();
         input::track_preview(false)
     }
@@ -715,9 +717,11 @@ impl App {
                     && self.cfg.mouse_enabled
                     && self.drag.is_none()
                     && self.selection_suspended.is_none()
-                    && self
-                        .preview
-                        .cycle(input::wheel_point(), msg.wParam as i32, &self.cfg)?
+                    && self.preview.cycle_deferred(
+                        input::wheel_point(),
+                        msg.wParam as i32,
+                        &self.cfg,
+                    )?
                 {
                     self.preview_until = Some(
                         occurred
@@ -727,7 +731,7 @@ impl App {
                                 3000
                             }),
                     );
-                    self.selection_tip()?;
+                    self.selection_paint.get_or_insert_with(|| later(16));
                 }
                 Ok(())
             }
@@ -950,6 +954,9 @@ impl App {
     fn deadlines(&mut self) -> Result<(), String> {
         self.topmost.poll()?;
         let now = Instant::now();
+        if self.selection_paint.is_some_and(|when| now >= when) {
+            self.flush_selection_paint()?;
+        }
         if self.cast.deadline().is_some_and(|when| now >= when) {
             self.cast.tick(&self.cfg)?;
         }
@@ -993,6 +1000,7 @@ impl App {
             self.reload,
             self.preview_until,
             self.preview_check,
+            self.selection_paint,
         ]
         .into_iter()
         .flatten()
@@ -1000,6 +1008,13 @@ impl App {
         .map_or(INFINITE, |when| {
             when.saturating_duration_since(Instant::now()).as_millis() as u32 + 1
         })
+    }
+    fn flush_selection_paint(&mut self) -> Result<(), String> {
+        if self.selection_paint.take().is_some() {
+            self.preview.flush_paint(&self.cfg)?;
+            self.selection_tip()?;
+        }
+        Ok(())
     }
 }
 
@@ -1082,6 +1097,7 @@ pub fn run(
             expired_selection: false,
             selection_suspended: None,
             selection_hint: String::new(),
+            selection_paint: None,
             preview_until: None,
             preview_check: None,
             window: null_mut(),
@@ -1246,6 +1262,7 @@ mod tests {
             expired_selection: false,
             selection_suspended: None,
             selection_hint: String::new(),
+            selection_paint: None,
             preview_until: None,
             preview_check: None,
             window: null_mut(),
@@ -1428,6 +1445,7 @@ mod tests {
         assert_eq!(app.preview_until, Some(first + Duration::from_secs(10)));
         assert_eq!(app.preview.hovered_name(), Some("5/9"));
         assert_eq!(app.preview.count(), 0);
+        app.flush_selection_paint().unwrap();
         assert!(app.overlay.tip_text().contains("1/3"));
         let (name, rect) = app.preview.hit(point, &app.cfg).unwrap().unwrap();
         app.preview.toggle(name, rect, &app.cfg).unwrap();
@@ -1735,6 +1753,7 @@ mod tests {
             expired_selection: false,
             selection_suspended: None,
             selection_hint: String::new(),
+            selection_paint: None,
             preview_until: None,
             preview_check: None,
             window: null_mut(),
@@ -1827,6 +1846,7 @@ mod tests {
             expired_selection: false,
             selection_suspended: None,
             selection_hint: String::new(),
+            selection_paint: None,
             preview_until: None,
             preview_check: None,
             window: null_mut(),
@@ -2159,6 +2179,7 @@ mod tests {
                 drain(&mut app);
                 assert_eq!(app.preview.hovered_name(), Some("center"));
                 assert_eq!(app.preview.selection_rect(), chosen);
+                app.flush_selection_paint().unwrap();
                 assert!(app.overlay.tip_text().contains("3/3"));
                 assert_eq!(desktop::bounds(target).unwrap().1, before);
                 input::tests::session_click(center, false);
@@ -2210,5 +2231,44 @@ mod tests {
         if let Err(error) = result {
             std::panic::resume_unwind(error);
         }
+    }
+    #[test]
+    #[ignore]
+    fn wheel_backlog_cancels_without_rendering_intermediate_candidates() {
+        let _hooks = input::Hooks::escape_only().unwrap();
+        let mut app = test_app();
+        app.begin_alt_preview(unsafe { GetForegroundWindow() }, false)
+            .unwrap();
+        let area = desktop::screen(desktop::cursor().unwrap(), 0).unwrap().work;
+        let p = POINT {
+            x: area.x + area.width / 2 + 3,
+            y: area.y + area.height / 2 + 3,
+        };
+        let now = Instant::now();
+        for _ in 0..30 {
+            input::tests::enqueue_pointer_at(input::REGION_WHEEL, (-120i32) as usize, p, now);
+        }
+        input::tests::enqueue_at(input::CANCEL, now);
+        let t = Instant::now();
+        let mut count = 0;
+        while let Some(event) = input::next_event() {
+            count += 1;
+            let cancel = event.message == input::CANCEL;
+            app.handle_event(event).unwrap();
+            if cancel {
+                break;
+            }
+        }
+        println!(
+            "PERF wheel_backlog events_before_cancel={} cancel_latency_ms={:.3}",
+            count - 1,
+            t.elapsed().as_secs_f64() * 1000.0
+        );
+        assert!(app.held_window.is_none());
+        assert!(
+            t.elapsed() < Duration::from_millis(100),
+            "cancel waited for wheel repaint backlog"
+        );
+        assert!(app.selection_paint.is_none());
     }
 }
