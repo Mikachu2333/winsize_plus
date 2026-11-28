@@ -5551,7 +5551,7 @@ mod tests {
             .position(|r| r.field.section == "presets" && r.field.key == "1/9")
             .unwrap();
         let edit = editor.rows[index].c(0);
-        set_text(edit, "1.234|2.987|50.12345sw|40.999sh");
+        set_text(edit, r"1.234\2.987、50.12345sw｜40.999sh");
         editor
             .command(BASE + index as i32 * STRIDE, EN_CHANGE, edit)
             .unwrap();

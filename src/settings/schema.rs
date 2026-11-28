@@ -514,7 +514,7 @@ pub fn fields(tab: usize, axis: usize, cfg: &Config, doc: &DocumentMut) -> Vec<F
         fields.push(Field { section: String::new(), key: String::new(), label: cfg.tr("Open configuration file", "打开配置文件").into(), hint: cfg.tr("Open winsizep_config.toml in Notepad. Windows 10 and 11 system tray overflow menus are excluded by default.", "使用记事本打开 winsizep_config.toml。默认排除 Windows 10 和 11 的系统托盘弹出菜单。").into(), kind: Kind::OpenConfig });
     }
     if tab == 2 {
-        fields.push(Field { section: String::new(), key: String::new(), label: cfg.tr("Region expressions", "分区表达式").into(), hint: cfg.tr("x | y | width | height [| monitor]. sw/sh: work-area width/height; ww/wh: current window; vw/vh: virtual desktop. Units are percentages: 50sw-8 = half the work-area width minus 8 px. Monitor 0 follows the pointer; vw/vh use the virtual-desktop origin.", "x | y | 宽 | 高 [| 屏号]。sw/sh：工作区宽高；ww/wh：当前窗口宽高；vw/vh：虚拟桌面宽高。单位均为百分比，例如 50sw-8 为半屏宽减 8 像素。屏号 0 跟随鼠标；含 vw/vh 时从虚拟桌面原点计算。").into(), kind: Kind::Note });
+        fields.push(Field { section: String::new(), key: String::new(), label: cfg.tr("Region expressions", "分区表达式").into(), hint: cfg.tr("x | y | width | height [| monitor]. sw/sh: work-area width/height; ww/wh: current window; vw/vh: virtual desktop. Units are percentages: 50sw-8 = half the work-area width minus 8 px. Separators also accept 、, ｜ and \\. Monitor 0 follows the pointer; vw/vh use the virtual-desktop origin.", "x | y | 宽 | 高 [| 屏号]。sw/sh：工作区宽高；ww/wh：当前窗口宽高；vw/vh：虚拟桌面宽高。单位均为百分比，例如 50sw-8 为半屏宽减 8 像素。分隔符也接受 、｜\\。屏号 0 跟随鼠标；含 vw/vh 时从虚拟桌面原点计算。").into(), kind: Kind::Note });
     }
     if tab == 7 {
         fields.push(Field{section:String::new(),key:String::new(),label:cfg.tr("Filled mouse indicators","填色鼠标指示").into(),

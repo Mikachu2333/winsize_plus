@@ -35,7 +35,7 @@ pub fn parse(text: &str, cfg: &Config) -> Result<Command, String> {
     if cfg.presets.contains_key(&name) {
         return Ok(Command::Action(name));
     }
-    if text.contains(['|', '｜', '、']) {
+    if text.contains(['|', '｜', '、', '\\']) {
         return text.parse().map(Command::Layout).map_err(|err| {
             format!(
                 "{}: {err}",
@@ -482,7 +482,12 @@ mod tests {
         for name in ["1/4", "a\\b-c", "a|b", "区域"] {
             assert!(matches!(parse(name,&cfg).unwrap(), Command::Action(a) if a == name));
         }
-        for expression in ["0|0|100sw|50sh", "0｜0、100sw|50sh"] {
+        for expression in [
+            "0|0|100sw|50sh",
+            "0｜0、100sw|50sh",
+            r"20sw\20sh\60sw\60sh",
+            r"0\0、100sw｜50sh",
+        ] {
             assert!(matches!(
                 parse(expression, &cfg).unwrap(),
                 Command::Layout(_)

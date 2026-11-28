@@ -111,7 +111,7 @@ pub fn normalize(input: &str) -> Result<String, String> {
 impl FromStr for Layout {
     type Err = String;
     fn from_str(text: &str) -> Result<Self, String> {
-        let mut parts = text.split(['|', '｜', '、']);
+        let mut parts = text.split(['|', '｜', '、', '\\']);
         let mut next = || parts.next().ok_or_else(|| text.to_owned())?.parse::<Expr>();
         let fields = [next()?, next()?, next()?, next()?];
         let monitor = parts
@@ -218,5 +218,13 @@ mod tests {
         assert_eq!((resolved.width, resolved.height), (3333, 6667));
         assert!(normalize("name 1/4").is_err());
         assert_eq!(normalize("0|0|100|100").unwrap(), "0|0|100|100");
+        for separator in ['|', '｜', '、', '\\'] {
+            let input = ["20sw", "20sh", "60sw", "60sh", "2"].join(&separator.to_string());
+            assert_eq!(normalize(&input).unwrap(), "20sw|20sh|60sw|60sh|2");
+        }
+        assert_eq!(
+            normalize(r"20sw\20sh、60sw｜60sh").unwrap(),
+            "20sw|20sh|60sw|60sh"
+        );
     }
 }
