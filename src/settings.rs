@@ -1407,7 +1407,7 @@ impl Editor {
                     let related_label = if row.field.section == "presets" {
                         self.cfg.tr("Find shortcuts", "查看快捷键")
                     } else {
-                        self.cfg.tr("Edit region", "编辑分区")
+                        self.cfg.tr("View region", "查看分区")
                     };
                     self.control(
                         &mut row,
@@ -1444,7 +1444,11 @@ impl Editor {
                             0,
                             "EDIT",
                             &text,
-                            WS_BORDER | WS_TABSTOP | ES_MULTILINE as u32 | ES_AUTOVSCROLL as u32,
+                            WS_BORDER
+                                | WS_TABSTOP
+                                | ES_MULTILINE as u32
+                                | ES_AUTOVSCROLL as u32
+                                | ES_AUTOHSCROLL as u32,
                         )?;
                         self.control(
                             &mut row,
@@ -1461,6 +1465,14 @@ impl Editor {
                             0,
                         );
                     } else {
+                        self.control(
+                            &mut row,
+                            index,
+                            5,
+                            "BUTTON",
+                            self.cfg.tr("Preview this region", "预览此分区"),
+                            BS_PUSHBUTTON as u32 | WS_TABSTOP,
+                        )?;
                         row.options = schema::actions(&self.cfg, false);
                         self.control(
                             &mut row,
@@ -1754,50 +1766,49 @@ impl Editor {
                 }
                 Kind::Mapping => {
                     let preset = row.field.section == "presets";
-                    let input_width = name_width;
-                    place(row.c(3), padding, y - self.scroll[1], input_width, h);
-                    if preset {
-                        let delete_x = if input_width + gap + button_width <= width {
-                            padding + input_width + gap
-                        } else {
-                            y += h + gap;
-                            padding
-                        };
-                        place(row.c(4), delete_x, y - self.scroll[1], button_width, h);
-                        y += h + gap;
-                        place(row.c(0), padding, y - self.scroll[1], expression_width, h);
-                        y += h + gap;
-                        place(row.c(5), padding, y - self.scroll[1], width, h);
-                        y += h;
-                    } else {
-                        let fits = input_width + combo_width + button_width + gap * 2 <= width;
-                        let x = if fits {
-                            padding + input_width + gap
-                        } else {
-                            padding
-                        };
-                        if !fits {
-                            y += h + gap;
-                        }
-                        place(row.c(0), x, y - self.scroll[1], combo_width, h * 10);
+                    let row_gap = self.s(10).min((width - 3).max(0) / 4);
+                    let delete_width = button_width.min((width / 4).max(1));
+                    let fields_width = (width - delete_width - 2 * row_gap).max(2);
+                    let key_width = name_width.min((fields_width / 3).max(1));
+                    let value_width = (fields_width - key_width).max(1);
+                    let top = y - self.scroll[1];
+                    place(row.c(3), padding, top, key_width, h);
+                    place(
+                        row.c(0),
+                        padding + key_width + row_gap,
+                        top,
+                        value_width,
+                        if preset { h } else { h * 10 },
+                    );
+                    place(
+                        row.c(4),
+                        padding + width - delete_width,
+                        top,
+                        delete_width,
+                        h,
+                    );
+                    if !preset {
                         send(
                             row.c(0),
                             CB_SETITEMHEIGHT,
                             usize::MAX,
                             (h - self.s(4)) as isize,
                         );
-                        send(row.c(0), CB_SETDROPPEDWIDTH, combo_width as usize, 0);
-                        let delete_x = if x - padding + combo_width + gap + button_width <= width {
-                            x + combo_width + gap
-                        } else {
-                            y += h + gap;
-                            padding
-                        };
-                        place(row.c(4), delete_x, y - self.scroll[1], button_width, h);
-                        y += h;
+                        send(row.c(0), CB_SETDROPPEDWIDTH, value_width as usize, 0);
                     }
-                    y += gap;
-                    place(row.c(6), padding, y - self.scroll[1], width, h);
+                    y += h + gap;
+                    let related_width = (text_width(&caption(row.c(6)), &self.font) + self.s(24))
+                        .min((width - row_gap).max(2) / 2);
+                    let preview_width = (text_width(&caption(row.c(5)), &self.font) + self.s(30))
+                        .min((width - related_width - row_gap).max(1));
+                    place(row.c(5), padding, y - self.scroll[1], preview_width, h);
+                    place(
+                        row.c(6),
+                        padding + width - related_width,
+                        y - self.scroll[1],
+                        related_width,
+                        h,
+                    );
                     y += h;
                     if !row.c(7).is_null() {
                         y += gap;
@@ -2392,6 +2403,18 @@ impl Editor {
                 }
             }
         }
+        for row in &self.rows {
+            if matches!(row.field.kind, Kind::Mapping) && row.field.section != "presets" {
+                let region = self
+                    .cfg
+                    .presets
+                    .contains_key(&config::command_name(&Self::selected_value(row, 0)));
+                unsafe {
+                    EnableWindow(row.c(5), i32::from(region));
+                    EnableWindow(row.c(6), i32::from(region));
+                }
+            }
+        }
     }
     fn update_values(&self) {
         for row in &self.rows {
@@ -2565,7 +2588,7 @@ impl Editor {
             )?;
         } else if self.live {
             match self.tab {
-                2 => {
+                2 | 4 => {
                     if let Some(name) = &self.selected {
                         self.preview.select(self.window.0, name, &self.cfg)?;
                     }
@@ -2939,7 +2962,16 @@ impl Editor {
                 return Ok(());
             }
             Kind::Mapping if slot == 5 && event == BN_CLICKED => {
-                self.selected = Some(row.field.key.clone());
+                let name = if row.field.section == "presets" {
+                    row.field.key.clone()
+                } else {
+                    Self::selected_value(row, 0)
+                };
+                if !self.cfg.presets.contains_key(&config::command_name(&name)) {
+                    return Ok(());
+                }
+                self.selected = Some(name);
+                self.live = true;
                 for row in &self.rows {
                     if !row.c(5).is_null() && row.field.section == "presets" {
                         send(
@@ -2948,6 +2980,9 @@ impl Editor {
                             usize::from(self.selected.as_ref() == Some(&row.field.key)),
                             0,
                         );
+                    }
+                    if matches!(row.field.kind, Kind::Preview) {
+                        send(row.c(0), BM_SETCHECK, 1, 0);
                     }
                 }
                 return self.render();
@@ -5234,6 +5269,69 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "checks real region and shortcut control geometry at narrow and wide widths"]
+    fn mapping_inputs_and_actions_share_rows_with_right_aligned_delete() {
+        let _hooks = input::Hooks::escape_only().unwrap();
+        for tab in [2, 4] {
+            let mut editor = test_editor(tab, &format!("mapping-rows-{tab}"));
+            for (dpi, width) in [(96, 640), (96, 980), (144, 1100), (192, 1280)] {
+                editor.dpi = dpi;
+                unsafe {
+                    SetWindowPos(
+                        editor.window.0,
+                        null_mut(),
+                        100,
+                        100,
+                        width,
+                        760,
+                        SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+                }
+                editor.layout().unwrap();
+                let geometry = |hwnd| {
+                    let mut r = RECT::default();
+                    unsafe {
+                        GetWindowRect(hwnd, &mut r);
+                        MapWindowPoints(
+                            null_mut(),
+                            editor.panes[1],
+                            (&mut r as *mut RECT).cast(),
+                            2,
+                        );
+                    }
+                    r
+                };
+                let mut pane = RECT::default();
+                unsafe {
+                    GetClientRect(editor.panes[1], &mut pane);
+                }
+                for row in editor
+                    .rows
+                    .iter()
+                    .filter(|r| matches!(r.field.kind, Kind::Mapping))
+                {
+                    let name = geometry(row.c(3));
+                    let value = geometry(row.c(0));
+                    let delete = geometry(row.c(4));
+                    assert_eq!(name.top, value.top);
+                    assert_eq!(value.top, delete.top);
+                    assert!(
+                        name.right < value.left && value.right < delete.left,
+                        "inputs overlap at dpi={dpi}, width={width}"
+                    );
+                    assert_eq!(delete.right, pane.right - editor.s(16));
+                    let preview = geometry(row.c(5));
+                    let related = geometry(row.c(6));
+                    assert_eq!(preview.top, related.top);
+                    assert!(preview.right < related.left);
+                    assert_eq!(related.right, delete.right);
+                    assert!(caption(row.c(12)).is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
     #[ignore = "saves an isolated region expression and checks two-place rounding in both editor and config"]
     fn region_expression_saves_at_two_decimal_places() {
         let mut editor = test_editor(2, "region-precision-test");
@@ -5343,6 +5441,14 @@ mod tests {
             .iter()
             .position(|r| r.field.section == "presets" && r.field.key == "1/4")
             .unwrap();
+        let preview = editor.rows[index].c(5);
+        editor
+            .command(BASE + index as i32 * STRIDE + 5, BN_CLICKED, preview)
+            .unwrap();
+        assert!(editor.preview.visible());
+        editor.escape().unwrap();
+        editor.render().unwrap();
+        assert!(!editor.preview.visible());
         let button = editor.rows[index].c(6);
         editor
             .command(BASE + index as i32 * STRIDE + 6, BN_CLICKED, button)
@@ -5353,6 +5459,15 @@ mod tests {
             .iter()
             .position(|r| r.field.section == "keys" && r.field.key == "1")
             .unwrap();
+        let preview = editor.rows[index].c(5);
+        editor
+            .command(BASE + index as i32 * STRIDE + 5, BN_CLICKED, preview)
+            .unwrap();
+        assert!(editor.preview.visible());
+        assert_eq!(editor.selected.as_deref(), Some("1/4"));
+        editor.escape().unwrap();
+        editor.render().unwrap();
+        assert!(!editor.preview.visible());
         let button = editor.rows[index].c(6);
         editor
             .command(BASE + index as i32 * STRIDE + 6, BN_CLICKED, button)
@@ -6165,11 +6280,22 @@ mod tests {
                         return Err(status);
                     }
                     let pane = unsafe { GetDlgItem(hwnd, 2) };
+                    let fields =
+                        schema::fields(tab as usize, 0, &Config::parse(&doc).unwrap(), &doc);
                     let mut child = unsafe { GetWindow(pane, GW_CHILD) };
                     while !child.is_null() {
+                        let id = unsafe { GetDlgCtrlID(child) };
+                        let region_action = id >= BASE
+                            && matches!((id - BASE) % STRIDE, 5 | 6)
+                            && fields
+                                .get(((id - BASE) / STRIDE) as usize)
+                                .is_some_and(|f| {
+                                    matches!(f.kind, Kind::Mapping) && f.section != "presets"
+                                });
                         if unsafe { IsWindowVisible(child) } != 0
                             && unsafe { IsWindowEnabled(child) } == 0
-                            && !matches!(unsafe { GetDlgCtrlID(child) }, AXIS_H | AXIS_V)
+                            && !matches!(id, AXIS_H | AXIS_V)
+                            && !region_action
                         {
                             return Err(format!(
                                 "Tab {tab} contains a permanently disabled control"
@@ -6177,11 +6303,7 @@ mod tests {
                         }
                         child = unsafe { GetWindow(child, GW_HWNDNEXT) };
                     }
-                    for (index, field) in
-                        schema::fields(tab as usize, 0, &Config::parse(&doc).unwrap(), &doc)
-                            .iter()
-                            .enumerate()
-                    {
+                    for (index, field) in fields.iter().enumerate() {
                         if let Kind::Color(format) = field.kind {
                             let alpha =
                                 unsafe { GetDlgItem(pane, BASE + index as i32 * STRIDE + 6) };
@@ -6200,7 +6322,7 @@ mod tests {
                         }
                     }
                     snapshot(hwnd, &output.join(format!("tab-{tab}.bmp")));
-                    if tab == 1 {
+                    if tab == 0 {
                         let pane = unsafe { GetDlgItem(hwnd, 2) };
                         unsafe {
                             PostMessageW(hwnd, SCROLL, 900, pane as isize);
