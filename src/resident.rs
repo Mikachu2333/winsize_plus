@@ -48,6 +48,8 @@ struct App {
     keycast: bool,
     cfg: Config,
     path: PathBuf,
+    // Command controls borrow the tip HWND, so release them before the overlay.
+    prompt: Option<crate::command_prompt::Prompt>,
     overlay: Overlay,
     tray: crate::tray::Tray,
     frames: FrameClock,
@@ -63,7 +65,6 @@ struct App {
     window: HWND,
     drag: Option<desktop::Drag>,
     command: String,
-    prompt: Option<crate::command_prompt::Prompt>,
     hide: Option<Instant>,
     reload: Option<Instant>,
     snapshot: Option<Vec<u8>>,
@@ -233,6 +234,7 @@ impl App {
         Ok(())
     }
     fn notice(&mut self, text: &str) -> Result<(), String> {
+        self.close_prompt_without_focus();
         self.overlay.tip(text, &self.cfg)?;
         self.hide = (!self.overlay.tip_scrollable()).then(|| later(self.cfg.duration));
         Ok(())
@@ -433,18 +435,22 @@ impl App {
                 self.overlay.tip(&self.cfg.help_text(), &self.cfg)
             }
             "command" => {
+                self.close_prompt_without_focus();
                 self.command.clear();
                 self.hide = None;
-                self.prompt = match crate::command_prompt::Prompt::new(&self.cfg, self.window) {
-                    Ok(prompt) => {
-                        input::native_text(prompt.window);
-                        Some(prompt)
-                    }
-                    Err(error) => {
-                        input::native_text(null_mut());
-                        return Err(error);
-                    }
-                };
+                let surface = self.overlay.command_surface(&self.cfg)?;
+                self.prompt =
+                    match crate::command_prompt::Prompt::attach(surface, &self.cfg, self.window) {
+                        Ok(prompt) => {
+                            input::native_text(prompt.window);
+                            Some(prompt)
+                        }
+                        Err(error) => {
+                            self.overlay.hide_tip();
+                            input::native_text(null_mut());
+                            return Err(error);
+                        }
+                    };
                 Ok(())
             }
             "reload" => self.load(false),
@@ -575,6 +581,7 @@ impl App {
     }
     fn close_prompt_without_focus(&mut self) {
         if self.prompt.take().is_some() {
+            self.overlay.hide_tip();
             input::native_text(null_mut());
         }
     }
@@ -628,10 +635,9 @@ impl App {
         let occurred = input::take_event_time();
         if matches!(msg.message, input::COMMAND_SUBMIT | input::COMMAND_CANCEL)
             && msg.wParam != 0
-            && self
-                .prompt
-                .as_ref()
-                .is_none_or(|prompt| prompt.window as usize != msg.wParam)
+            && self.prompt.as_ref().is_none_or(|prompt| {
+                prompt.window as usize != msg.wParam || prompt.token != (msg.lParam as usize >> 1)
+            })
         {
             return Ok(());
         }
@@ -670,7 +676,7 @@ impl App {
         match msg.message {
             input::COMMAND_SUBMIT => self.submit_prompt(),
             input::COMMAND_CANCEL => {
-                if msg.lParam == 1 {
+                if msg.lParam & 1 != 0 {
                     self.close_prompt_without_focus();
                 } else {
                     self.close_prompt();
@@ -1338,6 +1344,7 @@ mod tests {
         app.window = unsafe { GetForegroundWindow() };
         app.act("command").unwrap();
         let old = app.prompt.as_ref().unwrap().window;
+        let old_token = app.prompt.as_ref().unwrap().token;
         unsafe {
             SendMessageW(old, WM_ACTIVATE, WA_INACTIVE as usize, 0);
         }
@@ -1347,6 +1354,20 @@ mod tests {
         assert!(app.prompt.is_none());
         app.act("command").unwrap();
         let current = app.prompt.as_ref().unwrap().window;
+        assert_eq!(old, current, "command input must reuse the tip HWND");
+        for message in [input::COMMAND_CANCEL, input::COMMAND_SUBMIT] {
+            app.handle_event(MSG {
+                message,
+                wParam: old as usize,
+                lParam: (old_token << 1) as isize,
+                ..Default::default()
+            })
+            .unwrap();
+            assert!(
+                app.prompt.is_some(),
+                "stale events must not affect a new command on the same tip"
+            );
+        }
         // A handle from another window must never close this prompt.
         app.handle_event(MSG {
             message: input::COMMAND_CANCEL,
@@ -1372,7 +1393,9 @@ mod tests {
         }
         app.act("pause").unwrap();
         assert!(app.prompt.is_none());
-        assert_eq!(unsafe { IsWindow(hwnd) }, 0);
+        assert_ne!(unsafe { IsWindow(hwnd) }, 0);
+        assert_eq!(unsafe { GetPropW(hwnd, w!("CommandToken")) } as usize, 0);
+        assert!(unsafe { GetDlgItem(hwnd, 1) }.is_null());
         let notice = app.overlay.tip_text().to_owned();
         app.handle_event(MSG {
             message: input::COMMAND_SUBMIT,
@@ -2018,6 +2041,7 @@ mod tests {
     #[ignore = "uses a temporary foreign window and hook callbacks to verify unified selection and application"]
     fn alt_preview_lifecycle() {
         let _dpi = crate::test_support::Dpi::new();
+        let original_cursor = desktop::cursor().unwrap();
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args(["--ignored", "--exact", "resident::tests::target_window"])
             .env("WINSIZEP_PREVIEW_TARGET", "1")
@@ -2117,9 +2141,20 @@ mod tests {
                     x: work.x + work.width / 2 + 3,
                     y: work.y + work.height / 2 + 3,
                 };
+                unsafe {
+                    SetCursorPos(center.x, center.y);
+                }
+                std::thread::sleep(Duration::from_millis(40));
+                drain(&mut app);
                 input::tests::session_wheel(center, -120);
                 drain(&mut app);
-                assert_eq!(app.preview.hovered_name(), Some("4/4"));
+                assert_eq!(
+                    app.preview.hovered_name(),
+                    Some("4/4"),
+                    "double={double}, candidate={:?}, cursor={:?}",
+                    app.preview.candidate_position(),
+                    desktop::cursor().map(|p| (p.x, p.y))
+                );
                 input::tests::session_wheel(center, -120);
                 drain(&mut app);
                 assert_eq!(app.preview.hovered_name(), Some("center"));
@@ -2143,10 +2178,35 @@ mod tests {
                     .unwrap();
                 assert_eq!(desktop::bounds(target).unwrap().1, expected);
                 assert!(!app.preview.active());
+                // The same tip hosts native command entry and returns focus before
+                // applying a mixed-separator expression to the captured target.
+                input::tests::activate_session(double);
+                drain(&mut app);
+                input::tests::session_key(0xc0);
+                drain(&mut app);
+                let surface = app.prompt.as_ref().unwrap().window;
+                unsafe {
+                    let edit = GetDlgItem(surface, 1);
+                    SetWindowTextW(edit, wide(r"0\0、100sw｜50sh").as_ptr());
+                    SendMessageW(edit, WM_KEYDOWN, 13, 1);
+                }
+                drain(&mut app);
+                assert!(app.prompt.is_none());
+                assert_ne!(unsafe { IsWindow(surface) }, 0);
+                assert_eq!(
+                    desktop::bounds(target).unwrap().1,
+                    crate::layout::Rect {
+                        height: (work.height as f64 / 2.0).round() as i32,
+                        ..work
+                    }
+                );
             }
         });
         let _ = child.kill();
         let _ = child.wait();
+        unsafe {
+            SetCursorPos(original_cursor.x, original_cursor.y);
+        }
         if let Err(error) = result {
             std::panic::resume_unwind(error);
         }

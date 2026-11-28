@@ -43,6 +43,10 @@ pub const COMMAND_SUBMIT: u32 = WM_APP + 20;
 pub const COMMAND_CANCEL: u32 = WM_APP + 21;
 pub const REGION_WHEEL: u32 = WM_APP + 22;
 pub fn prompt_event(window: HWND, submit: bool) {
+    let token = unsafe { GetPropW(window, windows_sys::core::w!("CommandToken")) } as usize;
+    if token == 0 {
+        return;
+    }
     post(
         if submit {
             COMMAND_SUBMIT
@@ -50,11 +54,14 @@ pub fn prompt_event(window: HWND, submit: bool) {
             COMMAND_CANCEL
         },
         window as usize,
-        0,
+        (token << 1) as isize,
     );
 }
 pub fn prompt_deactivated(window: HWND) {
-    post(COMMAND_CANCEL, window as usize, 1);
+    let token = unsafe { GetPropW(window, windows_sys::core::w!("CommandToken")) } as usize;
+    if token != 0 {
+        post(COMMAND_CANCEL, window as usize, ((token << 1) | 1) as isize);
+    }
 }
 thread_local! { static DISPLAY_PENDING: Cell<bool> = const { Cell::new(false) }; }
 pub fn display_changed() {

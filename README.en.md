@@ -23,7 +23,7 @@ Run `winsizep.exe`. Open Settings or pause input capture from the tray menu.
 | Middle click / F | Center / maximize |
 | P / L | Toggle always on top / crosshair |
 | M / K | Toggle mouse / keyboard annotations |
-| Grave key | Open the command editor for a region name or command |
+| Grave key | Enter a region, layout or command in the floating tip bar |
 | H | Show the current shortcut help |
 
 Use these actions after Alt activation. Customize shortcuts, mouse buttons, regions and the UI font in Settings. Dropdowns support search, and changes save automatically. See tray Help and the setting descriptions for details.

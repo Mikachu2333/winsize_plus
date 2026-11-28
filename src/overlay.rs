@@ -495,6 +495,38 @@ impl Overlay {
         let screen = desktop::screen(desktop::cursor()?, 0)?;
         self.tip_on(text, cfg, screen)
     }
+    pub(crate) fn command_surface(&mut self, cfg: &Config) -> Result<HWND, String> {
+        let screen = desktop::screen(desktop::cursor()?, 0)?;
+        self.tip_on(" ", cfg, screen.clone())?;
+        let font = Font::new(
+            &cfg.font,
+            cfg.font_size,
+            screen.dpi,
+            cfg.font_bold,
+            cfg.font_italic,
+        )?;
+        let width = scale(680, screen.dpi).min(screen.work.width);
+        let height = (font.height() * 4 + scale(42, screen.dpi)).min(screen.work.height);
+        let rect = Rect {
+            x: screen.work.x + (screen.work.width - width) / 2,
+            y: screen.work.y + screen.work.height - height - scale(6, screen.dpi),
+            width,
+            height,
+        };
+        let radius = scale(12, screen.dpi);
+        self.tip.round(width, height, radius)?;
+        self.shadow.round(width, height, radius)?;
+        self.shadow.show(Rect {
+            y: rect.y + scale(3, screen.dpi),
+            ..rect
+        });
+        self.tip.show(rect);
+        crate::input::tip_scrollable(false, 0);
+        unsafe {
+            check(SetPropW(self.tip.0, w!("CommandShadow"), self.shadow.0))?;
+        }
+        Ok(self.tip.0)
+    }
     fn tip_on(&mut self, text: &str, cfg: &Config, screen: Display) -> Result<(), String> {
         self.tip_text = text.to_owned();
         let dpi = screen.dpi;
@@ -631,6 +663,11 @@ impl Overlay {
         Ok(())
     }
     fn refresh_tip(&mut self, cfg: &Config) -> Result<(), String> {
+        // Command entry owns the same panel temporarily and handles its own DPI
+        // messages. Rebuilding the passive text buffer would disturb native input.
+        if unsafe { !GetPropW(self.tip.0, w!("PromptAppearance")).is_null() } {
+            return Ok(());
+        }
         if self.tip.1.get().is_none() {
             return Ok(());
         }
