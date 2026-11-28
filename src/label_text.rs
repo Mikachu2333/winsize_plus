@@ -75,11 +75,11 @@ struct Style {
 impl Style {
     fn new(cfg: &Config, dpi: i32) -> Self {
         Self::fonts(
-            &cfg.region_font,
-            &cfg.region_fallbacks,
-            cfg.region_font_size,
-            cfg.region_bold,
-            cfg.region_italic,
+            &cfg.font,
+            &cfg.font_fallbacks,
+            cfg.font_size,
+            cfg.font_bold,
+            cfg.font_italic,
             dpi,
         )
     }
@@ -403,7 +403,7 @@ mod tests {
     #[test]
     fn region_name_and_shortcut_lines_are_centered_together() {
         let mut cfg = crate::test_support::cfg();
-        cfg.region_font = "Arial".into();
+        cfg.font = "Arial".into();
         for dpi in [96, 144, 192] {
             let image = render(&cfg.region_caption("2/9"), 600, dpi, 0xffffff, &cfg).unwrap();
             let mut bands = Vec::new();
@@ -506,11 +506,11 @@ mod tests {
     #[test]
     fn transparent_glyphs_have_smooth_alpha_and_unclipped_overhangs() {
         let mut cfg = Config::parse(&crate::config::help().parse().unwrap()).unwrap();
-        cfg.region_font = "Arial".into();
-        cfg.region_fallbacks = vec!["Microsoft YaHei UI".into(), "Segoe UI Emoji".into()];
+        cfg.font = "Arial".into();
+        cfg.font_fallbacks = vec!["Microsoft YaHei UI".into(), "Segoe UI Emoji".into()];
         for dpi in [96, 120, 144, 192] {
             for italic in [false, true] {
-                cfg.region_italic = italic;
+                cfg.font_italic = italic;
                 let image = render(
                     "Center 中心区域 Aa 0123\n🙂 e\u{301}",
                     400,
@@ -543,17 +543,17 @@ mod tests {
             return; // These optional Windows language-pack fonts are needed for this comparison.
         }
         let mut cfg = Config::parse(&crate::config::help().parse().unwrap()).unwrap();
-        cfg.region_font = "Arial".into();
-        cfg.region_fallbacks = families.iter().map(|name| (*name).into()).collect();
+        cfg.font = "Arial".into();
+        cfg.font_fallbacks = families.iter().map(|name| (*name).into()).collect();
         let first = render("中心区域", 500, 96, 0xffffff, &cfg).unwrap();
-        cfg.region_fallbacks.reverse();
+        cfg.font_fallbacks.reverse();
         let second = render("中心区域", 500, 96, 0xffffff, &cfg).unwrap();
         assert_ne!(
             pixels(&first),
             pixels(&second),
             "Configured font order was ignored"
         );
-        cfg.region_fallbacks
+        cfg.font_fallbacks
             .insert(0, "WinSizeP nonexistent font".into());
         let missing = render("中心区域", 500, 96, 0xffffff, &cfg).unwrap();
         assert_eq!(
@@ -570,8 +570,8 @@ mod tests {
         let mut cfg = Config::parse(&crate::config::help().parse().unwrap()).unwrap();
         for dpi in [96, 120, 144, 192] {
             for (points, italic) in [(12, false), (14, false), (12, true)] {
-                cfg.region_font_size = points;
-                cfg.region_italic = italic;
+                cfg.font_size = points;
+                cfg.font_italic = italic;
                 let image = render("Center 中心区域 Aa 0123", 1000, dpi, 0, &cfg).unwrap();
                 validate(&image);
                 let mut bytes = vec![0u8; 54];

@@ -298,6 +298,7 @@ fn group_aliases(section: &str) -> &'static [&'static str] {
     match section {
         "general" => &["常规", "基础设置", "preferences"],
         "topmost_marker" => &["置顶角标", "置顶标志", "角标", "pin marker", "topmost"],
+        "ui" => &["界面字体", "UI字体", "提示字体", "分区字体", "UI font"],
         "tip" => &["提示气泡", "信息浮窗", "悬浮提示", "提示窗口", "tooltip"],
         "regions" | "presets" => &[
             "分屏",
@@ -558,8 +559,8 @@ mod tests {
             ("厚度", 3, "outline", "width"),
             ("提权", 0, "general", "elevate"),
             ("开机自启", 0, "general", "autostart"),
-            ("后备字体", 1, "tip", "font_fallbacks"),
-            ("倾斜", 1, "tip", "font_italic"),
+            ("后备字体", 0, "ui", "font_fallbacks"),
+            ("倾斜", 0, "ui", "font_italic"),
             ("配色模式", 1, "tip", "theme"),
             ("透光", 5, "horizontal", "color"),
             ("前进后退", 7, "mousecast", "swap_side_buttons"),
@@ -594,7 +595,7 @@ mod tests {
             ("左上", 0, "topmost_marker", "position"),
             ("20", 0, "topmost_marker", "size"),
             ("crshair", 5, "horizontal", "color"),
-            ("系统默认 UI 字体", 1, "tip", "font"),
+            ("系统默认 UI 字体", 0, "ui", "font"),
         ] {
             assert!(matches(&index, query, tab, section, key), "{query}");
         }
@@ -622,14 +623,14 @@ mod tests {
             "topmost_marker",
             "position"
         ));
-        assert!(!matches(&index, "A Test Font", 1, "tip", "font"));
+        assert!(!matches(&index, "A Test Font", 0, "ui", "font"));
         assert!(!matches(&index, "退出", 4, "keys", "Q"));
 
         doc["selection"]["apply_button"] = toml_edit::value("x2");
         doc["topmost_marker"]["position"] = toml_edit::value("bottom-right");
         doc["topmost_marker"]["size"] = toml_edit::value(32);
-        doc["tip"]["font"] = toml_edit::value("A Test Font");
-        doc["tip"]["font_fallbacks"] = toml_edit::value(toml_edit::Array::from_iter([
+        doc["ui"]["font"] = toml_edit::value("A Test Font");
+        doc["ui"]["font_fallbacks"] = toml_edit::value(toml_edit::Array::from_iter([
             "Another Font",
             "Fallback Font",
         ]));
@@ -647,8 +648,8 @@ mod tests {
             "position"
         ));
         assert!(matches(&index, "32", 0, "topmost_marker", "size"));
-        assert!(matches(&index, "A Test Font", 1, "tip", "font"));
-        assert!(matches(&index, "Fallback Font", 1, "tip", "font_fallbacks"));
+        assert!(matches(&index, "A Test Font", 0, "ui", "font"));
+        assert!(matches(&index, "Fallback Font", 0, "ui", "font_fallbacks"));
         assert!(matches(&index, "退出", 4, "keys", "Q"));
     }
     #[test]
@@ -667,6 +668,6 @@ mod tests {
                 .iter()
                 .any(|&i| index.entries[i].target == Target::Axis(3))
         );
-        assert!(matches(&index, "提示 字型", 1, "tip", "font"));
+        assert!(matches(&index, "提示 字型", 0, "ui", "font"));
     }
 }

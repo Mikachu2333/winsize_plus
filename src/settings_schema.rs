@@ -350,6 +350,12 @@ fn describe(section: &str, key: &str) -> (&'static str, &'static str, &'static s
             "Follows the Windows app theme unless a mode is selected.",
             "默认跟随 Windows 应用主题。",
         ),
+        ("ui", "font") => (
+            "UI font",
+            "UI 字体（界面字体）",
+            "Shared by settings, region labels, tips and command input.",
+            "统一用于设置界面、屏幕分区标签、提示框和命令输入。",
+        ),
         (_, "font") => (
             "Font family",
             "字体",
@@ -475,9 +481,9 @@ pub fn fields(tab: usize, axis: usize, cfg: &Config, doc: &DocumentMut) -> Vec<F
     });
     let mut fields = Vec::new();
     let sections: &[&str] = match tab {
-        0 => &["general", "topmost_marker"],
+        0 => &["general", "topmost_marker", "ui"],
         1 => &["tip"],
-        2 => &["regions", "presets"],
+        2 => &["presets"],
         3 => &["outline"],
         4 => &["keys", "commands"],
         5 if cfg.crosshair_unified || axis != 1 => &["crosshair", "horizontal"],
@@ -698,13 +704,8 @@ fn field_order(section: &str) -> &'static [&'static str] {
             "foreground",
             "dark_background",
             "dark_foreground",
-            "font",
-            "font_size",
-            "font_bold",
-            "font_italic",
-            "font_fallbacks",
         ],
-        "regions" => &[
+        "ui" => &[
             "font",
             "font_size",
             "font_bold",
@@ -783,7 +784,7 @@ mod tests {
             "topmost_marker",
             "shortcuts",
             "tip",
-            "regions",
+            "ui",
             "outline",
             "crosshair",
             "horizontal",

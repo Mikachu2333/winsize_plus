@@ -87,11 +87,6 @@ pub struct Config {
     pub font_fallbacks: Vec<String>,
     pub font_bold: bool,
     pub font_italic: bool,
-    pub region_font: String,
-    pub region_fallbacks: Vec<String>,
-    pub region_font_size: i32,
-    pub region_bold: bool,
-    pub region_italic: bool,
     pub time_format: String,
     pub outline: Line,
     pub outline_dark: u32,
@@ -986,16 +981,11 @@ impl Config {
                 color("tip", "dark_background")?,
                 color("tip", "dark_foreground")?,
             ],
-            font: font("tip")?,
-            font_size: number("tip", "font_size", 6, 128)? as i32,
-            font_fallbacks: fallbacks("tip")?,
-            font_bold: boolean("tip", "font_bold")?,
-            font_italic: boolean("tip", "font_italic")?,
-            region_font: font("regions")?,
-            region_fallbacks: fallbacks("regions")?,
-            region_font_size: number("regions", "font_size", 6, 128)? as i32,
-            region_bold: boolean("regions", "font_bold")?,
-            region_italic: boolean("regions", "font_italic")?,
+            font: font("ui")?,
+            font_size: number("ui", "font_size", 6, 128)? as i32,
+            font_fallbacks: fallbacks("ui")?,
+            font_bold: boolean("ui", "font_bold")?,
+            font_italic: boolean("ui", "font_italic")?,
             time_format: text("tip", "time_format")?.into(),
             outline: Line {
                 width: number("outline", "width", 1, 16)? as i32,
@@ -2696,14 +2686,14 @@ My = "Center"
     #[test]
     fn invalid_field_falls_back_without_discarding_other_edits() {
         let mut doc = help().parse::<DocumentMut>().unwrap();
-        doc["tip"]["font_size"] = value(-2);
+        doc["ui"]["font_size"] = value(-2);
         doc["general"]["autostart"] = value(true);
         doc["crosshair"]["fps"] = value(2000);
         let cfg = recover(&mut doc).unwrap();
         assert_eq!(cfg.font_size, 12);
         assert!(cfg.autostart);
         assert_eq!(cfg.fps, 1000.0);
-        assert_eq!(cfg.warnings, ["tip.font_size"]);
+        assert_eq!(cfg.warnings, ["ui.font_size"]);
         doc["crosshair"]["fps"] = value(59.94);
         assert_eq!(recover(&mut doc).unwrap().fps, 30.0);
     }

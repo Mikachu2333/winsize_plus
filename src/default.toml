@@ -7,6 +7,13 @@ preview_mode = "always"
 target_marker = true # Fixed translucent yellow 4 px frame around the captured target.
 alt_hold_ms = 1500 # Hold Alt before capturing input; 0 activates immediately.
 
+[ui]
+font = "SystemFont"
+font_fallbacks = [] # Up to three fallback fonts, in order.
+font_size = 12
+font_bold = false
+font_italic = false
+
 [topmost_marker]
 enabled = true
 size = 20
@@ -35,18 +42,6 @@ background = "#FFFFFF"
 foreground = "#242424"
 dark_background = "#292929"
 dark_foreground = "#FFFFFF"
-font = "SystemFont"
-font_fallbacks = [] # Up to three readable family names, in order.
-font_size = 12
-font_bold = false
-font_italic = false
-
-[regions]
-font = "SystemFont"
-font_fallbacks = []
-font_size = 14
-font_bold = false
-font_italic = false
 
 [outline]
 width = 2

@@ -1404,14 +1404,14 @@ mod tests {
         app.preview.toggle("1/4".into(), rect, &app.cfg).unwrap();
         app.preview_until = Some(later(3000));
         let deadline = app.preview_until;
-        doc["regions"]["font_size"] = toml_edit::value(20);
+        doc["ui"]["font_size"] = toml_edit::value(20);
         doc["outline"]["opacity"] = toml_edit::value(180);
         std::fs::write(&path, doc.to_string()).unwrap();
         app.load(true).unwrap();
         assert_eq!(app.preview.count(), 1);
         assert_eq!(app.preview.selection_rect(), Some(rect));
         assert_eq!(app.preview_until, deadline);
-        assert_eq!(app.cfg.region_font_size, 20);
+        assert_eq!(app.cfg.font_size, 20);
         doc["keys"]["Q"] = toml_edit::value("2/4");
         std::fs::write(&path, doc.to_string()).unwrap();
         app.load(true).unwrap();

@@ -398,7 +398,11 @@ fn measured(text: &str, font: &Font, width: i32) -> i32 {
     }
 }
 impl Editor {
-    fn apply_config(&mut self, cfg: Config) {
+    fn apply_config(&mut self, cfg: Config) -> Result<(), String> {
+        let font_changed = self.cfg.font != cfg.font
+            || self.cfg.font_size != cfg.font_size
+            || self.cfg.font_bold != cfg.font_bold
+            || self.cfg.font_italic != cfg.font_italic;
         if self.cfg != cfg {
             self.search.stale = true;
             if unsafe { GetFocus() } == self.search.edit && !self.search.query.is_empty() {
@@ -411,6 +415,10 @@ impl Editor {
             self.clock.reset(cfg.fps);
         }
         self.cfg = cfg;
+        if font_changed {
+            self.refresh_display()?;
+        }
+        Ok(())
     }
     fn invalidate_pages(&mut self) {
         for (_, (rows, _)) in self.pages.drain() {
@@ -2256,7 +2264,7 @@ impl Editor {
         // The edit already updated the live preview. Saving only restarts it
         // when merging concurrent file changes alters the effective settings.
         let preview_changed = cfg != self.cfg;
-        self.apply_config(cfg);
+        self.apply_config(cfg)?;
         for row in &mut self.rows {
             if matches!(row.field.kind, Kind::Mapping) {
                 let name = caption(row.c(3)).trim().to_owned();
@@ -2592,7 +2600,7 @@ impl Editor {
             .original
             .parse::<DocumentMut>()
             .map_err(|e| e.to_string())?;
-        self.apply_config(Config::parse(&self.doc)?);
+        self.apply_config(Config::parse(&self.doc)?)?;
         self.dirty.clear();
         self.pending = None;
         self.save_error.set(false);
@@ -2977,7 +2985,7 @@ impl Editor {
             self.update_enabled_controls();
             match self.collect().and_then(|draft| Config::parse(&draft)) {
                 Ok(cfg) => {
-                    self.apply_config(cfg);
+                    self.apply_config(cfg)?;
                     if self.tab != 0 && self.tab != 4 {
                         self.render()?;
                     }
@@ -2998,8 +3006,20 @@ impl Editor {
         self.dpi = unsafe { GetDpiForWindow(self.window.0) }.max(96) as i32;
         // Keep pending (even temporarily invalid) edits in their controls.
         // Old fonts remain alive until every control has its replacement.
-        let font = Font::new("SystemFont", 0, self.dpi, false, false)?;
-        let hint = Font::new("SystemFont", 9, self.dpi, false, false)?;
+        let font = Font::new(
+            &self.cfg.font,
+            self.cfg.font_size,
+            self.dpi,
+            self.cfg.font_bold,
+            self.cfg.font_italic,
+        )?;
+        let hint = Font::new(
+            &self.cfg.font,
+            (self.cfg.font_size * 3 / 4).max(6),
+            self.dpi,
+            false,
+            self.cfg.font_italic,
+        )?;
         let _old_font = std::mem::replace(&mut self.font, font);
         let _old_hint = std::mem::replace(&mut self.hint_font, hint);
         crate::settings_paint::reset_fonts();
@@ -3024,7 +3044,7 @@ impl Editor {
                     send(
                         *handle,
                         WM_SETFONT,
-                        if slot == 2 {
+                        if matches!(slot, 2 | 12) {
                             self.hint_font.0
                         } else {
                             self.font.0
@@ -3093,7 +3113,7 @@ impl Editor {
                 self.original = loaded.text;
                 self.search.stale = true;
                 self.doc = loaded.document;
-                self.apply_config(loaded.config);
+                self.apply_config(loaded.config)?;
                 self.save_error.set(false);
                 if let Some(error) = loaded.write_error {
                     self.error(&error);
@@ -4249,6 +4269,20 @@ pub fn run(path: &Path) -> Result<(), String> {
             }
             crate::settings_theme::apply(*pane);
         }
+        let ui_font = Font::new(
+            &cfg.font,
+            cfg.font_size,
+            dpi,
+            cfg.font_bold,
+            cfg.font_italic,
+        )?;
+        let ui_hint = Font::new(
+            &cfg.font,
+            (cfg.font_size * 3 / 4).max(6),
+            dpi,
+            false,
+            cfg.font_italic,
+        )?;
         let mut editor = Editor {
             search: Search::default(),
             cast: crate::cast::Visuals::new(),
@@ -4275,8 +4309,8 @@ pub fn run(path: &Path) -> Result<(), String> {
             scroll: [0; 2],
             extent: [0; 2],
             dpi,
-            font: Font::new("SystemFont", 0, dpi, false, false)?,
-            hint_font: Font::new("SystemFont", 9, dpi, false, false)?,
+            font: ui_font,
+            hint_font: ui_hint,
             families: fonts::families(),
             live: false,
             selected: None,
@@ -5199,6 +5233,54 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "updates the shared UI font and verifies controls resize without moving focus"]
+    fn shared_ui_font_updates_settings_and_survives_page_switches() {
+        let _hooks = input::Hooks::escape_only().unwrap();
+        let mut editor = test_editor(0, "shared-ui-font-test");
+        let index = editor
+            .rows
+            .iter()
+            .position(|r| r.field.section == "ui" && r.field.key == "font_size")
+            .unwrap();
+        let edit = editor.rows[index].c(0);
+        unsafe {
+            SetFocus(edit);
+        }
+        set_text(edit, "18");
+        editor
+            .command(BASE + index as i32 * STRIDE, EN_CHANGE, edit)
+            .unwrap();
+        assert_eq!(editor.cfg.font_size, 18);
+        assert_eq!(unsafe { GetFocus() }, edit);
+        assert_eq!(
+            send(edit, WM_GETFONT, 0, 0) as usize,
+            editor.font.0 as usize
+        );
+        editor.save().unwrap();
+        editor.switch_page(2, 0).unwrap();
+        assert!(!editor.rows.iter().any(|r| r.field.key.starts_with("font")));
+        let field = editor
+            .rows
+            .iter()
+            .find(|r| r.field.section == "presets")
+            .unwrap()
+            .c(0);
+        assert_eq!(
+            send(field, WM_GETFONT, 0, 0) as usize,
+            editor.font.0 as usize
+        );
+        let loaded = config::load(&editor.path, None).unwrap();
+        assert_eq!(loaded.font_size, 18);
+        for tab in [1, 2] {
+            assert!(
+                !schema::fields(tab, 0, &loaded, &editor.doc)
+                    .iter()
+                    .any(|f| f.section == "ui" || f.key.starts_with("font"))
+            );
+        }
+    }
+
+    #[test]
     #[ignore = "edits an isolated setting and verifies inline draft, error and saved feedback"]
     fn inline_edit_status_tracks_validity_and_persistence() {
         let mut editor = test_editor(5, "inline-status-test");
@@ -5976,7 +6058,7 @@ mod tests {
         let mut fallbacks = toml_edit::Array::new();
         fallbacks.push("Noto Color Emoji");
         fallbacks.push("Microsoft YaHei UI");
-        doc["tip"]["font_fallbacks"] = value(fallbacks);
+        doc["ui"]["font_fallbacks"] = value(fallbacks);
         doc["presets"]["这是一个超过八个汉字的测试分区名称"] = value("0|0|50sw|50sh");
         std::fs::write(&path, doc.to_string()).unwrap();
         assert!(
@@ -6450,10 +6532,10 @@ mod tests {
                     ));
                 }
                 unsafe {
-                    PostMessageW(hwnd, WM_COMMAND, (TAB_BASE + 1) as usize, 0);
+                    PostMessageW(hwnd, WM_COMMAND, TAB_BASE as usize, 0);
                 }
-                wait_tab(hwnd, 1)?;
-                let font_row = schema::fields(1, 0, &Config::parse(&merged).unwrap(), &merged)
+                wait_tab(hwnd, 0)?;
+                let font_row = schema::fields(0, 0, &Config::parse(&merged).unwrap(), &merged)
                     .iter()
                     .position(|field| field.key == "font")
                     .ok_or("Font field missing")?;
