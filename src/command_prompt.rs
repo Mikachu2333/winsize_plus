@@ -211,7 +211,6 @@ impl Prompt {
                 .as_ptr(),
                 WS_CHILD
                     | WS_VISIBLE
-                    | WS_VSCROLL
                     | ES_MULTILINE as u32
                     | ES_AUTOVSCROLL as u32
                     | ES_READONLY as u32,
@@ -239,6 +238,13 @@ impl Prompt {
             }
             SendMessageW(prompt.edit, EM_SETLIMITTEXT, 4096, 0);
             layout(window, &prompt.appearance.borrow());
+            sync_frame(window);
+            RedrawWindow(
+                window,
+                null(),
+                null_mut(),
+                RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN,
+            );
             ShowWindow(window, SW_SHOW);
             SetForegroundWindow(window);
             SetFocus(prompt.edit);
@@ -255,6 +261,7 @@ impl Prompt {
     pub fn error(&self, text: &str) {
         unsafe {
             SetWindowTextW(self.status, desktop::wide(text).as_ptr());
+            update_status_scrollbar(self.status);
             SetFocus(self.edit);
         }
     }
@@ -298,16 +305,44 @@ fn layout(hwnd: HWND, style: &Appearance) {
             1,
         );
         let top = padding + line * 2 + 36;
+        let status = GetDlgItem(hwnd, 2);
         MoveWindow(
-            GetDlgItem(hwnd, 2),
+            status,
             padding,
             top,
             width,
             (rect.bottom - top - padding).max(line),
             1,
         );
+        update_status_scrollbar(status);
     }
 }
+fn update_status_scrollbar(hwnd: HWND) {
+    // SAFETY: this is a live native edit on the UI thread; its font is borrowed only
+    // while measuring, and the original selection is restored before releasing the DC.
+    unsafe {
+        // Measure at full width so a previously visible bar cannot keep wrapped text
+        // overflowing after the status becomes shorter or the window becomes wider.
+        ShowScrollBar(hwnd, SB_VERT, 0);
+        let mut format = RECT::default();
+        SendMessageW(hwnd, EM_GETRECT, 0, (&mut format as *mut RECT) as isize);
+        let dc = GetDC(hwnd);
+        if dc.is_null() {
+            return;
+        }
+        let old = SelectObject(dc, SendMessageW(hwnd, WM_GETFONT, 0, 0) as HFONT);
+        let mut metrics = TEXTMETRICW::default();
+        let measured = GetTextMetricsW(dc, &mut metrics) != 0;
+        SelectObject(dc, old);
+        ReleaseDC(hwnd, dc);
+        if measured {
+            let visible_lines = ((format.bottom - format.top) / metrics.tmHeight.max(1)).max(1);
+            let lines = SendMessageW(hwnd, EM_GETLINECOUNT, 0, 0);
+            ShowScrollBar(hwnd, SB_VERT, i32::from(lines > visible_lines as isize));
+        }
+    }
+}
+
 fn sync_frame(hwnd: HWND) {
     // SAFETY: both panels belong to Overlay on this UI thread. Successful
     // SetWindowRgn calls take ownership of the region, failures release it here.
@@ -325,8 +360,8 @@ fn sync_frame(hwnd: HWND) {
             let region = CreateRoundRectRgn(
                 0,
                 0,
-                rect.right - rect.left + 1,
-                rect.bottom - rect.top + 1,
+                rect.right - rect.left,
+                rect.bottom - rect.top,
                 12 * dpi / 96,
                 12 * dpi / 96,
             );
@@ -403,9 +438,17 @@ unsafe extern "system" fn window_proc(
                         let mut rect = RECT::default();
                         GetClientRect(hwnd, &mut rect);
                         FillRect(dc, &rect, s.brush);
-                        let border = CreateSolidBrush(crate::colors::tip_border(s.background));
-                        FrameRect(dc, &rect, border);
-                        DeleteObject(border);
+                        // Use the actual clipping region so every curved edge and the
+                        // right/bottom strokes stay inside the visible window pixels.
+                        let outline = CreateRectRgn(0, 0, 0, 0);
+                        if !outline.is_null() {
+                            if GetWindowRgn(hwnd, outline) != 0 {
+                                let border = (GetDpiForWindow(hwnd).max(96) / 96) as i32;
+                                SetDCBrushColor(dc, crate::colors::tip_border(s.background));
+                                FrameRgn(dc, outline, GetStockObject(DC_BRUSH), border, border);
+                            }
+                            DeleteObject(outline);
+                        }
                     }
                     EndPaint(hwnd, &paint);
                     return 0;
@@ -506,6 +549,114 @@ unsafe extern "system" fn edit_proc(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "opens temporary command prompts to check the visible border around the entire window region"]
+    fn prompt_border_follows_all_rounded_edges_before_and_after_resize() {
+        let _dpi = crate::test_support::Dpi::new();
+        // SAFETY: each prompt and its window DC stay alive throughout the pixel checks.
+        unsafe {
+            for theme in ["light", "dark"] {
+                let mut cfg = crate::test_support::cfg();
+                cfg.theme = theme.into();
+                let mut overlay = crate::overlay::Overlay::new().unwrap();
+                let window = overlay.command_surface(&cfg).unwrap();
+                let prompt = Prompt::attach(window, &cfg, GetForegroundWindow()).unwrap();
+                for resize in [false, true] {
+                    if resize {
+                        let mut rect = RECT::default();
+                        GetWindowRect(window, &mut rect);
+                        SetWindowPos(
+                            window,
+                            null_mut(),
+                            0,
+                            0,
+                            rect.right - rect.left - 20,
+                            rect.bottom - rect.top + 20,
+                            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                        );
+                    }
+                    RedrawWindow(
+                        window,
+                        null(),
+                        null_mut(),
+                        RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW,
+                    );
+                    let region = CreateRectRgn(0, 0, 0, 0);
+                    assert_ne!(GetWindowRgn(window, region), 0);
+                    let mut bounds = RECT::default();
+                    GetRgnBox(region, &mut bounds);
+                    let dc = GetWindowDC(window);
+                    let background = prompt.appearance.borrow().background;
+                    let border = crate::colors::tip_border(background);
+                    let mut failures = Vec::new();
+                    for y in bounds.top..bounds.bottom {
+                        let left =
+                            (bounds.left..bounds.right).find(|&x| PtInRegion(region, x, y) != 0);
+                        let right =
+                            (bounds.left..bounds.right).rfind(|&x| PtInRegion(region, x, y) != 0);
+                        for x in [left, right].into_iter().flatten() {
+                            let pixel = GetPixel(dc, x, y);
+                            if pixel != border {
+                                failures.push((x, y, pixel));
+                            }
+                        }
+                    }
+                    for y in [bounds.top, bounds.bottom - 1] {
+                        let x = (bounds.left + bounds.right) / 2;
+                        let pixel = GetPixel(dc, x, y);
+                        if pixel != border {
+                            failures.push((x, y, pixel));
+                        }
+                    }
+                    let fill = GetPixel(dc, bounds.right - 6, bounds.bottom / 2);
+                    ReleaseDC(window, dc);
+                    DeleteObject(region);
+                    assert!(
+                        failures.is_empty(),
+                        "{theme}, resized={resize}: {} unpainted border pixels, first {:?}",
+                        failures.len(),
+                        failures.first()
+                    );
+                    assert_eq!(fill, background, "the right margin must be opaque");
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "opens a temporary command prompt to verify scrollbars only appear for overflowing status text"]
+    fn prompt_status_scrollbar_only_appears_for_overflow() {
+        let _dpi = crate::test_support::Dpi::new();
+        let cfg = crate::test_support::cfg();
+        let mut overlay = crate::overlay::Overlay::new().unwrap();
+        overlay.tip(&"Long tip\n".repeat(100), &cfg).unwrap();
+        let window = overlay.command_surface(&cfg).unwrap();
+        let prompt = Prompt::attach(window, &cfg, unsafe { GetForegroundWindow() }).unwrap();
+        // SAFETY: the prompt owns its child edit for all synchronous messages and queries.
+        unsafe {
+            assert_eq!(GetWindowLongW(window, GWL_STYLE) as u32 & WS_VSCROLL, 0);
+            assert_eq!(
+                GetWindowLongW(prompt.status, GWL_STYLE) as u32 & WS_VSCROLL,
+                0,
+                "the one-line usage hint must not have a scrollbar"
+            );
+            prompt.error(&"A detailed error line\r\n".repeat(100));
+            assert_ne!(
+                GetWindowLongW(prompt.status, GWL_STYLE) as u32 & WS_VSCROLL,
+                0
+            );
+            SendMessageW(prompt.status, WM_VSCROLL, SB_BOTTOM as usize, 0);
+            assert!(SendMessageW(prompt.status, EM_GETFIRSTVISIBLELINE, 0, 0) > 0);
+            prompt.error("Short error");
+            assert_eq!(
+                GetWindowLongW(prompt.status, GWL_STYLE) as u32 & WS_VSCROLL,
+                0,
+                "a short replacement error must hide the scrollbar again"
+            );
+            assert_eq!(SendMessageW(prompt.status, EM_GETFIRSTVISIBLELINE, 0, 0), 0);
+        }
+    }
+
     #[test]
     #[ignore = "opens a themed command prompt and checks target text, font, long errors and DPI changes"]
     fn prompt_displays_target_and_uses_theme_font_and_scrollable_errors() {
