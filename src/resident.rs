@@ -55,6 +55,7 @@ struct App {
     neighbors: crate::neighbors::Hint,
     held_window: Option<HWND>,
     preview_latched: bool,
+    expired_selection: bool,
     selection_suspended: Option<Duration>,
     selection_hint: String,
     preview_until: Option<Instant>,
@@ -98,6 +99,7 @@ impl App {
         self.window = window;
         self.held_window = Some(window);
         self.preview_latched = true;
+        self.expired_selection = false;
         self.refresh_preview()?;
         if self.cfg.target_marker {
             self.marker.show(window)?;
@@ -578,6 +580,32 @@ impl App {
         Ok(())
     }
     fn handle_event(&mut self, msg: MSG) -> Result<(), String> {
+        let occurred = input::take_event_time();
+        let selection_action = matches!(
+            msg.message,
+            input::CLICK
+                | input::POINTER_DOWN
+                | input::POINTER_UP
+                | input::CONFIRM
+                | input::ACTION
+                | input::DRAG_START
+                | input::CENTER
+        ) && !(msg.message == input::ACTION
+            && self
+                .cfg
+                .keys
+                .get(&(msg.wParam as u32))
+                .is_some_and(|a| matches!(a.as_str(), "mousecast" | "keycast")));
+        if selection_action
+            && self.held_window.is_some()
+            && self.preview_until.is_some_and(|end| occurred >= end)
+        {
+            self.finish_selection(self.preview.selection_rect())?;
+            self.expired_selection = true;
+        }
+        if selection_action && self.expired_selection {
+            return Ok(());
+        }
         if self.paused
             && (input::ARMED..=input::CONFIRM).contains(&msg.message)
             && msg.message != input::DISPLAY_CHANGED
@@ -732,11 +760,14 @@ impl App {
                     if msg.lParam != 0 {
                         self.preview.toggle(name, rect, &self.cfg)?;
                         self.selection_suspended = None;
-                        self.preview_until = Some(later(if self.preview.count() == 0 {
-                            10_000
-                        } else {
-                            3000
-                        }));
+                        self.preview_until = Some(
+                            occurred
+                                + Duration::from_millis(if self.preview.count() == 0 {
+                                    10_000
+                                } else {
+                                    3000
+                                }),
+                        );
                         self.selection_tip()?;
                     } else {
                         self.finish_selection(Some(rect))?;
@@ -764,12 +795,12 @@ impl App {
                 self.selection_suspended = self
                     .preview_until
                     .take()
-                    .map(|end| end.saturating_duration_since(Instant::now()));
+                    .map(|end| end.saturating_duration_since(occurred));
                 Ok(())
             }
             input::POINTER_UP => {
                 if let Some(remaining) = self.selection_suspended.take() {
-                    self.preview_until = Some(Instant::now() + remaining);
+                    self.preview_until = Some(occurred + remaining);
                 }
                 Ok(())
             }
@@ -837,8 +868,9 @@ impl App {
         if self.cast.deadline().is_some_and(|when| now >= when) {
             self.cast.tick(&self.cfg)?;
         }
-        if self.preview_until.is_some_and(|when| now >= when) {
+        if self.preview_until.is_some_and(|when| now >= when) && !input::has_pending_events() {
             self.finish_selection(self.preview.selection_rect())?;
+            self.expired_selection = true;
         }
         if self.preview_check.is_some_and(|when| now >= when) {
             if unsafe { IsWindow(self.window) } == 0
@@ -959,6 +991,7 @@ pub fn run(
             neighbors: crate::neighbors::Hint::default(),
             held_window: None,
             preview_latched: false,
+            expired_selection: false,
             selection_suspended: None,
             selection_hint: String::new(),
             preview_until: None,
@@ -1122,6 +1155,7 @@ mod tests {
             neighbors: crate::neighbors::Hint::default(),
             held_window: None,
             preview_latched: false,
+            expired_selection: false,
             selection_suspended: None,
             selection_hint: String::new(),
             preview_until: None,
@@ -1174,6 +1208,44 @@ mod tests {
         app.act("pause").unwrap();
         assert!(!app.paused);
         assert_eq!(app.overlay.tip_text(), "开始捕获");
+    }
+
+    #[test]
+    #[ignore = "opens temporary previews and replays a backlog spanning the selection deadline"]
+    fn queued_pointer_down_uses_occurrence_time_and_late_input_cannot_reopen_session() {
+        let _hooks = input::Hooks::start(&crate::test_support::cfg()).unwrap();
+        let mut app = test_app();
+        app.begin_alt_preview(unsafe { GetForegroundWindow() }, false)
+            .unwrap();
+        let now = Instant::now();
+        let deadline = now - Duration::from_millis(20);
+        app.preview_until = Some(deadline);
+        for _ in 0..70 {
+            input::tests::enqueue_at(input::TIP_SCROLL, deadline - Duration::from_millis(10));
+        }
+        input::tests::enqueue_at(input::POINTER_DOWN, deadline - Duration::from_millis(5));
+        for _ in 0..64 {
+            app.handle_event(input::next_event().unwrap()).unwrap();
+        }
+        app.deadlines().unwrap();
+        assert!(
+            app.held_window.is_some(),
+            "backlogged pointer down was overtaken by expiry"
+        );
+        while let Some(event) = input::next_event() {
+            app.handle_event(event).unwrap();
+        }
+        assert_eq!(app.selection_suspended, Some(Duration::from_millis(5)));
+        assert!(app.preview_until.is_none());
+        input::tests::enqueue_at(input::POINTER_UP, now);
+        app.handle_event(input::next_event().unwrap()).unwrap();
+        assert_eq!(app.preview_until, Some(now + Duration::from_millis(5)));
+        input::tests::enqueue_at(input::POINTER_DOWN, now + Duration::from_millis(6));
+        app.handle_event(input::next_event().unwrap()).unwrap();
+        assert!(app.held_window.is_none() && app.expired_selection);
+        input::tests::enqueue_at(input::CONFIRM, now + Duration::from_millis(7));
+        app.handle_event(input::next_event().unwrap()).unwrap();
+        assert!(app.held_window.is_none());
     }
 
     #[test]
@@ -1382,6 +1454,7 @@ mod tests {
             neighbors: crate::neighbors::Hint::default(),
             held_window: None,
             preview_latched: false,
+            expired_selection: false,
             selection_suspended: None,
             selection_hint: String::new(),
             preview_until: Some(Instant::now()),
@@ -1456,6 +1529,7 @@ mod tests {
             neighbors: crate::neighbors::Hint::default(),
             held_window: None,
             preview_latched: false,
+            expired_selection: false,
             selection_suspended: None,
             selection_hint: String::new(),
             preview_until: None,
@@ -1547,6 +1621,7 @@ mod tests {
             neighbors: crate::neighbors::Hint::default(),
             held_window: None,
             preview_latched: false,
+            expired_selection: false,
             selection_suspended: None,
             selection_hint: String::new(),
             preview_until: None,

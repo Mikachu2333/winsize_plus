@@ -12,7 +12,7 @@ use std::{
         mpsc,
     },
     thread::JoinHandle,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use windows_sys::Win32::{
     Foundation::*,
@@ -136,6 +136,8 @@ thread_local! {
     static EVENTS: RefCell<Option<EventSender>> = const { RefCell::new(None) };
     static INBOX: RefCell<Option<mpsc::Receiver<QueuedEvent>>> = const { RefCell::new(None) };
     static CURRENT: Cell<Option<(u32, POINT)>> = const { Cell::new(None) };
+    static CURRENT_TIME: Cell<Option<Instant>> = const { Cell::new(None) };
+    static HOOK_TIME: Cell<Option<Instant>> = const { Cell::new(None) };
     static DRIVER: RefCell<Option<Driver>> = const { RefCell::new(None) };
     static DEFERRED: RefCell<VecDeque<QueuedEvent>> = const {RefCell::new(VecDeque::new())};
 }
@@ -143,6 +145,7 @@ const WAKE: u32 = WM_APP + 90;
 const SCROLL_READY: u32 = WM_APP + 91;
 #[derive(Clone, Copy)]
 struct QueuedEvent {
+    at: Instant,
     message: u32,
     wp: usize,
     lp: isize,
@@ -184,6 +187,7 @@ fn receive_event() -> Option<QueuedEvent> {
             };
             if more {
                 let _ = events.send.send(QueuedEvent {
+                    at: event.at,
                     message: SCROLL_READY,
                     wp: 0,
                     lp: 0,
@@ -205,6 +209,7 @@ fn receive_event() -> Option<QueuedEvent> {
     Some(event)
 }
 fn event_message(event: QueuedEvent) -> MSG {
+    CURRENT_TIME.with(|time| time.set(Some(event.at)));
     if event.message == DISPLAY_CHANGED {
         DISPLAY_PENDING.with(|pending| pending.set(false));
     }
@@ -214,6 +219,34 @@ fn event_message(event: QueuedEvent) -> MSG {
         wParam: event.wp,
         lParam: event.lp,
         ..Default::default()
+    }
+}
+pub fn take_event_time() -> Instant {
+    CURRENT_TIME.with(Cell::take).unwrap_or_else(Instant::now)
+}
+pub fn has_pending_events() -> bool {
+    if DEFERRED.with_borrow(|events| !events.is_empty()) {
+        return true;
+    }
+    if let Some(event) = receive_event() {
+        DEFERRED.with_borrow_mut(|events| events.push_back(event));
+        return true;
+    }
+    false
+}
+struct EventTime(Option<Instant>);
+impl EventTime {
+    fn new(ticks: u32) -> Self {
+        let elapsed = unsafe { GetTickCount() }.wrapping_sub(ticks);
+        let at = Instant::now()
+            .checked_sub(Duration::from_millis(u64::from(elapsed)))
+            .unwrap_or_else(Instant::now);
+        Self(HOOK_TIME.with(|time| time.replace(Some(at))))
+    }
+}
+impl Drop for EventTime {
+    fn drop(&mut self) {
+        HOOK_TIME.with(|time| time.set(self.0));
     }
 }
 pub fn next_event() -> Option<MSG> {
@@ -323,6 +356,7 @@ fn post_event(message: u32, wp: usize, lp: isize, point: Option<POINT>) -> bool 
             return false;
         }
         let mut event = QueuedEvent {
+            at: HOOK_TIME.with(Cell::get).unwrap_or_else(Instant::now),
             message,
             wp,
             lp,
@@ -338,6 +372,7 @@ fn post_event(message: u32, wp: usize, lp: isize, point: Option<POINT>) -> bool 
             }
             pending.queued = true;
             event = QueuedEvent {
+                at: event.at,
                 message: SCROLL_READY,
                 wp: 0,
                 lp: 0,
@@ -745,6 +780,7 @@ unsafe extern "system" fn keyboard(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT
         }
         if code == HC_ACTION as i32 {
             let data = &*(lp as *const KBDLLHOOKSTRUCT);
+            let _time = EventTime::new(data.time);
             // All WinSizeP hooks must pass their own mask through without casting it,
             // treating it as an application shortcut, or recursively modifying input.
             if data.dwExtraInfo == MENU_MASK_TAG && data.flags & LLKHF_INJECTED != 0 {
@@ -832,6 +868,7 @@ unsafe extern "system" fn mouse(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
         }
         if code == HC_ACTION as i32 {
             let data = &*(lp as *const MSLLHOOKSTRUCT);
+            let _time = EventTime::new(data.time);
             INPUT.with(|cell| {
                 if let Ok(mut input) = cell.try_borrow_mut() {
                     input.last_event = data.time;
@@ -1568,6 +1605,17 @@ impl Drop for Hooks {
 
 #[cfg(test)]
 pub(super) mod tests {
+    pub fn enqueue_at(message: u32, at: super::Instant) {
+        super::DEFERRED.with_borrow_mut(|events| {
+            events.push_back(super::QueuedEvent {
+                message,
+                wp: 0,
+                lp: 0,
+                point: None,
+                at,
+            })
+        });
+    }
     pub fn activate_session(double: bool) {
         use super::*;
         on_hook(move || {
