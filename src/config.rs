@@ -350,6 +350,16 @@ fn validate_command_names(doc: &DocumentMut) -> Result<(), String> {
 }
 
 fn canonicalize(doc: &mut DocumentMut) {
+    if let Some(presets) = doc.get_mut("presets").and_then(Item::as_table_mut) {
+        for (_, item) in presets.iter_mut() {
+            if let Some(text) = item.as_str()
+                && let Ok(normalized) = crate::layout::normalize(text)
+                && normalized != text
+            {
+                assign(item, value(normalized));
+            }
+        }
+    }
     let names: HashMap<String, String> = doc
         .get("presets")
         .and_then(Item::as_table)
@@ -1213,6 +1223,7 @@ fn migrate_default_regions(doc: &mut DocumentMut) {
 }
 
 fn migrate(doc: &mut DocumentMut) -> Result<(), String> {
+    migrate_equal_thirds(doc);
     migrate_default_regions(doc);
     // Obsolete sections are ignored by the UI and retained in the user's document.
     if doc
@@ -1369,6 +1380,40 @@ fn migrate(doc: &mut DocumentMut) -> Result<(), String> {
         }
     }
     Ok(())
+}
+fn migrate_equal_thirds(doc: &mut DocumentMut) {
+    let Some(presets) = doc.get_mut("presets").and_then(Item::as_table_mut) else {
+        return;
+    };
+    let starts = ["0", "33.33333333333333", "66.66666666666667"];
+    let old: Vec<_> = (0..9)
+        .map(|cell| {
+            let x = if cell % 3 == 0 {
+                "0".into()
+            } else {
+                format!("{}sw", starts[cell % 3])
+            };
+            let y = if cell / 3 == 0 {
+                "0".into()
+            } else {
+                format!("{}sh", starts[cell / 3])
+            };
+            (
+                format!("{}/9", cell + 1),
+                format!("{x}|{y}|33.33333333333333sw|33.33333333333333sh"),
+            )
+        })
+        .collect();
+    if !old
+        .iter()
+        .all(|(name, layout)| presets.get(name).and_then(Item::as_str) == Some(layout.as_str()))
+    {
+        return;
+    }
+    let defaults: DocumentMut = help().parse().expect("valid defaults");
+    for (name, _) in old {
+        assign(&mut presets[&name], defaults["presets"][&name].clone());
+    }
 }
 
 fn recover(doc: &mut DocumentMut) -> Result<Config, String> {
@@ -1905,6 +1950,55 @@ mod tests {
                 .any(|f| matches!(f.key.as_str(), "show" | "window_format"))
         );
     }
+    #[test]
+    fn thirds_use_33_34_33_and_migrate_only_unchanged_equal_thirds() {
+        let mut doc = help().parse::<DocumentMut>().unwrap();
+        let area = crate::layout::Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        };
+        let cfg = Config::parse(&doc).unwrap();
+        for (name, expected) in [
+            ("1/9", (0, 0, 33, 33)),
+            ("2/9", (33, 0, 34, 33)),
+            ("5/9", (33, 33, 34, 34)),
+            ("9/9", (67, 67, 33, 33)),
+        ] {
+            let r = cfg.presets[name].resolve(area, area, area).unwrap();
+            assert_eq!((r.x, r.y, r.width, r.height), expected);
+        }
+        let starts = ["0", "33.33333333333333", "66.66666666666667"];
+        for cell in 0..9 {
+            let x = if cell % 3 == 0 {
+                "0".into()
+            } else {
+                format!("{}sw", starts[cell % 3])
+            };
+            let y = if cell / 3 == 0 {
+                "0".into()
+            } else {
+                format!("{}sh", starts[cell / 3])
+            };
+            doc["presets"][&format!("{}/9", cell + 1)] =
+                value(format!("{x}|{y}|33.33333333333333sw|33.33333333333333sh"));
+        }
+        let mut custom = doc.clone();
+        custom["presets"]["1/9"] = value("1|2|300|400");
+        let before = custom.to_string();
+        migrate_equal_thirds(&mut custom);
+        assert_eq!(custom.to_string(), before);
+        migrate_equal_thirds(&mut doc);
+        assert_eq!(doc["presets"]["5/9"].as_str(), Some("33sw|33sh|34sw|34sh"));
+        doc["presets"]["Custom"] = value("1.234|2.987|50.12345sw|40.999sh");
+        recover(&mut doc).unwrap();
+        assert_eq!(
+            doc["presets"]["Custom"].as_str(),
+            Some("1.23|2.99|50.12sw|41sh")
+        );
+    }
+
     #[test]
     fn default_regions_tile_odd_work_areas_and_use_only_top_row_digits() {
         let cfg = crate::test_support::cfg();

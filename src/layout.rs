@@ -1,4 +1,4 @@
-use std::str::FromStr;
+use std::{fmt, str::FromStr};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Rect {
@@ -46,6 +46,7 @@ impl FromStr for Expr {
             if !factor.is_finite() {
                 return Err(input.into());
             }
+            let factor = round_decimal(factor);
             if unit.is_some() {
                 rest = &rest[2..];
             }
@@ -57,12 +58,54 @@ impl FromStr for Expr {
         Ok(Self(terms))
     }
 }
+fn round_decimal(value: f64) -> f64 {
+    if value.abs() <= f64::MAX / 100.0 {
+        (value * 100.0).round() / 100.0
+    } else {
+        value
+    }
+}
+impl fmt::Display for Expr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, (factor, unit)) in self.0.iter().enumerate() {
+            if index > 0 && *factor >= 0.0 {
+                write!(f, "+")?;
+            }
+            let value = if *factor == 0.0 { 0.0 } else { *factor };
+            let number = format!("{value:.2}");
+            write!(
+                f,
+                "{}{}",
+                number.trim_end_matches('0').trim_end_matches('.'),
+                ["", "sw", "sh", "ww", "wh", "vw", "vh"][*unit]
+            )?;
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Layout {
     fields: [Expr; 4],
     pub monitor: u32,
     virtual_origin: bool,
+}
+impl fmt::Display for Layout {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}|{}|{}|{}",
+            self.fields[0], self.fields[1], self.fields[2], self.fields[3]
+        )?;
+        if self.monitor != 0 {
+            write!(f, "|{}", self.monitor)?;
+        }
+        Ok(())
+    }
+}
+/// Only numeric layout terms are normalized; names containing digits are untouched.
+pub fn normalize(input: &str) -> Result<String, String> {
+    input.parse::<Layout>().map(|layout| layout.to_string())
 }
 
 impl FromStr for Layout {
@@ -88,6 +131,33 @@ impl FromStr for Layout {
             monitor,
             virtual_origin,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn numeric_terms_round_to_two_places_for_storage_and_resolution() {
+        assert_eq!(
+            normalize("1.234｜-2.345、33.33333sw+0.126|66.66666sh|2").unwrap(),
+            "1.23|-2.35|33.33sw+0.13|66.67sh|2"
+        );
+        assert_eq!(
+            normalize("0|0|100.00sw|50.5sh").unwrap(),
+            "0|0|100sw|50.5sh"
+        );
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 10000,
+            height: 10000,
+        };
+        let layout: Layout = "0|0|33.33333333sw|66.66666667sh".parse().unwrap();
+        let resolved = layout.resolve(area, area, area).unwrap();
+        assert_eq!((resolved.width, resolved.height), (3333, 6667));
+        assert!(normalize("name 1/4").is_err());
+        assert_eq!(normalize("0|0|100|100").unwrap(), "0|0|100|100");
     }
 }
 

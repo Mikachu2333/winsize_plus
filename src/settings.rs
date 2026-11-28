@@ -2166,7 +2166,8 @@ impl Editor {
                             .into());
                     }
                     let text = if section == "presets" {
-                        caption(row.c(0))
+                        crate::layout::normalize(&caption(row.c(0)))
+                            .map_err(|error| format!("presets.{name}: {error}"))?
                     } else {
                         Self::selected_value(row, 0)
                     };
@@ -5230,6 +5231,32 @@ mod tests {
             ReleaseDC(hwnd, dc);
             pixels
         }
+    }
+
+    #[test]
+    #[ignore = "saves an isolated region expression and checks two-place rounding in both editor and config"]
+    fn region_expression_saves_at_two_decimal_places() {
+        let mut editor = test_editor(2, "region-precision-test");
+        let index = editor
+            .rows
+            .iter()
+            .position(|r| r.field.section == "presets" && r.field.key == "1/9")
+            .unwrap();
+        let edit = editor.rows[index].c(0);
+        set_text(edit, "1.234|2.987|50.12345sw|40.999sh");
+        editor
+            .command(BASE + index as i32 * STRIDE, EN_CHANGE, edit)
+            .unwrap();
+        editor.save().unwrap();
+        assert_eq!(caption(edit), "1.23|2.99|50.12sw|41sh");
+        let saved = config::read_settings(&editor.path)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(
+            saved["presets"]["1/9"].as_str(),
+            Some("1.23|2.99|50.12sw|41sh")
+        );
     }
 
     #[test]
