@@ -6,9 +6,9 @@ pub const TABS: [(&str, &str); 9] = [
     ("Tips", "提示框"),
     ("Screen regions", "屏幕分区"),
     ("Region outlines", "标识框线"),
-    ("Quick actions", "快捷操作"),
+    ("Shortcuts and commands", "快捷键与命令"),
     ("Crosshair", "十字线"),
-    ("Region selection", "分区选择"),
+    ("Window actions", "窗口操作"),
     ("Mouse annotations", "鼠标标注"),
     ("Keyboard annotations", "键盘标注"),
 ];
@@ -479,12 +479,12 @@ pub fn fields(tab: usize, axis: usize, cfg: &Config, doc: &DocumentMut) -> Vec<F
         1 => &["tip"],
         2 => &["regions", "presets"],
         3 => &["outline"],
-        4 => &["shortcuts", "general", "keys", "commands"],
+        4 => &["keys", "commands"],
         5 if cfg.crosshair_unified || axis != 1 => &["crosshair", "horizontal"],
         5 => &["crosshair", "vertical"],
         7 => &["mousecast"],
         8 => &["keycast"],
-        _ => &["selection"],
+        _ => &["general", "shortcuts", "selection"],
     };
     if matches!(tab, 2 | 3 | 5 | 6 | 7 | 8) {
         fields.push(Field {
@@ -536,7 +536,7 @@ pub fn fields(tab: usize, axis: usize, cfg: &Config, doc: &DocumentMut) -> Vec<F
             }
             if *section == "general" {
                 let activation = matches!(key, "alt_hold_ms" | "preview_mode" | "target_marker");
-                if activation != (tab == 4) {
+                if activation != (tab == 6) {
                     continue;
                 }
             }
@@ -653,6 +653,9 @@ pub fn fields(tab: usize, axis: usize, cfg: &Config, doc: &DocumentMut) -> Vec<F
     }
     if tab == 4 {
         fields.push(Field { section: String::new(), key: String::new(), label: cfg.tr("Built-in command aliases", "内置命令别名").into(), hint: "Version = Ver; Help = H; Quit = Exit; Restart = Reboot; Top = Pin; Ignore = Exclude; Monitor = Screen".into(), kind: Kind::Note });
+    }
+    if tab == 6 {
+        fields.push(Field{section:String::new(),key:String::new(),label:cfg.tr("Click or drag after activation","激活后单击或拖动").into(),hint:cfg.tr("Click: choose regions. Drag: move or resize. Highlighted shared edges take priority when linked resizing is on. Esc cancels and restores a drag. Mouse controls are disabled by the master mouse switch.","单击选择分区，拖动移动或缩放；启用联动时高亮共边优先。Esc 取消并恢复拖动。关闭鼠标总开关后相关控件禁用。").into(),kind:Kind::Note});
         fields.sort_by_key(|field| match group(field).0 {
             "keyboard-activation" => 0,
             "mouse-actions" => 1,
@@ -824,7 +827,7 @@ mod tests {
                     .any(|field| field.section == "general" && field.key == key)
             );
             assert!(
-                expected[4]
+                expected[6]
                     .iter()
                     .any(|field| field.section == "general" && field.key == key)
             );

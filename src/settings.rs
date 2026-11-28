@@ -1389,6 +1389,19 @@ impl Editor {
                         row.field.key.clone()
                     };
                     self.control(&mut row, index, 3, "EDIT", &key, WS_BORDER | WS_TABSTOP)?;
+                    let related_label = if row.field.section == "presets" {
+                        self.cfg.tr("Find shortcuts", "查看快捷键")
+                    } else {
+                        self.cfg.tr("Edit region", "编辑分区")
+                    };
+                    self.control(
+                        &mut row,
+                        index,
+                        6,
+                        "BUTTON",
+                        related_label,
+                        BS_PUSHBUTTON as u32 | WS_TABSTOP,
+                    )?;
                     if row.field.section == "keys" {
                         unsafe {
                             SetPropW(row.c(3), w!("ShortcutCapture"), 1 as HANDLE);
@@ -1761,6 +1774,9 @@ impl Editor {
                         place(row.c(4), delete_x, y - self.scroll[1], button_width, h);
                         y += h;
                     }
+                    y += gap;
+                    place(row.c(6), padding, y - self.scroll[1], width, h);
+                    y += h;
                 }
                 Kind::Color(channels) => {
                     let color_width = (combo_width + self.s(80)).min(width);
@@ -2772,6 +2788,56 @@ impl Editor {
                 return self.add(&section);
             }
             Kind::Mapping if slot == 4 && event == BN_CLICKED => return self.delete(index),
+            Kind::Mapping if slot == 6 && event == BN_CLICKED => {
+                let source = row.field.section.clone();
+                let name = if source == "presets" {
+                    row.field.key.clone()
+                } else {
+                    Self::selected_value(row, 0)
+                };
+                self.save()?;
+                let tab = if source == "presets" { 4 } else { 2 };
+                self.switch_page(tab, 0)?;
+                let normalized = config::command_name(&name);
+                let target = self
+                    .rows
+                    .iter()
+                    .find(|r| {
+                        if source == "presets" {
+                            r.field.section == "keys"
+                                && self.doc["keys"]
+                                    .get(&r.field.key)
+                                    .and_then(Item::as_str)
+                                    .is_some_and(|v| config::command_name(v) == normalized)
+                        } else {
+                            r.field.section == "presets"
+                                && config::command_name(&r.field.key) == normalized
+                        }
+                    })
+                    .map(|r| r.c(3));
+                if let Some(control) = target {
+                    let mut rect = RECT::default();
+                    unsafe {
+                        GetWindowRect(control, &mut rect);
+                        MapWindowPoints(
+                            null_mut(),
+                            self.panes[1],
+                            (&mut rect as *mut RECT).cast(),
+                            2,
+                        );
+                    }
+                    self.scroll_by(1, u16::MAX, rect.top - self.s(16))?;
+                    unsafe {
+                        SetFocus(control);
+                    }
+                } else {
+                    self.status(self.cfg.tr(
+                        "No linked item; add a shortcut or select a region action.",
+                        "尚无关联项；请添加快捷键或选择分区动作。",
+                    ));
+                }
+                return Ok(());
+            }
             Kind::Mapping if slot == 5 && event == BN_CLICKED => {
                 self.selected = Some(row.field.key.clone());
                 for row in &self.rows {
@@ -4982,6 +5048,33 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "navigates directly between a region and its shortcut controls"]
+    fn related_region_shortcut_buttons_navigate_both_directions() {
+        let _hooks = input::Hooks::escape_only().unwrap();
+        let mut editor = test_editor(2, "related-region-shortcuts");
+        let index = editor
+            .rows
+            .iter()
+            .position(|r| r.field.section == "presets" && r.field.key == "1/4")
+            .unwrap();
+        let button = editor.rows[index].c(6);
+        editor
+            .command(BASE + index as i32 * STRIDE + 6, BN_CLICKED, button)
+            .unwrap();
+        assert_eq!(editor.tab, 4);
+        let index = editor
+            .rows
+            .iter()
+            .position(|r| r.field.section == "keys" && r.field.key == "1")
+            .unwrap();
+        let button = editor.rows[index].c(6);
+        editor
+            .command(BASE + index as i32 * STRIDE + 6, BN_CLICKED, button)
+            .unwrap();
+        assert_eq!(editor.tab, 2);
+    }
+
+    #[test]
     #[ignore = "checks all dependent controls when mouse actions are disabled"]
     fn mouse_switch_disables_region_click_controls() {
         let _hooks = input::Hooks::escape_only().unwrap();
@@ -5837,7 +5930,7 @@ mod tests {
                 // Mouse controls follow switches immediately and retain saved selections.
                 send(hwnd, WM_COMMAND, (TAB_BASE + 4) as usize, 0);
                 wait_tab(hwnd, 4)?;
-                let fields = schema::fields(4, 0, &Config::parse(&doc).unwrap(), &doc);
+                let fields = schema::fields(6, 0, &Config::parse(&doc).unwrap(), &doc);
                 let control_id = |key: &str| {
                     BASE + fields
                         .iter()
@@ -5865,8 +5958,8 @@ mod tests {
                     std::thread::sleep(Duration::from_millis(800));
                     send(hwnd, WM_COMMAND, TAB_BASE as usize, 0);
                     wait_tab(hwnd, 0)?;
-                    send(hwnd, WM_COMMAND, (TAB_BASE + 4) as usize, 0);
-                    wait_tab(hwnd, 4)?;
+                    send(hwnd, WM_COMMAND, (TAB_BASE + 6) as usize, 0);
+                    wait_tab(hwnd, 6)?;
                     let checkbox = unsafe { GetDlgItem(pane, control_id(switch)) };
                     let combo = unsafe { GetDlgItem(pane, control_id(button)) };
                     if unsafe { IsWindowEnabled(combo) } != 0
