@@ -2088,6 +2088,22 @@ mod tests {
             );
             assert!(!hwnd.is_null());
             SetForegroundWindow(hwnd);
+            if std::env::var_os("WINSIZEP_TARGET_INPUT").is_some() {
+                use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
+                let keys = [0, KEYEVENTF_KEYUP].map(|flags| INPUT {
+                    r#type: INPUT_KEYBOARD,
+                    Anonymous: INPUT_0 {
+                        ki: KEYBDINPUT {
+                            wVk: VK_F24,
+                            dwFlags: flags,
+                            ..Default::default()
+                        },
+                    },
+                });
+                assert_eq!(SendInput(2, keys.as_ptr(), size_of::<INPUT>() as i32), 2);
+                crate::test_support::pump();
+                SetPropW(hwnd, w!("TargetInputReady"), 1 as HANDLE);
+            }
             let until = Instant::now() + Duration::from_secs(20);
             while Instant::now() < until && IsWindow(hwnd) != 0 {
                 MsgWaitForMultipleObjectsEx(0, null(), 50, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
@@ -2108,6 +2124,7 @@ mod tests {
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args(["--ignored", "--exact", "resident::tests::target_window"])
             .env("WINSIZEP_PREVIEW_TARGET", "1")
+            .env("WINSIZEP_TARGET_INPUT", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -2117,7 +2134,7 @@ mod tests {
             let until = Instant::now() + Duration::from_secs(5);
             let target = loop {
                 let hwnd = unsafe { FindWindowW(null(), wide(TARGET).as_ptr()) };
-                if !hwnd.is_null() {
+                if !hwnd.is_null() && !unsafe { GetPropW(hwnd, w!("TargetInputReady")) }.is_null() {
                     break hwnd;
                 }
                 assert!(Instant::now() < until);
@@ -2126,6 +2143,7 @@ mod tests {
             unsafe {
                 SetForegroundWindow(target);
             }
+            assert_eq!(unsafe { GetForegroundWindow() }, target);
             let mut app = test_app();
             let _hooks = input::Hooks::start(&app.cfg).unwrap();
             let drain = |app: &mut App| {
@@ -2258,8 +2276,47 @@ mod tests {
                 drain(&mut app);
                 let surface = app.prompt.as_ref().unwrap().window;
                 unsafe {
+                    use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
                     let edit = GetDlgItem(surface, 1);
-                    SetWindowTextW(edit, wide(r"0\0、100sw｜50sh").as_ptr());
+                    assert_eq!(
+                        GetForegroundWindow(),
+                        surface,
+                        "command input must become the foreground window"
+                    );
+                    assert_eq!(
+                        GetFocus(),
+                        edit,
+                        "command input must receive keyboard focus without a click"
+                    );
+                    let command = r"0\0、100sw｜50sh";
+                    let keys: Vec<INPUT> = command
+                        .encode_utf16()
+                        .flat_map(|code| {
+                            [0, KEYEVENTF_KEYUP].map(move |flags| INPUT {
+                                r#type: INPUT_KEYBOARD,
+                                Anonymous: INPUT_0 {
+                                    ki: KEYBDINPUT {
+                                        wScan: code,
+                                        dwFlags: KEYEVENTF_UNICODE | flags,
+                                        ..Default::default()
+                                    },
+                                },
+                            })
+                        })
+                        .collect();
+                    assert_eq!(
+                        SendInput(keys.len() as u32, keys.as_ptr(), size_of::<INPUT>() as i32),
+                        keys.len() as u32
+                    );
+                    let until = Instant::now() + Duration::from_secs(2);
+                    while app.prompt.as_ref().unwrap().text() != command {
+                        assert!(
+                            Instant::now() < until,
+                            "typed command did not reach the input"
+                        );
+                        crate::test_support::pump();
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
                     SendMessageW(edit, WM_KEYDOWN, 13, 1);
                 }
                 drain(&mut app);

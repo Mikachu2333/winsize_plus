@@ -11,7 +11,10 @@ use windows_sys::{
     Win32::{
         Foundation::*,
         Graphics::Gdi::*,
-        System::LibraryLoader::GetModuleHandleW,
+        System::{
+            LibraryLoader::GetModuleHandleW,
+            Threading::{AttachThreadInput, GetCurrentThreadId},
+        },
         UI::{Controls::*, Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
     },
     core::w,
@@ -246,7 +249,20 @@ impl Prompt {
                 RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN,
             );
             ShowWindow(window, SW_SHOW);
-            SetForegroundWindow(window);
+            if SetForegroundWindow(window) == 0 {
+                // A consumed global shortcut can leave the last input with another
+                // application. Share its foreground input queue only for activation.
+                let current_thread = GetCurrentThreadId();
+                let foreground_thread = GetWindowThreadProcessId(GetForegroundWindow(), null_mut());
+                if foreground_thread != 0
+                    && foreground_thread != current_thread
+                    && AttachThreadInput(current_thread, foreground_thread, 1) != 0
+                {
+                    SetForegroundWindow(window);
+                    SetFocus(prompt.edit);
+                    AttachThreadInput(current_thread, foreground_thread, 0);
+                }
+            }
             SetFocus(prompt.edit);
             Ok(prompt)
         }
