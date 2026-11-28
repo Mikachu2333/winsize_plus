@@ -1,6 +1,11 @@
+use crate::fonts::Font;
 use crate::{config::Config, desktop, input, layout::Layout};
-use std::ptr::{null, null_mut};
+use std::{
+    cell::RefCell,
+    ptr::{null, null_mut},
+};
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
+use windows_sys::Win32::{Graphics::Dwm::*, UI::HiDpi::GetDpiForWindow};
 use windows_sys::{
     Win32::{
         Foundation::*,
@@ -49,35 +54,88 @@ pub fn parse(text: &str, cfg: &Config) -> Result<Command, String> {
     }
 }
 
+struct Appearance {
+    family: String,
+    points: i32,
+    bold: bool,
+    italic: bool,
+    font: Font,
+    theme: String,
+    colors: [u32; 4],
+    background: u32,
+    foreground: u32,
+    brush: HBRUSH,
+}
+impl Appearance {
+    fn update_colors(&mut self) {
+        let dark = self.theme == "dark" || (self.theme == "system" && crate::overlay::dark());
+        self.background = self.colors[if dark { 2 } else { 0 }];
+        self.foreground = self.colors[if dark { 3 } else { 1 }];
+        unsafe {
+            if !self.brush.is_null() {
+                DeleteObject(self.brush);
+            }
+            self.brush = CreateSolidBrush(self.background);
+        }
+    }
+}
+impl Drop for Appearance {
+    fn drop(&mut self) {
+        unsafe {
+            DeleteObject(self.brush);
+        }
+    }
+}
 pub struct Prompt {
     pub window: HWND,
     edit: HWND,
     status: HWND,
+    appearance: Box<RefCell<Appearance>>,
 }
 impl Prompt {
-    pub fn new(cfg: &Config) -> Result<Self, String> {
-        // SAFETY: class strings are static; child windows belong to this UI thread.
+    pub fn new(cfg: &Config, target: HWND) -> Result<Self, String> {
+        let screen = desktop::screen(desktop::cursor()?, 0)?;
+        let font = Font::new(
+            &cfg.font,
+            cfg.font_size,
+            screen.dpi,
+            cfg.font_bold,
+            cfg.font_italic,
+        )?;
+        let mut style = Appearance {
+            family: cfg.font.clone(),
+            points: cfg.font_size,
+            bold: cfg.font_bold,
+            italic: cfg.font_italic,
+            font,
+            theme: cfg.theme.clone(),
+            colors: cfg.colors,
+            background: 0,
+            foreground: 0,
+            brush: null_mut(),
+        };
+        style.update_colors();
+        let appearance = Box::new(RefCell::new(style));
+        // SAFETY: the boxed appearance outlives HWND and is removed before its allocation is dropped.
         unsafe {
             let instance = GetModuleHandleW(null());
             let class = WNDCLASSW {
                 lpfnWndProc: Some(window_proc),
                 hInstance: instance,
                 hCursor: LoadCursorW(null_mut(), IDC_ARROW),
-                hbrBackground: (COLOR_WINDOW + 1) as HBRUSH,
                 lpszClassName: w!("WinSizeP.Command"),
                 ..Default::default()
             };
             RegisterClassW(&class);
-            let screen = desktop::screen(desktop::cursor()?, 0)?;
-            let width = (620 * screen.dpi / 96).min(screen.work.width);
-            let height = 145 * screen.dpi / 96;
+            let width = (680 * screen.dpi / 96).min(screen.work.width);
+            let height = (260 * screen.dpi / 96).min(screen.work.height);
             let window = CreateWindowExW(
                 WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
                 class.lpszClassName,
                 desktop::wide(cfg.tr("Region or command", "分区或命令")).as_ptr(),
-                WS_CAPTION | WS_SYSMENU,
+                WS_CAPTION | WS_SYSMENU | WS_THICKFRAME,
                 screen.work.x + (screen.work.width - width) / 2,
-                screen.work.y + screen.work.height / 3,
+                screen.work.y + (screen.work.height - height) / 3,
                 width,
                 height,
                 null_mut(),
@@ -92,17 +150,55 @@ impl Prompt {
                 window,
                 edit: null_mut(),
                 status: null_mut(),
+                appearance,
             };
-            let scale = |v| v * screen.dpi / 96;
+            desktop::check(SetPropW(
+                window,
+                w!("PromptAppearance"),
+                (&*prompt.appearance as *const RefCell<Appearance>) as HANDLE,
+            ))?;
+            let display = desktop::bounds(target)
+                .ok()
+                .and_then(|(_, rect)| {
+                    desktop::screen(
+                        POINT {
+                            x: rect.x + rect.width / 2,
+                            y: rect.y + rect.height / 2,
+                        },
+                        0,
+                    )
+                    .ok()
+                })
+                .map_or(screen.number, |d| d.number);
+            let target_text = format!(
+                "{}: {}  ·  {} {display}",
+                cfg.tr("Target", "目标"),
+                desktop::window_text(target, "{title} — {process}"),
+                cfg.tr("Screen", "屏幕")
+            );
+            let target_label = CreateWindowExW(
+                0,
+                w!("STATIC"),
+                desktop::wide(target_text).as_ptr(),
+                WS_CHILD | WS_VISIBLE | 0x4000, // SS_ENDELLIPSIS from WinUser.h.
+                0,
+                0,
+                1,
+                1,
+                window,
+                3 as HMENU,
+                instance,
+                null(),
+            );
             prompt.edit = CreateWindowExW(
                 WS_EX_CLIENTEDGE,
                 w!("EDIT"),
                 w!(""),
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL as u32,
-                scale(12),
-                scale(12),
-                width - scale(40),
-                scale(30),
+                0,
+                0,
+                1,
+                1,
                 window,
                 1 as HMENU,
                 instance,
@@ -110,32 +206,49 @@ impl Prompt {
             );
             prompt.status = CreateWindowExW(
                 0,
-                w!("STATIC"),
-                desktop::wide(cfg.tr("Enter to apply · Esc to cancel", "Enter 确认 · Esc 取消"))
-                    .as_ptr(),
-                WS_CHILD | WS_VISIBLE,
-                scale(12),
-                scale(52),
-                width - scale(40),
-                scale(48),
+                w!("EDIT"),
+                desktop::wide(cfg.tr(
+                    "Enter to apply · Esc to cancel · Switching windows cancels",
+                    "Enter 确认 · Esc 取消 · 切换窗口时取消",
+                ))
+                .as_ptr(),
+                WS_CHILD
+                    | WS_VISIBLE
+                    | WS_VSCROLL
+                    | ES_MULTILINE as u32
+                    | ES_AUTOVSCROLL as u32
+                    | ES_READONLY as u32,
+                0,
+                0,
+                1,
+                1,
                 window,
                 2 as HMENU,
                 instance,
                 null(),
             );
-            if prompt.edit.is_null() || prompt.status.is_null() {
+            if target_label.is_null() || prompt.edit.is_null() || prompt.status.is_null() {
                 return Err(desktop::err());
             }
             desktop::check(SetWindowSubclass(prompt.edit, Some(edit_proc), 1, 0))?;
-            for child in [prompt.edit, prompt.status] {
+            for child in [target_label, prompt.edit, prompt.status] {
                 SendMessageW(
                     child,
                     WM_SETFONT,
-                    GetStockObject(DEFAULT_GUI_FONT) as usize,
+                    prompt.appearance.borrow().font.0 as usize,
                     1,
                 );
             }
+            let dark =
+                i32::from(cfg.theme == "dark" || (cfg.theme == "system" && crate::overlay::dark()));
+            DwmSetWindowAttribute(
+                window,
+                DWMWA_USE_IMMERSIVE_DARK_MODE as u32,
+                (&dark as *const i32).cast(),
+                4,
+            );
             SendMessageW(prompt.edit, EM_SETLIMITTEXT, 4096, 0);
+            layout(window, &prompt.appearance.borrow());
             ShowWindow(window, SW_SHOW);
             SetForegroundWindow(window);
             SetFocus(prompt.edit);
@@ -143,11 +256,10 @@ impl Prompt {
         }
     }
     pub fn text(&self) -> String {
-        // SAFETY: the owned edit remains alive and the buffer includes a terminator.
         unsafe {
             let mut text = vec![0; GetWindowTextLengthW(self.edit).max(0) as usize + 1];
-            let count = GetWindowTextW(self.edit, text.as_mut_ptr(), text.len() as i32);
-            String::from_utf16_lossy(&text[..count.max(0) as usize])
+            let n = GetWindowTextW(self.edit, text.as_mut_ptr(), text.len() as i32);
+            String::from_utf16_lossy(&text[..n.max(0) as usize])
         }
     }
     pub fn error(&self, text: &str) {
@@ -160,13 +272,40 @@ impl Prompt {
 impl Drop for Prompt {
     fn drop(&mut self) {
         unsafe {
+            RemovePropW(self.window, w!("PromptAppearance"));
             DestroyWindow(self.window);
         }
     }
 }
-
+fn layout(hwnd: HWND, style: &Appearance) {
+    unsafe {
+        let dpi = GetDpiForWindow(hwnd).max(96) as i32;
+        let padding = 12 * dpi / 96;
+        let mut rect = RECT::default();
+        GetClientRect(hwnd, &mut rect);
+        let line = style.font.height().max(18 * dpi / 96);
+        let width = (rect.right - 2 * padding).max(1);
+        MoveWindow(GetDlgItem(hwnd, 3), padding, padding, width, line + 4, 1);
+        MoveWindow(
+            GetDlgItem(hwnd, 1),
+            padding,
+            padding + line + 12,
+            width,
+            line + 12,
+            1,
+        );
+        let top = padding + line * 2 + 36;
+        MoveWindow(
+            GetDlgItem(hwnd, 2),
+            padding,
+            top,
+            width,
+            (rect.bottom - top - padding).max(line),
+            1,
+        );
+    }
+}
 unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    // SAFETY: callback arguments are supplied by Windows on the owning thread.
     unsafe {
         if message == WM_CLOSE {
             input::prompt_event(hwnd, false);
@@ -178,6 +317,67 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
         if message == WM_SETFOCUS {
             SetFocus(GetDlgItem(hwnd, 1));
             return 0;
+        }
+        let state = GetPropW(hwnd, w!("PromptAppearance")) as *const RefCell<Appearance>;
+        if let Some(state) = state.as_ref() {
+            match message {
+                WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT => {
+                    if let Ok(s) = state.try_borrow() {
+                        SetTextColor(wp as HDC, s.foreground);
+                        SetBkColor(wp as HDC, s.background);
+                        SetBkMode(wp as HDC, OPAQUE as i32);
+                        return s.brush as isize;
+                    }
+                }
+                WM_ERASEBKGND => {
+                    if let Ok(s) = state.try_borrow() {
+                        let mut r = RECT::default();
+                        GetClientRect(hwnd, &mut r);
+                        FillRect(wp as HDC, &r, s.brush);
+                        return 1;
+                    }
+                }
+                WM_SIZE => {
+                    if let Ok(s) = state.try_borrow() {
+                        layout(hwnd, &s);
+                    }
+                    return 0;
+                }
+                WM_DPICHANGED => {
+                    let dpi = (wp & 0xffff) as i32;
+                    let old = if let Ok(mut s) = state.try_borrow_mut() {
+                        Font::new(&s.family, s.points, dpi, s.bold, s.italic)
+                            .ok()
+                            .map(|font| std::mem::replace(&mut s.font, font))
+                    } else {
+                        None
+                    };
+                    if let Ok(s) = state.try_borrow() {
+                        for id in [1, 2, 3] {
+                            SendMessageW(GetDlgItem(hwnd, id), WM_SETFONT, s.font.0 as usize, 1);
+                        }
+                    }
+                    drop(old);
+                    let r = &*(lp as *const RECT);
+                    SetWindowPos(
+                        hwnd,
+                        null_mut(),
+                        r.left,
+                        r.top,
+                        r.right - r.left,
+                        r.bottom - r.top,
+                        SWP_NOACTIVATE | SWP_NOZORDER,
+                    );
+                    return 0;
+                }
+                WM_THEMECHANGED | WM_SETTINGCHANGE => {
+                    if let Ok(mut s) = state.try_borrow_mut() {
+                        s.update_colors();
+                    }
+                    InvalidateRect(hwnd, null(), 1);
+                }
+                _ => {}
+            }
         }
         DefWindowProcW(hwnd, message, wp, lp)
     }
@@ -221,6 +421,48 @@ unsafe extern "system" fn edit_proc(
 mod tests {
     use super::*;
     #[test]
+    #[ignore = "opens a themed command prompt and checks target text, font, long errors and DPI changes"]
+    fn prompt_displays_target_and_uses_theme_font_and_scrollable_errors() {
+        let _hooks = input::Hooks::escape_only().unwrap();
+        let mut cfg = crate::test_support::cfg();
+        cfg.theme = "dark".into();
+        cfg.font_size = 18;
+        let prompt = Prompt::new(&cfg, unsafe { GetForegroundWindow() }).unwrap();
+        let label = unsafe { GetDlgItem(prompt.window, 3) };
+        let mut text = [0u16; 1024];
+        let n = unsafe { GetWindowTextW(label, text.as_mut_ptr(), 1024) };
+        let text = String::from_utf16_lossy(&text[..n as usize]);
+        assert!(text.contains("屏幕") || text.contains("Screen"));
+        assert_eq!(prompt.appearance.borrow().background, cfg.colors[2]);
+        assert_eq!(
+            unsafe { SendMessageW(prompt.edit, WM_GETFONT, 0, 0) } as usize,
+            prompt.appearance.borrow().font.0 as usize
+        );
+        let error = "A detailed error line\n".repeat(100);
+        prompt.error(&error);
+        assert_eq!(
+            unsafe { GetWindowTextLengthW(prompt.status) } as usize,
+            error.encode_utf16().count()
+        );
+        assert!(unsafe { GetWindowLongW(prompt.status, GWL_STYLE) } as u32 & WS_VSCROLL != 0);
+        let before = prompt.appearance.borrow().font.height();
+        let rect = RECT {
+            left: 100,
+            top: 100,
+            right: 900,
+            bottom: 500,
+        };
+        unsafe {
+            SendMessageW(
+                prompt.window,
+                WM_DPICHANGED,
+                192 | (192 << 16),
+                (&rect as *const RECT) as isize,
+            );
+        }
+        assert!(prompt.appearance.borrow().font.height() >= before);
+    }
+    #[test]
     fn names_precede_expressions_and_punctuation_is_preserved() {
         let mut doc = crate::config::help()
             .parse::<toml_edit::DocumentMut>()
@@ -247,7 +489,7 @@ mod tests {
     fn native_editor_accepts_unicode_punctuation_and_defers_enter_during_composition() {
         let _hooks = input::Hooks::escape_only().unwrap();
         let cfg = crate::test_support::cfg();
-        let prompt = Prompt::new(&cfg).unwrap();
+        let prompt = Prompt::new(&cfg, unsafe { GetForegroundWindow() }).unwrap();
         let text = "区域1/4\\-｜、|";
         unsafe {
             for ch in text.encode_utf16() {

@@ -417,7 +417,7 @@ impl App {
             "command" => {
                 self.command.clear();
                 self.hide = None;
-                self.prompt = match crate::command_prompt::Prompt::new(&self.cfg) {
+                self.prompt = match crate::command_prompt::Prompt::new(&self.cfg, self.window) {
                     Ok(prompt) => {
                         input::native_text(prompt.window);
                         Some(prompt)
