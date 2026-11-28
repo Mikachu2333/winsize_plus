@@ -1,5 +1,7 @@
 # WinSizeP
 
+After Alt activation, press grave to open the native command editor. It supports IME input, caret editing and paste. Enter a region name, a layout such as `0|0|100sw|50sh`, or a command; Enter applies and Esc cancels. Layouts also accept `｜` and `、` separators. Invalid input remains available for correction.
+
 [中文](README.md) | English
 
 A Windows window management tool that uses Alt shortcuts and mouse actions to move, resize, and arrange windows. Designed for multiple monitors, screen recordings, and presentations.

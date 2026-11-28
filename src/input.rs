@@ -39,6 +39,19 @@ pub const RECOVERED: u32 = WM_APP + 16;
 pub const CENTER: u32 = WM_APP + 17;
 pub const POINTER_UP: u32 = WM_APP + 18;
 pub const CONFIRM: u32 = WM_APP + 19;
+pub const COMMAND_SUBMIT: u32 = WM_APP + 20;
+pub const COMMAND_CANCEL: u32 = WM_APP + 21;
+pub fn prompt_event(submit: bool) {
+    post(
+        if submit {
+            COMMAND_SUBMIT
+        } else {
+            COMMAND_CANCEL
+        },
+        0,
+        0,
+    );
+}
 thread_local! { static DISPLAY_PENDING: Cell<bool> = const { Cell::new(false) }; }
 pub fn display_changed() {
     desktop::invalidate_displays();
@@ -67,6 +80,7 @@ enum Mode {
 struct Input {
     paused: bool,
     mode: Mode,
+    native_text: bool,
     alt_mask: u8,
     gesture_mask: u8,
     gesture_target: HWND,
@@ -508,6 +522,12 @@ impl Input {
                 self.eaten[index] &= !flag;
             }
             return true;
+        }
+        if self.native_text {
+            if !down && matches!(key, LEFT | RIGHT) {
+                self.pressed &= if key == LEFT { !1 } else { !2 };
+            }
+            return false;
         }
         if down
             && self.hold_active
@@ -1112,8 +1132,16 @@ pub fn alt_held() -> bool {
         )
     })
 }
-pub fn command_mode() {
-    let _ = on_hook(|| INPUT.with_borrow_mut(|input| input.mode = Mode::Command));
+pub fn native_text(on: bool) {
+    let _ = on_hook(move || {
+        INPUT.with_borrow_mut(|input| {
+            input.mode = Mode::Idle;
+            input.cancel_hold();
+            input.native_text = on;
+            input.tap = None;
+            input.last_tap = None;
+        })
+    });
 }
 pub fn set_guides(on: bool) -> Result<(), String> {
     on_hook(move || {

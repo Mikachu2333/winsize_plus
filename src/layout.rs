@@ -68,7 +68,7 @@ pub struct Layout {
 impl FromStr for Layout {
     type Err = String;
     fn from_str(text: &str) -> Result<Self, String> {
-        let mut parts = text.split('|');
+        let mut parts = text.split(['|', '｜', '、']);
         let mut next = || parts.next().ok_or_else(|| text.to_owned())?.parse::<Expr>();
         let fields = [next()?, next()?, next()?, next()?];
         let monitor = parts

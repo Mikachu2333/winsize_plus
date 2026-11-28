@@ -62,6 +62,7 @@ struct App {
     window: HWND,
     drag: Option<desktop::Drag>,
     command: String,
+    prompt: Option<crate::command_prompt::Prompt>,
     hide: Option<Instant>,
     reload: Option<Instant>,
     snapshot: Option<Vec<u8>>,
@@ -360,10 +361,17 @@ impl App {
                 self.overlay.tip(&self.cfg.help_text(), &self.cfg)
             }
             "command" => {
-                input::command_mode();
+                input::native_text(true);
                 self.command.clear();
                 self.hide = None;
-                self.overlay.tip(": ▏", &self.cfg)
+                self.prompt = match crate::command_prompt::Prompt::new(&self.cfg) {
+                    Ok(prompt) => Some(prompt),
+                    Err(error) => {
+                        input::native_text(false);
+                        return Err(error);
+                    }
+                };
+                Ok(())
             }
             "reload" => self.load(false),
             "restart" | "quit" => {
@@ -496,6 +504,51 @@ impl App {
         }
         self.overlay.tip(&format!(": {}▏", self.command), &self.cfg)
     }
+    fn close_prompt(&mut self) {
+        self.prompt.take();
+        input::native_text(false);
+        unsafe {
+            if IsWindow(self.window) != 0 {
+                SetForegroundWindow(self.window);
+            }
+        }
+    }
+    fn submit_prompt(&mut self) -> Result<(), String> {
+        let Some(prompt) = &self.prompt else {
+            return Ok(());
+        };
+        let command = match crate::command_prompt::parse(&prompt.text(), &self.cfg) {
+            Ok(command) => command,
+            Err(error) => {
+                prompt.error(&error);
+                return Ok(());
+            }
+        };
+        let rect = if let crate::command_prompt::Command::Layout(layout) = &command {
+            let resolved = (|| {
+                let screen = desktop::screen(desktop::cursor()?, layout.monitor)?;
+                layout.resolve(
+                    screen.work,
+                    desktop::bounds(self.window)?.1,
+                    desktop::desktop(),
+                )
+            })();
+            match resolved {
+                Ok(rect) => Some(rect),
+                Err(error) => {
+                    prompt.error(&error);
+                    return Ok(());
+                }
+            }
+        } else {
+            None
+        };
+        self.close_prompt();
+        match command {
+            crate::command_prompt::Command::Action(action) => self.act(&action),
+            crate::command_prompt::Command::Layout(_) => self.finish_selection(rect),
+        }
+    }
     fn event(&mut self, msg: MSG) -> Result<(), String> {
         self.handle_event(msg)?;
         for _ in 0..64 {
@@ -514,6 +567,11 @@ impl App {
             return Ok(());
         }
         match msg.message {
+            input::COMMAND_SUBMIT => self.submit_prompt(),
+            input::COMMAND_CANCEL => {
+                self.close_prompt();
+                Ok(())
+            }
             input::RECOVERED => {
                 self.drag = None;
                 self.cast.clear();
@@ -890,6 +948,7 @@ pub fn run(
             window: null_mut(),
             drag: None,
             command: String::new(),
+            prompt: None,
             hide: None,
             reload: None,
             snapshot,
@@ -1060,6 +1119,7 @@ mod tests {
             window: null_mut(),
             drag: None,
             command: String::new(),
+            prompt: None,
             hide: None,
             reload: None,
             snapshot: None,
@@ -1248,6 +1308,7 @@ mod tests {
             window: null_mut(),
             drag: None,
             command: String::new(),
+            prompt: None,
             hide: None,
             reload: None,
             snapshot: None,
@@ -1320,6 +1381,7 @@ mod tests {
             window: null_mut(),
             drag: None,
             command: String::new(),
+            prompt: None,
             hide: None,
             reload: None,
             snapshot: None,
@@ -1409,6 +1471,7 @@ mod tests {
             window: null_mut(),
             drag: None,
             command: String::new(),
+            prompt: None,
             hide: None,
             reload: None,
             snapshot: None,
@@ -1683,6 +1746,7 @@ mod tests {
             window: null_mut(),
             drag: None,
             command: String::new(),
+            prompt: None,
             hide: None,
             reload: None,
             snapshot: None,

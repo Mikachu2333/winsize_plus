@@ -3,6 +3,7 @@
 mod cast;
 mod cli;
 mod colors;
+mod command_prompt;
 mod config;
 mod config_access;
 mod desktop;
