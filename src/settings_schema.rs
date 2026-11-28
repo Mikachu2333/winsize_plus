@@ -661,7 +661,7 @@ pub fn fields(tab: usize, axis: usize, cfg: &Config, doc: &DocumentMut) -> Vec<F
         fields.push(Field { section: String::new(), key: String::new(), label: cfg.tr("Built-in command aliases", "内置命令别名").into(), hint: "Version = Ver; Help = H; Quit = Exit; Restart = Reboot; Top = Pin; Ignore = Exclude; Monitor = Screen".into(), kind: Kind::Note });
     }
     if tab == 6 {
-        fields.push(Field{section:String::new(),key:String::new(),label:cfg.tr("Click or drag after activation","激活后单击或拖动").into(),hint:cfg.tr("Click: choose regions. Drag: move or resize. Highlighted shared edges take priority when linked resizing is on. Esc cancels and restores a drag. Mouse controls are disabled by the master mouse switch.","单击选择分区，拖动移动或缩放；启用联动时高亮共边优先。Esc 取消并恢复拖动。关闭鼠标总开关后相关控件禁用。").into(),kind:Kind::Note});
+        fields.push(Field{section:String::new(),key:String::new(),label:cfg.tr("Click, scroll or drag after activation","激活后单击、滚动或拖动").into(),hint:cfg.tr("Click: choose regions. Wheel: cycle overlapping regions under the pointer, down for larger areas and up for smaller ones. Drag: move or resize; highlighted shared edges take priority when linked resizing is on. Esc cancels and restores a drag. The mouse switch controls all these actions.","单击选择分区；滚轮切换鼠标下的重叠分区，向下选更大区域，向上反向切换。拖动移动或缩放，启用联动时高亮共边优先。Esc 取消并恢复拖动。鼠标总开关控制上述操作。").into(),kind:Kind::Note});
         fields.sort_by_key(|field| match group(field).0 {
             "keyboard-activation" => 0,
             "mouse-actions" => 1,

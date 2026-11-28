@@ -516,8 +516,8 @@ impl Config {
             }
             mouse.push(
                 self.tr(
-                    "After Alt activation: select actual regions; Enter confirms, Esc cancels",
-                    "Alt 触发后：按实际分区选择；Enter 确认，Esc 取消",
+                    "After Alt activation: select regions; wheel switches overlaps; Enter confirms, Esc cancels",
+                    "Alt 触发后：选择分区；滚轮切换重叠分区，Enter 确认，Esc 取消",
                 )
                 .into(),
             );

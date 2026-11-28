@@ -153,6 +153,23 @@ fn center(rect: Rect) -> (i64, i64) {
         i64::from(rect.y) * 2 + i64::from(rect.height),
     )
 }
+fn overlapping(regions: &[PresetRegion], point: POINT) -> Vec<usize> {
+    let mut candidates: Vec<_> = regions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, region)| contains(region.rect, point).then_some(index))
+        .collect();
+    candidates.sort_by_key(|&index| {
+        let region = &regions[index];
+        (
+            i64::from(region.rect.width) * i64::from(region.rect.height),
+            region.rect.y,
+            region.rect.x,
+            &region.name,
+        )
+    });
+    candidates
+}
 fn coincident(regions: &[PresetRegion], selected: usize) -> Vec<usize> {
     let target = center(regions[selected].rect);
     regions
@@ -192,6 +209,7 @@ fn enclosing(rects: impl Iterator<Item = Rect>) -> Option<Rect> {
 pub struct Preview {
     base: Panel,
     highlight: Panel,
+    candidate_outline: Panel,
     overlaps: Vec<Panel>,
     label: Label,
     chosen: Vec<Chosen>,
@@ -203,6 +221,9 @@ pub struct Preview {
     display: Option<(HMONITOR, Display)>,
     regions: Vec<PresetRegion>,
     selected: Option<usize>,
+    candidates: Vec<usize>,
+    cycled: Option<usize>,
+    wheel_remainder: i32,
     locked: Option<String>,
     pointer: Option<(i32, i32)>,
     display_epoch: u64,
@@ -220,6 +241,7 @@ impl Preview {
         Ok(Self {
             base: Panel::new()?,
             highlight: Panel::new()?,
+            candidate_outline: Panel::new()?,
             overlaps: Vec::new(),
             label: Label::new()?,
             chosen: Vec::new(),
@@ -231,6 +253,9 @@ impl Preview {
             display: None,
             regions: Vec::new(),
             selected: None,
+            candidates: Vec::new(),
+            cycled: None,
+            wheel_remainder: 0,
             locked: None,
             pointer: None,
             display_epoch: desktop::display_epoch(),
@@ -256,6 +281,37 @@ impl Preview {
     pub fn hovered_name(&self) -> Option<&str> {
         self.selected.map(|index| self.regions[index].name.as_str())
     }
+    pub fn candidate_position(&self) -> Option<(usize, usize)> {
+        let selected = self.selected?;
+        let position = self
+            .candidates
+            .iter()
+            .position(|&index| index == selected)?;
+        (self.interactive && self.candidates.len() > 1)
+            .then_some((position + 1, self.candidates.len()))
+    }
+    /// Returns whether the wheel browsed overlapping candidates, even when a
+    /// smooth wheel has not yet accumulated a complete notch.
+    pub fn cycle(&mut self, point: POINT, delta: i32, cfg: &Config) -> Result<bool, String> {
+        if !self.active() || !self.interactive || !cfg.mouse_enabled || delta == 0 {
+            return Ok(false);
+        }
+        self.follow(point, cfg)?;
+        let Some((position, count)) = self.candidate_position() else {
+            self.wheel_remainder = 0;
+            return Ok(false);
+        };
+        self.wheel_remainder = self.wheel_remainder.saturating_add(delta);
+        let steps = self.wheel_remainder / 120;
+        self.wheel_remainder %= 120;
+        if steps != 0 {
+            // Windows reports upward scrolling as positive: down selects a larger region.
+            let next = (position as i64 - 1 - i64::from(steps)).rem_euclid(count as i64) as usize;
+            self.cycled = Some(self.candidates[next]);
+            self.highlight(self.cycled, cfg)?;
+        }
+        Ok(true)
+    }
     pub fn count(&self) -> usize {
         self.chosen.len()
     }
@@ -268,12 +324,20 @@ impl Preview {
             .selected
             .and_then(|i| self.regions.get(i))
             .map(|r| r.name.clone());
+        let cycled = self
+            .cycled
+            .and_then(|i| self.regions.get(i))
+            .map(|r| r.name.clone());
         let chosen = std::mem::take(&mut self.chosen);
         self.rebuild(monitor, cfg)?;
         for region in chosen {
             self.toggle(region.name, region.rect, cfg)?;
         }
         let index = selected.and_then(|name| self.regions.iter().position(|r| r.name == name));
+        if let Some((x, y)) = self.pointer {
+            self.candidates = overlapping(&self.regions, POINT { x, y });
+            self.cycled = cycled.and_then(|name| self.regions.iter().position(|r| r.name == name));
+        }
         self.highlight(index, cfg)
     }
     pub fn selection_rect(&self) -> Option<Rect> {
@@ -347,6 +411,7 @@ impl Preview {
     fn hide_layers(&self) {
         self.base.hide();
         self.highlight.hide();
+        self.candidate_outline.hide();
         for panel in &self.overlaps {
             panel.hide();
         }
@@ -361,6 +426,9 @@ impl Preview {
         self.chosen.clear();
         self.display = None;
         self.selected = None;
+        self.candidates.clear();
+        self.cycled = None;
+        self.wheel_remainder = 0;
         self.pointer = None;
     }
     fn color(cfg: &Config) -> u32 {
@@ -374,6 +442,9 @@ impl Preview {
         &self.warnings
     }
     fn rebuild(&mut self, monitor: HMONITOR, cfg: &Config) -> Result<(), String> {
+        self.candidates.clear();
+        self.cycled = None;
+        self.wheel_remainder = 0;
         let display = desktop::display(monitor)?;
         let virtual_area = desktop::desktop();
         let displays = desktop::displays()?;
@@ -451,6 +522,7 @@ impl Preview {
     }
     fn show_base(&mut self, _cfg: &Config) -> Result<(), String> {
         self.highlight.hide();
+        self.candidate_outline.hide();
         for panel in &self.overlaps {
             panel.hide();
         }
@@ -467,6 +539,7 @@ impl Preview {
         }
         self.selected = selected;
         self.highlight.hide();
+        self.candidate_outline.hide();
         for panel in &self.overlaps {
             panel.hide();
         }
@@ -495,7 +568,11 @@ impl Preview {
             {
                 panel.style(
                     unsafe { GetSysColor(COLOR_HIGHLIGHT) },
-                    cfg.highlight_opacity,
+                    if self.interactive {
+                        cfg.highlight_opacity / 2
+                    } else {
+                        cfg.highlight_opacity
+                    },
                 );
                 panel.show(self.regions[index].rect);
             }
@@ -503,17 +580,29 @@ impl Preview {
             let dpi = region.dpi;
             // Selection uses a translucent interior fill; the ordinary outline stays unchanged.
             self.highlight.show(region.rect);
-            self.label.show(
-                &group
+            if self.interactive {
+                let desktop = desktop::desktop();
+                let width = ((cfg.outline.width + 2) * dpi / 96).max(3);
+                outline(
+                    &self.candidate_outline,
+                    &[(region.rect, region.area, region.area, width)],
+                    desktop,
+                )?;
+                self.candidate_outline
+                    .style(unsafe { GetSysColor(COLOR_HIGHLIGHT) }, 255);
+                self.candidate_outline.show(desktop);
+            }
+            let label = if self.interactive {
+                cfg.region_caption(&region.name)
+            } else {
+                group
                     .iter()
-                    .map(|&index| cfg.region_caption(&self.regions[index].name))
+                    .map(|&i| cfg.region_caption(&self.regions[i].name))
                     .collect::<Vec<_>>()
-                    .join("\n"),
-                region.rect,
-                Self::color(cfg),
-                dpi,
-                cfg,
-            )?;
+                    .join("\n")
+            };
+            self.label
+                .show(&label, region.rect, Self::color(cfg), dpi, cfg)?;
         }
         Ok(())
     }
@@ -549,10 +638,19 @@ impl Preview {
             || point.x >= area.x + area.width - 2
             || point.y >= area.y + area.height - 2;
         if edge {
+            self.candidates.clear();
+            self.cycled = None;
+            self.wheel_remainder = 0;
             self.highlight(None, cfg)?;
             return Ok(());
         }
-        let selected = nearest(&self.regions, point);
+        let candidates = overlapping(&self.regions, point);
+        if self.candidates != candidates {
+            self.wheel_remainder = 0;
+            self.candidates = candidates;
+        }
+        self.cycled = self.cycled.filter(|index| self.candidates.contains(index));
+        let selected = self.cycled.or_else(|| nearest(&self.regions, point));
         self.highlight(selected, cfg)
     }
 }
@@ -560,6 +658,139 @@ impl Preview {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn wheel_candidates_include_only_pointer_overlaps_in_stable_size_order() {
+        let mut regions = vec![
+            region("large", -100, -100, 400, 400),
+            region("small", 40, 40, 20, 20),
+            region("same-size-right", 25, 0, 100, 100),
+            region("same-size-left", 0, 0, 100, 100),
+            region("outside", 500, 0, 10, 10),
+        ];
+        let point = POINT { x: 50, y: 50 };
+        let names = |regions: &[PresetRegion]| {
+            overlapping(regions, point)
+                .iter()
+                .map(|&i| regions[i].name.clone())
+                .collect::<Vec<_>>()
+        };
+        let expected = ["small", "same-size-left", "same-size-right", "large"];
+        assert_eq!(names(&regions), expected);
+        regions.reverse();
+        assert_eq!(names(&regions), expected);
+        assert!(overlapping(&regions, POINT { x: 800, y: 800 }).is_empty());
+    }
+    #[test]
+    #[ignore = "shows actual region overlays to verify wheel selection, smooth deltas, and reset boundaries"]
+    fn wheel_browsing_keeps_center_until_exit_and_respects_display_modes() {
+        let _dpi = crate::test_support::Dpi::new();
+        let _overlay = overlay::Overlay::new().unwrap();
+        let mut cfg = crate::test_support::cfg();
+        let area = desktop::screen(desktop::cursor().unwrap(), 0).unwrap().work;
+        let point = POINT {
+            x: area.x + area.width / 2 + 3,
+            y: area.y + area.height / 2 + 3,
+        };
+        for mode in ["always", "selected", "off"] {
+            cfg.preview_mode = mode.into();
+            let mut preview = Preview::new().unwrap();
+            preview.interactive(std::ptr::null_mut(), &cfg).unwrap();
+            preview.follow(point, &cfg).unwrap();
+            assert_eq!(preview.hovered_name(), Some("5/9"));
+            assert_eq!(preview.candidate_position(), Some((1, 3)));
+            for _ in 0..3 {
+                assert!(preview.cycle(point, -30, &cfg).unwrap());
+                assert_eq!(preview.hovered_name(), Some("5/9"));
+            }
+            preview.cycle(point, -30, &cfg).unwrap();
+            assert_eq!(preview.hovered_name(), Some("4/4"));
+            preview.cycle(point, -120, &cfg).unwrap();
+            assert_eq!(preview.hovered_name(), Some("center"));
+            assert_eq!(preview.candidate_position(), Some((3, 3)));
+            assert_eq!(preview.count(), 0);
+            assert_eq!(preview.visible(), mode == "always");
+            // Slight motion and even crossing another candidate's edge keep the browsed region.
+            let inside = POINT {
+                x: area.x + area.width / 5,
+                y: area.y + area.height / 5,
+            };
+            let (name, rect) = preview.hit(inside, &cfg).unwrap().unwrap();
+            assert_eq!(name, "center");
+            preview.toggle(name, rect, &cfg).unwrap();
+            assert_eq!(preview.visible(), mode != "off");
+            assert_eq!(preview.selection_rect(), Some(rect));
+            preview.restyle(&cfg).unwrap();
+            assert_eq!(preview.hit(point, &cfg).unwrap().unwrap().0, "center");
+            preview.cycle(point, -120, &cfg).unwrap();
+            assert_eq!(preview.hovered_name(), Some("5/9"));
+            preview.cycle(point, 120, &cfg).unwrap();
+            assert_eq!(preview.hovered_name(), Some("center"));
+            assert_eq!(
+                preview.selection_rect(),
+                Some(rect),
+                "wheel must never change cumulative selection"
+            );
+            let first_number = preview.display.as_ref().unwrap().1.number;
+            if let Some(display) = desktop::displays()
+                .unwrap()
+                .iter()
+                .find(|d| d.number != first_number)
+            {
+                let second = POINT {
+                    x: display.work.x + display.work.width / 2 + 3,
+                    y: display.work.y + display.work.height / 2 + 3,
+                };
+                preview.follow(second, &cfg).unwrap();
+                assert_eq!(preview.hovered_name(), Some("5/9"));
+                assert!(preview.cycled.is_none());
+                preview.follow(point, &cfg).unwrap();
+            }
+            let outside = POINT {
+                x: area.x + 5,
+                y: area.y + 5,
+            };
+            preview.follow(outside, &cfg).unwrap();
+            assert_ne!(preview.hovered_name(), Some("center"));
+            preview.follow(point, &cfg).unwrap();
+            assert_eq!(preview.hovered_name(), Some("5/9"));
+            preview.cycle(point, -60, &cfg).unwrap();
+            desktop::invalidate_displays();
+            preview.follow(point, &cfg).unwrap();
+            preview.cycle(point, -60, &cfg).unwrap();
+            assert_eq!(
+                preview.hovered_name(),
+                Some("5/9"),
+                "display rebuild must reset wheel fractions"
+            );
+            preview.hide();
+            assert!(!preview.cycle(point, -120, &cfg).unwrap());
+            assert_eq!(
+                unsafe {
+                    windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible(
+                        preview.candidate_outline.0,
+                    )
+                },
+                0
+            );
+            preview.interactive(std::ptr::null_mut(), &cfg).unwrap();
+            preview.cycle(point, -60, &cfg).unwrap();
+            assert_eq!(preview.hovered_name(), Some("5/9"));
+        }
+        cfg.presets.retain(|name, _| name == "center");
+        let mut only_one = Preview::new().unwrap();
+        only_one.interactive(std::ptr::null_mut(), &cfg).unwrap();
+        only_one.follow(point, &cfg).unwrap();
+        assert_eq!(only_one.hovered_name(), Some("center"));
+        assert!(only_one.candidate_position().is_none());
+        assert!(!only_one.cycle(point, -120, &cfg).unwrap());
+        cfg = crate::test_support::cfg();
+        cfg.mouse_enabled = false;
+        let mut preview = Preview::new().unwrap();
+        preview.interactive(std::ptr::null_mut(), &cfg).unwrap();
+        preview.follow(point, &cfg).unwrap();
+        assert!(!preview.cycle(point, -120, &cfg).unwrap());
+        assert_eq!(preview.hovered_name(), Some("5/9"));
+    }
     #[test]
     #[ignore = "opens temporary previews to verify all three display modes across selection changes"]
     fn display_modes_apply_to_the_entire_selection_session() {

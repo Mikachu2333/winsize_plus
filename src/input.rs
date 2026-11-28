@@ -41,6 +41,7 @@ pub const POINTER_UP: u32 = WM_APP + 18;
 pub const CONFIRM: u32 = WM_APP + 19;
 pub const COMMAND_SUBMIT: u32 = WM_APP + 20;
 pub const COMMAND_CANCEL: u32 = WM_APP + 21;
+pub const REGION_WHEEL: u32 = WM_APP + 22;
 pub fn prompt_event(window: HWND, submit: bool) {
     post(
         if submit {
@@ -391,6 +392,13 @@ fn post_event(message: u32, wp: usize, lp: isize, point: Option<POINT>) -> bool 
     })
 }
 impl Input {
+    fn region_wheel(&self) -> bool {
+        !self.paused
+            && self.mode == Mode::Wait
+            && self.target_allowed
+            && self.gesture_mask != 0
+            && self.drag.is_none()
+    }
     fn cancel_hold(&mut self) {
         self.hold_started = None;
         self.hold_active = false;
@@ -935,6 +943,13 @@ unsafe extern "system" fn mouse(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
             let eaten = INPUT.with(|cell| {
                 cell.try_borrow_mut()
                     .is_ok_and(|mut input| match wp as u32 {
+                        WM_MOUSEWHEEL if input.region_wheel() => {
+                            let delta = (data.mouseData >> 16) as i16 as i32;
+                            if delta != 0 {
+                                post_event(REGION_WHEEL, delta as usize, 0, Some(data.pt));
+                            }
+                            true
+                        }
                         WM_MOUSEMOVE if input.guides || input.preview_tracking || input.drag.is_some()
                             || (input.cast_mouse && (input.cast_buttons!=0 || input.cast_wheel_time.is_some_and(|when|data.time.wrapping_sub(when)<600))) => {
                             input.point = data.pt;
@@ -1119,6 +1134,13 @@ pub fn click_point() -> POINT {
     CURRENT
         .with(Cell::get)
         .filter(|(kind, _)| matches!(*kind, CLICK | CENTER))
+        .map(|(_, point)| point)
+        .unwrap_or_default()
+}
+pub fn wheel_point() -> POINT {
+    CURRENT
+        .with(Cell::get)
+        .filter(|(kind, _)| *kind == REGION_WHEEL)
         .map(|(_, point)| point)
         .unwrap_or_default()
 }
@@ -1665,12 +1687,15 @@ pub(super) mod tests {
         }
     }
     pub fn enqueue_at(message: u32, at: super::Instant) {
+        enqueue_pointer_at(message, 0, super::POINT::default(), at);
+    }
+    pub fn enqueue_pointer_at(message: u32, wp: usize, point: super::POINT, at: super::Instant) {
         super::DEFERRED.with_borrow_mut(|events| {
             events.push_back(super::QueuedEvent {
                 message,
-                wp: 0,
+                wp,
                 lp: 0,
-                point: None,
+                point: Some(point),
                 at,
             })
         });
@@ -1705,6 +1730,88 @@ pub(super) mod tests {
         })
         .unwrap();
     }
+    pub fn session_wheel(point: super::POINT, delta: i16) {
+        use super::*;
+        on_hook(move || {
+            let data = MSLLHOOKSTRUCT {
+                pt: point,
+                mouseData: (delta as u16 as u32) << 16,
+                time: unsafe { GetTickCount() },
+                ..Default::default()
+            };
+            assert_eq!(
+                unsafe {
+                    mouse(
+                        HC_ACTION as i32,
+                        WM_MOUSEWHEEL as usize,
+                        (&data as *const _) as isize,
+                    )
+                },
+                1
+            );
+        })
+        .unwrap();
+    }
+    #[test]
+    fn wheel_capture_requires_selection_and_retains_each_delta_and_position() {
+        use super::*;
+        let _hooks = Hooks::escape_only().unwrap();
+        on_hook(|| {
+            INPUT.with_borrow_mut(|input| {
+                assert!(!input.region_wheel());
+                input.mode = Mode::Wait;
+                input.target_allowed = true;
+                input.gesture_mask = 1;
+                assert!(input.region_wheel());
+                input.paused = true;
+                assert!(!input.region_wheel());
+                input.paused = false;
+                input.gesture_mask = 0;
+                assert!(!input.region_wheel());
+                input.gesture_mask = 1;
+                input.target_allowed = false;
+                assert!(!input.region_wheel());
+                input.target_allowed = true;
+                for active in [false, true] {
+                    input.drag = Some(PointerAction {
+                        start: POINT::default(),
+                        button: 1,
+                        resize: active,
+                        draggable: true,
+                        active,
+                        canceled: false,
+                    });
+                    assert!(!input.region_wheel());
+                }
+                input.drag = None;
+                input.mode = Mode::Command;
+                assert!(!input.region_wheel());
+                input.mode = Mode::Wait;
+            });
+        })
+        .unwrap();
+        for (index, delta) in [-30, -30, -60, 120, -240].into_iter().enumerate() {
+            session_wheel(
+                POINT {
+                    x: -100 + index as i32,
+                    y: 250,
+                },
+                delta,
+            );
+        }
+        for (index, expected) in [-30, -30, -60, 120, -240].into_iter().enumerate() {
+            let event = next_event().unwrap();
+            assert_eq!(
+                (event.message, event.wParam as i32),
+                (REGION_WHEEL, expected)
+            );
+            assert_eq!(
+                (wheel_point().x, wheel_point().y),
+                (-100 + index as i32, 250)
+            );
+        }
+        assert!(next_event().is_none());
+    }
     pub fn session_click(point: super::POINT, right: bool) {
         use super::*;
         on_hook(move || {
@@ -1732,6 +1839,87 @@ pub(super) mod tests {
         })
         .unwrap();
     }
+    #[test]
+    #[ignore = "opens a temporary scrollable tip to verify mouse wheel routing before region browsing"]
+    fn wheel_over_scrollable_tip_is_not_used_to_cycle_regions() {
+        use super::*;
+        let _hooks = Hooks::escape_only().unwrap();
+        on_hook(|| {
+            let area = desktop::screen(desktop::cursor().unwrap(), 0).unwrap().work;
+            // SAFETY: this temporary window and callback data remain on the hook
+            // thread and are destroyed after the posted wheel message is inspected.
+            unsafe {
+                let class = windows_sys::core::w!("WinSizeP.WheelTipTest");
+                let instance = GetModuleHandleW(null());
+                let wc = WNDCLASSW {
+                    lpfnWndProc: Some(DefWindowProcW),
+                    hInstance: instance,
+                    lpszClassName: class,
+                    ..Default::default()
+                };
+                assert_ne!(RegisterClassW(&wc), 0);
+                let window = CreateWindowExW(
+                    WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+                    class,
+                    windows_sys::core::w!("Temporary scrolling tip"),
+                    WS_POPUP | WS_VISIBLE,
+                    area.x + 20,
+                    area.y + 20,
+                    100,
+                    80,
+                    null_mut(),
+                    null_mut(),
+                    GetModuleHandleW(null()),
+                    null(),
+                );
+                assert!(!window.is_null());
+                let data = MSLLHOOKSTRUCT {
+                    pt: POINT {
+                        x: area.x + 30,
+                        y: area.y + 30,
+                    },
+                    mouseData: ((-120i16) as u16 as u32) << 16,
+                    time: GetTickCount(),
+                    ..Default::default()
+                };
+                INPUT.with_borrow_mut(|input| {
+                    input.mode = Mode::Wait;
+                    input.target_allowed = true;
+                    input.gesture_mask = 1;
+                    input.tip_scrollable = true;
+                    input.tip_window = window as usize;
+                });
+                let result = mouse(
+                    HC_ACTION as i32,
+                    WM_MOUSEWHEEL as usize,
+                    (&data as *const _) as isize,
+                );
+                let mut message = MSG::default();
+                let posted = PeekMessageW(
+                    &mut message,
+                    window,
+                    WM_MOUSEWHEEL,
+                    WM_MOUSEWHEEL,
+                    PM_REMOVE,
+                );
+                INPUT.with_borrow_mut(|input| {
+                    input.tip_scrollable = false;
+                    input.tip_window = 0;
+                });
+                DestroyWindow(window);
+                UnregisterClassW(class, instance);
+                assert_eq!(result, 1);
+                assert_ne!(posted, 0);
+                assert_eq!((message.wParam >> 16) as i16, -120);
+            }
+        })
+        .unwrap();
+        assert!(
+            next_event().is_none(),
+            "tip scrolling must not also browse regions"
+        );
+    }
+
     #[test]
     fn configured_hold_delay_keeps_the_saved_value_and_handles_boundaries() {
         use super::*;

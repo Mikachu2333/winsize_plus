@@ -112,10 +112,24 @@ impl App {
             return Ok(());
         }
         let count = self.preview.count();
+        let candidate = self.preview.hovered_name().map(|name| {
+            let name = self.cfg.display_name(name);
+            match self
+                .preview
+                .candidate_position()
+                .filter(|_| self.cfg.mouse_enabled)
+            {
+                Some((position, total)) => format!(
+                    "{name} · {position}/{total} · {}",
+                    self.cfg.tr("Wheel to switch", "滚轮切换")
+                ),
+                None => name.to_owned(),
+            }
+        });
         let text = if count == 0 {
             let mut parts = Vec::new();
-            if let Some(name) = self.preview.hovered_name() {
-                parts.push(self.cfg.display_name(name).to_owned());
+            if let Some(candidate) = candidate {
+                parts.push(candidate);
             }
             if self.cfg.mouse_enabled {
                 for (button, en, zh) in [
@@ -177,6 +191,10 @@ impl App {
                 if !help.is_empty() {
                     text.push('\n');
                     text.push_str(&help.join(" · "));
+                }
+                if let Some(candidate) = candidate {
+                    text.push('\n');
+                    text.push_str(&candidate);
                 }
             }
             text
@@ -626,6 +644,7 @@ impl App {
                 | input::ACTION
                 | input::DRAG_START
                 | input::CENTER
+                | input::REGION_WHEEL
         ) && !(msg.message == input::ACTION
             && self
                 .cfg
@@ -643,7 +662,7 @@ impl App {
             return Ok(());
         }
         if self.paused
-            && (input::ARMED..=input::COMMAND_CANCEL).contains(&msg.message)
+            && (input::ARMED..=input::REGION_WHEEL).contains(&msg.message)
             && msg.message != input::DISPLAY_CHANGED
         {
             return Ok(());
@@ -683,6 +702,27 @@ impl App {
             input::TIP_SCROLL => {
                 self.overlay.scroll_tip(msg.wParam as i32);
                 self.hide = None;
+                Ok(())
+            }
+            input::REGION_WHEEL => {
+                if self.held_window.is_some()
+                    && self.cfg.mouse_enabled
+                    && self.drag.is_none()
+                    && self.selection_suspended.is_none()
+                    && self
+                        .preview
+                        .cycle(input::wheel_point(), msg.wParam as i32, &self.cfg)?
+                {
+                    self.preview_until = Some(
+                        occurred
+                            + Duration::from_millis(if self.preview.count() == 0 {
+                                10_000
+                            } else {
+                                3000
+                            }),
+                    );
+                    self.selection_tip()?;
+                }
                 Ok(())
             }
             input::DISPLAY_CHANGED => {
@@ -1341,6 +1381,66 @@ mod tests {
         .unwrap();
         assert_eq!(app.overlay.tip_text(), notice);
         app.act("pause").unwrap();
+    }
+
+    #[test]
+    #[ignore = "replays timestamped wheel events against selection deadlines using temporary overlays"]
+    fn wheel_refreshes_deadlines_without_selecting_and_cannot_revive_expired_session() {
+        let _dpi = crate::test_support::Dpi::new();
+        let _hooks = input::Hooks::start(&crate::test_support::cfg()).unwrap();
+        let mut app = test_app();
+        app.begin_alt_preview(unsafe { GetForegroundWindow() }, false)
+            .unwrap();
+        let area = desktop::screen(desktop::cursor().unwrap(), 0).unwrap().work;
+        let point = POINT {
+            x: area.x + area.width / 2 + 3,
+            y: area.y + area.height / 2 + 3,
+        };
+        let now = Instant::now();
+        let first = now - Duration::from_millis(20);
+        app.preview_until = Some(now - Duration::from_millis(10));
+        input::tests::enqueue_pointer_at(input::REGION_WHEEL, (-30i32) as usize, point, first);
+        let event = input::next_event().unwrap();
+        app.handle_event(event).unwrap();
+        assert_eq!(app.preview_until, Some(first + Duration::from_secs(10)));
+        assert_eq!(app.preview.hovered_name(), Some("5/9"));
+        assert_eq!(app.preview.count(), 0);
+        assert!(app.overlay.tip_text().contains("1/3"));
+        let (name, rect) = app.preview.hit(point, &app.cfg).unwrap().unwrap();
+        app.preview.toggle(name, rect, &app.cfg).unwrap();
+        input::tests::enqueue_pointer_at(input::REGION_WHEEL, (-90i32) as usize, point, now);
+        let event = input::next_event().unwrap();
+        app.handle_event(event).unwrap();
+        assert_eq!(app.preview_until, Some(now + Duration::from_secs(3)));
+        assert_eq!(app.preview.hovered_name(), Some("4/4"));
+        assert_eq!(app.preview.selection_rect(), Some(rect));
+        let deadline = app.preview_until;
+        input::tests::enqueue_at(input::TIP_SCROLL, now);
+        let event = input::next_event().unwrap();
+        app.handle_event(event).unwrap();
+        assert_eq!(app.preview_until, deadline);
+        app.selection_suspended = Some(Duration::from_millis(500));
+        app.preview_until = None;
+        input::tests::enqueue_pointer_at(input::REGION_WHEEL, (-120i32) as usize, point, now);
+        let event = input::next_event().unwrap();
+        app.handle_event(event).unwrap();
+        assert_eq!(app.preview.hovered_name(), Some("4/4"));
+        assert_eq!(app.selection_suspended, Some(Duration::from_millis(500)));
+        assert!(app.preview_until.is_none());
+        // Use an empty new session so expiry cannot move an unrelated desktop window.
+        app.begin_alt_preview(unsafe { GetForegroundWindow() }, false)
+            .unwrap();
+        app.preview_until = Some(now);
+        input::tests::enqueue_pointer_at(
+            input::REGION_WHEEL,
+            (-120i32) as usize,
+            point,
+            now + Duration::from_millis(1),
+        );
+        let event = input::next_event().unwrap();
+        app.handle_event(event).unwrap();
+        assert!(app.expired_selection && !app.preview.active());
+        assert!(app.preview_until.is_none());
     }
 
     #[test]
@@ -2005,6 +2105,44 @@ mod tests {
                 drain(&mut app);
                 assert!(!app.preview.visible());
                 assert_eq!(desktop::bounds(target).unwrap().1, before);
+
+                // Browsing keeps the cumulative set; the right click still applies
+                // only the current candidate, for both hold and double-tap activation.
+                input::tests::activate_session(double);
+                drain(&mut app);
+                input::tests::session_click(a, false);
+                drain(&mut app);
+                let chosen = app.preview.selection_rect();
+                let center = POINT {
+                    x: work.x + work.width / 2 + 3,
+                    y: work.y + work.height / 2 + 3,
+                };
+                input::tests::session_wheel(center, -120);
+                drain(&mut app);
+                assert_eq!(app.preview.hovered_name(), Some("4/4"));
+                input::tests::session_wheel(center, -120);
+                drain(&mut app);
+                assert_eq!(app.preview.hovered_name(), Some("center"));
+                assert_eq!(app.preview.selection_rect(), chosen);
+                assert!(app.overlay.tip_text().contains("3/3"));
+                assert_eq!(desktop::bounds(target).unwrap().1, before);
+                input::tests::session_click(center, false);
+                drain(&mut app);
+                assert_eq!(app.preview.count(), 2);
+                assert_eq!(app.preview.hovered_name(), Some("center"));
+                input::tests::session_click(
+                    POINT {
+                        x: center.x + 1,
+                        y: center.y + 1,
+                    },
+                    true,
+                );
+                drain(&mut app);
+                let expected = app.cfg.presets["center"]
+                    .resolve(work, before, desktop::desktop())
+                    .unwrap();
+                assert_eq!(desktop::bounds(target).unwrap().1, expected);
+                assert!(!app.preview.active());
             }
         });
         let _ = child.kill();

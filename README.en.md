@@ -15,6 +15,7 @@ Run `winsizep.exe`. Open Settings or pause input capture from the tray menu.
 | Left drag / right drag | Move / resize the window |
 | Left-click a region | Add or remove a selection; Enter applies |
 | Right-click a region | Apply the region immediately |
+| Mouse wheel | Cycle through overlapping regions under the pointer |
 | Drag a highlighted shared edge | Resize adjacent windows together |
 | Q/W/E, A/S/D, Z/X/C | Select one of nine default regions |
 | Top-row 1–4 | Select one of four default regions |
