@@ -545,6 +545,7 @@ impl Drag {
         }
     }
 }
+#[cfg(test)]
 pub(crate) fn set_frames(wanted: &[(HWND, Rect)]) -> Result<(), String> {
     // Validate every participant before posting any move. Coordinates are converted
     // from visible frames using each window's own invisible resize margins.
@@ -680,7 +681,7 @@ fn position(hwnd: HWND, req: &Request, cfg: &Config, point: POINT) -> Result<(),
     }
 }
 
-fn frame_position(wanted: Rect, outer: Rect, frame: Rect) -> Result<Rect, String> {
+pub(crate) fn frame_position(wanted: Rect, outer: Rect, frame: Rect) -> Result<Rect, String> {
     let overflow = "Invalid rectangle / 矩形越界";
     let offset = |value: i32, raw: i32, visible: i32| {
         i32::try_from(i64::from(value) + i64::from(raw) - i64::from(visible)).map_err(|_| overflow)

@@ -1,4 +1,5 @@
 use crate::{config::Config, desktop, layout::Rect, overlay::Panel};
+mod updates;
 use std::{
     cell::Cell,
     ptr::from_mut,
@@ -355,6 +356,7 @@ impl Hint {
 }
 struct Member {
     window: Window,
+    outer: Rect,
     before: bool,
     min: i64,
     max: i64,
@@ -364,6 +366,7 @@ pub struct Drag {
     members: Vec<Member>,
     origin: POINT,
     last_delta: Cell<Option<i64>>,
+    updates: updates::Updates,
 }
 impl Drag {
     pub fn start(origin: POINT, point: POINT, cfg: &Config) -> Result<Option<Self>, String> {
@@ -421,6 +424,7 @@ impl Drag {
             };
             members.push(Member {
                 window,
+                outer,
                 before,
                 min: i64::from((min - border).max(1)),
                 max: if max > 0 {
@@ -435,6 +439,7 @@ impl Drag {
             members,
             origin,
             last_delta: Cell::new(None),
+            updates: updates::Updates::new()?,
         }))
     }
     fn delta(&self, point: POINT) -> i64 {
@@ -469,22 +474,24 @@ impl Drag {
             .members
             .iter()
             .map(|m| {
-                (
-                    m.window.hwnd,
+                desktop::frame_position(
                     resize(m.window.rect, self.axis, m.before, delta),
+                    m.outer,
+                    m.window.rect,
                 )
+                .map(|rect| (m.window.hwnd as usize, rect))
             })
-            .collect::<Vec<_>>();
-        desktop::set_frames(&wanted)?;
+            .collect::<Result<Vec<_>, String>>()?;
+        self.updates.submit(wanted)?;
         self.last_delta.set(Some(delta));
         Ok(())
     }
     pub fn cancel(&self) -> Result<(), String> {
-        desktop::set_frames(
-            &self
-                .members
+        self.last_delta.set(None);
+        self.updates.submit(
+            self.members
                 .iter()
-                .map(|m| (m.window.hwnd, m.window.rect))
+                .map(|m| (m.window.hwnd as usize, m.outer))
                 .collect::<Vec<_>>(),
         )
     }
@@ -611,6 +618,29 @@ mod tests {
         let _dpi = crate::test_support::Dpi::new();
         unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
             unsafe {
+                if msg == WM_APP + 71 {
+                    SetPropW(hwnd, windows_sys::core::w!("TestResizeDelay"), wp as HANDLE);
+                    SetPropW(
+                        hwnd,
+                        windows_sys::core::w!("TestResizeCount"),
+                        std::ptr::null_mut(),
+                    );
+                    return 0;
+                }
+                if msg == WM_WINDOWPOSCHANGING
+                    && (*(lp as *const WINDOWPOS)).flags & SWP_NOSIZE == 0
+                {
+                    let count = GetPropW(hwnd, windows_sys::core::w!("TestResizeCount")) as usize;
+                    SetPropW(
+                        hwnd,
+                        windows_sys::core::w!("TestResizeCount"),
+                        (count + 1) as HANDLE,
+                    );
+                    let delay = GetPropW(hwnd, windows_sys::core::w!("TestResizeDelay")) as usize;
+                    if delay != 0 {
+                        std::thread::sleep(Duration::from_millis(delay as u64));
+                    }
+                }
                 if msg == WM_GETMINMAXINFO {
                     let delay = GetPropW(hwnd, windows_sys::core::w!("TestLimitsDelay")) as usize;
                     if delay != 0 {
@@ -814,6 +844,59 @@ mod tests {
             drag.cancel().unwrap();
             settle(&placements);
             let mut single_cfg = crate::test_support::cfg();
+            // A slow passive window must see the newest rectangle, not a backlog
+            // of every intermediate mouse position queued by SWP_ASYNCWINDOWPOS.
+            unsafe {
+                SendMessageW(handles[2], WM_APP + 71, 40, 0);
+            }
+            let start = Instant::now();
+            for delta in 1..=40 {
+                drag.follow(POINT {
+                    x: origin.x + delta,
+                    y: origin.y,
+                })
+                .unwrap();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let issued = start.elapsed();
+            let latest = [
+                (handles[0], original[0]),
+                (handles[1], resize(original[1], Axis::X, true, 40)),
+                (handles[2], resize(original[2], Axis::X, false, 40)),
+            ];
+            let final_started = Instant::now();
+            settle(&latest);
+            let catchup = final_started.elapsed();
+            let count =
+                unsafe { GetPropW(handles[2], windows_sys::core::w!("TestResizeCount")) as usize };
+            println!(
+                "slow linked drag: issued_ms={} catchup_ms={} passive_resize_count={count}",
+                issued.as_millis(),
+                catchup.as_millis()
+            );
+            assert!(
+                count < 20,
+                "outdated rectangles were not coalesced: {count}"
+            );
+            // Cancellation replaces an in-flight backlog, and dropping the drag
+            // still lets its final restore complete without a later stale move.
+            for delta in 41..=65 {
+                drag.follow(POINT {
+                    x: origin.x + delta,
+                    y: origin.y,
+                })
+                .unwrap();
+            }
+            drag.cancel().unwrap();
+            drop(drag);
+            settle(&placements);
+            unsafe {
+                SendMessageW(handles[2], WM_APP + 71, 0, 0);
+            }
+            assert!(
+                catchup < Duration::from_millis(600),
+                "passive window drained stale resize requests: {catchup:?}"
+            );
             single_cfg.linked_resize = false;
             for resizing in [false, true] {
                 let origin = POINT {
@@ -858,14 +941,17 @@ mod tests {
             axis: Axis::X,
             origin: POINT { x: 500, y: 0 },
             last_delta: Cell::new(None),
+            updates: updates::Updates::new().unwrap(),
             members: vec![
                 Member {
+                    outer: Rect::default(),
                     window: window(0, 0, 500, 400),
                     before: true,
                     min: 100,
                     max: 1000,
                 },
                 Member {
+                    outer: Rect::default(),
                     window: window(503, 0, 500, 400),
                     before: false,
                     min: 300,
