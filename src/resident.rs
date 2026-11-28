@@ -53,6 +53,7 @@ struct App {
     overlay: Overlay,
     tray: crate::tray::Tray,
     frames: FrameClock,
+    drag_frames: FrameClock,
     preview: Preview,
     neighbors: crate::neighbors::Hint,
     held_window: Option<HWND>,
@@ -830,7 +831,12 @@ impl App {
                 {
                     self.neighbors.follow(point, &self.cfg)?;
                 }
-                if (self.overlay.mode() != 0 || self.drag.is_some())
+                if self.drag.is_some()
+                    && let Some(frame) = self.drag_frames.moved(point)?
+                {
+                    self.follow_drag(frame)?;
+                }
+                if self.overlay.mode() != 0
                     && let Some(frame) = self.frames.moved(point)?
                 {
                     self.follow_frame(frame)?;
@@ -910,12 +916,12 @@ impl App {
                 };
                 self.close_preview()?;
                 self.clear();
-                self.frames.reset(self.cfg.fps);
-                self.follow_frame(desktop::cursor()?)
+                self.drag_frames.reset(120.0);
+                self.follow_drag(desktop::cursor()?)
             }
             input::DRAG_END => {
                 let drag = self.drag.take();
-                self.frames.reset(self.cfg.fps);
+                self.drag_frames.reset(120.0);
                 let point = input::moved();
                 // End the gesture even if its final move fails (closed target,
                 // denied operation or drawing error). A failure must not re-arm it.
@@ -925,6 +931,7 @@ impl App {
             }
             input::CANCEL => {
                 input::cancel();
+                self.drag_frames.reset(120.0);
                 if let Some(drag) = self.drag.take() {
                     drag.cancel()?;
                 }
@@ -946,10 +953,13 @@ impl App {
         }
     }
     fn follow_frame(&mut self, point: POINT) -> Result<(), String> {
+        self.overlay.follow(point, &self.cfg)
+    }
+    fn follow_drag(&mut self, point: POINT) -> Result<(), String> {
         if let Some(drag) = &self.drag {
             drag.follow(point)?;
         }
-        self.overlay.follow(point, &self.cfg)
+        Ok(())
     }
     fn deadlines(&mut self) -> Result<(), String> {
         self.topmost.poll()?;
@@ -1086,6 +1096,7 @@ pub fn run(
             mousecast: cfg.mousecast.enabled,
             keycast: cfg.keycast.enabled,
             frames: FrameClock::new(cfg.fps)?,
+            drag_frames: FrameClock::new(120.0)?,
             cfg,
             path: path.into(),
             overlay,
@@ -1170,16 +1181,17 @@ pub fn run(
             let handles = [
                 watch.as_ref().map_or(null_mut(), |watch| watch.0),
                 app.frames.handle(),
+                app.drag_frames.handle(),
             ];
             let skipped = usize::from(watch.is_none());
             let signaled = MsgWaitForMultipleObjectsEx(
-                (2 - skipped) as u32,
+                (3 - skipped) as u32,
                 handles[skipped..].as_ptr(),
                 timeout,
                 QS_ALLINPUT,
                 MWMO_INPUTAVAILABLE,
             );
-            let signaled = if signaled < WAIT_OBJECT_0 + 3 {
+            let signaled = if signaled < WAIT_OBJECT_0 + 4 {
                 signaled + skipped as u32
             } else {
                 signaled
@@ -1207,6 +1219,13 @@ pub fn run(
                     }
                 }
                 value if value == WAIT_OBJECT_0 + 2 => {
+                    if let Some(point) = app.drag_frames.tick()
+                        && let Err(problem) = app.follow_drag(point)
+                    {
+                        let _ = app.notice(&problem);
+                    }
+                }
+                value if value == WAIT_OBJECT_0 + 3 => {
                     for _ in 0..64 {
                         if PeekMessageW(&mut msg, null_mut(), 0, 0, PM_REMOVE) == 0 {
                             break;
@@ -1251,6 +1270,7 @@ mod tests {
             mousecast: false,
             keycast: false,
             frames: FrameClock::new(cfg.fps).unwrap(),
+            drag_frames: FrameClock::new(120.0).unwrap(),
             cfg,
             path: PathBuf::new(),
             overlay: Overlay::new().unwrap(),
@@ -1742,6 +1762,7 @@ mod tests {
             mousecast: false,
             keycast: false,
             frames: FrameClock::new(cfg.fps).unwrap(),
+            drag_frames: FrameClock::new(120.0).unwrap(),
             cfg,
             path: PathBuf::new(),
             overlay,
@@ -1835,6 +1856,7 @@ mod tests {
             mousecast: false,
             keycast: false,
             frames: FrameClock::new(cfg.fps).unwrap(),
+            drag_frames: FrameClock::new(120.0).unwrap(),
             cfg,
             path: path.clone(),
             overlay,
