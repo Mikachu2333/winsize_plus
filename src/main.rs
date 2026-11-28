@@ -10,6 +10,7 @@ mod desktop;
 mod fonts;
 mod framerate;
 mod handoff;
+mod identity;
 mod input;
 mod label_text;
 mod launch;

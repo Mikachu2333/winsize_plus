@@ -34,7 +34,7 @@ use windows_sys::{
     },
     core::w,
 };
-const CLASS: *const u16 = w!("WinSizeP.Settings");
+const CLASS: *const u16 = crate::identity::SETTINGS_CLASS;
 const PANE: *const u16 = w!("WinSizeP.Settings.Pane");
 const BASE: i32 = 2000;
 const STRIDE: i32 = 16;
@@ -1255,7 +1255,11 @@ impl Editor {
         }
         set_text(
             self.window.0,
-            self.cfg.tr("WinSizeP Settings", "WinSizeP 设置"),
+            &format!(
+                "{} {}",
+                crate::identity::NAME,
+                self.cfg.tr("Settings", "设置")
+            ),
         );
         for (i, hwnd) in self.axis_controls.iter().enumerate() {
             set_text(
@@ -3932,11 +3936,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
 }
 pub fn run(path: &Path) -> Result<(), String> {
     unsafe {
-        let mutex = CreateMutexW(
-            null(),
-            0,
-            w!("Local\\D5C9A59069D907909B153C76CEBDC023.Settings"),
-        );
+        let mutex = CreateMutexW(null(), 0, crate::identity::mutex(true).as_ptr());
         if mutex.is_null() {
             return Err(err());
         }

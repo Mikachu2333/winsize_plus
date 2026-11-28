@@ -12,12 +12,11 @@ use std::{
     ptr::{null, null_mut},
     time::{Duration, Instant},
 };
-use windows_sys::{
-    Win32::{
-        Foundation::*, Storage::FileSystem::*, System::Threading::*, UI::WindowsAndMessaging::*,
-    },
-    core::w,
+use windows_sys::Win32::{
+    Foundation::*, Storage::FileSystem::*, System::Threading::*, UI::WindowsAndMessaging::*,
 };
+#[cfg(test)]
+use windows_sys::core::w;
 #[cfg(test)]
 use {crate::desktop::wide, std::fs};
 
@@ -878,7 +877,7 @@ pub fn running() -> bool {
         let handle = OpenMutexW(
             SYNCHRONIZATION_SYNCHRONIZE,
             0,
-            w!("Local\\D5C9A59069D907909B153C76CEBDC023"),
+            crate::identity::mutex(false).as_ptr(),
         );
         if handle.is_null() {
             return GetLastError() == ERROR_ACCESS_DENIED;
@@ -895,7 +894,7 @@ pub fn run(
     fallback: &mut Option<Config>,
 ) -> Result<crate::ResidentExit, String> {
     unsafe {
-        let handle = CreateMutexW(null(), 0, w!("Local\\D5C9A59069D907909B153C76CEBDC023"));
+        let handle = CreateMutexW(null(), 0, crate::identity::mutex(false).as_ptr());
         if handle.is_null() {
             if GetLastError() == ERROR_ACCESS_DENIED && running() {
                 return Ok(crate::ResidentExit::Quit);
@@ -1438,7 +1437,7 @@ mod tests {
     #[test]
     #[ignore = "opens a temporary settings process and exercises the tray Quit action"]
     fn tray_quit_closes_settings() {
-        let class = w!("WinSizeP.Settings");
+        let class = crate::identity::SETTINGS_CLASS;
         assert!(
             unsafe { FindWindowW(class, null()) }.is_null(),
             "Close existing settings before running this integration test"

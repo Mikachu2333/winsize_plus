@@ -102,7 +102,8 @@ impl Drop for Apartment {
 
 pub fn sync_direct(enabled: bool, elevated: bool, owner: &str) -> Result<(), windows::core::Error> {
     let name = BSTR::from(format!(
-        "WinSizeP-{}",
+        "{}-{}",
+        crate::identity::NAME.replace(' ', "-"),
         owner.replace('!', "!!").replace('\\', "!")
     ));
     let task = if enabled {

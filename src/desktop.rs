@@ -323,7 +323,7 @@ fn eligible(hwnd: HWND) -> bool {
             || hwnd == GetShellWindow()
             || pid(hwnd) == std::process::id()
             // Settings run in a separate process; owned native dialogs share its root owner.
-            || class(GetAncestor(hwnd, GA_ROOTOWNER)) == "WinSizeP.Settings"
+            || crate::identity::settings_class(&class(GetAncestor(hwnd, GA_ROOTOWNER)))
         {
             return false;
         }
@@ -1176,8 +1176,7 @@ mod tests {
     #[ignore = "read-only exclusion check against an already-open settings window"]
     fn open_settings_are_excluded() {
         // SAFETY: only query handles and window metadata; the existing UI is left untouched.
-        let window =
-            unsafe { FindWindowW(windows_sys::core::w!("WinSizeP.Settings"), std::ptr::null()) };
+        let window = unsafe { FindWindowW(crate::identity::SETTINGS_CLASS, std::ptr::null()) };
         assert!(
             !window.is_null(),
             "Open settings before this read-only check"
