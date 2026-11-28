@@ -1418,6 +1418,51 @@ mod multi_monitor_regressions {
     }
 
     #[test]
+    #[ignore = "measures same-monitor positioning latency on a responsive and deliberately busy temporary window"]
+    fn measure_positioning_wait_on_responsive_and_busy_windows() {
+        let _dpi = Dpi::new();
+        let display = displays().remove(0).1;
+        for busy in [false, true] {
+            let (handle, worker, events) = target(&display, 0);
+            let hwnd = handle as HWND;
+            if busy {
+                unsafe {
+                    PostMessageW(hwnd, WM_APP + 77, 0, 0);
+                }
+                let deadline = Instant::now() + Duration::from_secs(1);
+                while events.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+            let started = Instant::now();
+            let req = Request {
+                x: Some(display.work.x + 70),
+                y: Some(display.work.y + 70),
+                size: Some((600, 400)),
+                ..Default::default()
+            };
+            let result = position(hwnd, &req, &crate::test_support::cfg(), point(&display));
+            let elapsed = started.elapsed();
+            let actual = bounds(hwnd).unwrap().1;
+            unsafe {
+                PostMessageW(hwnd, WM_CLOSE, 0, 0);
+            }
+            worker.join().unwrap();
+            result.unwrap();
+            assert_eq!(
+                actual,
+                Rect {
+                    x: display.work.x + 70,
+                    y: display.work.y + 70,
+                    width: 600,
+                    height: 400
+                }
+            );
+            println!("position busy={busy} elapsed_ms={}", elapsed.as_millis());
+        }
+    }
+
+    #[test]
     #[ignore = "requires an interactive desktop; some cases need mixed DPI monitors"]
     fn position_corrects_immediate_cross_dpi_target() {
         let Some((result, wanted, actual, _)) = probe(0, false) else {

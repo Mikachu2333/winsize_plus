@@ -570,6 +570,10 @@ mod tests {
         unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
             unsafe {
                 if msg == WM_GETMINMAXINFO {
+                    let delay = GetPropW(hwnd, windows_sys::core::w!("TestLimitsDelay")) as usize;
+                    if delay != 0 {
+                        std::thread::sleep(Duration::from_millis(delay as u64));
+                    }
                     let info = &mut *(lp as *mut MINMAXINFO);
                     info.ptMinTrackSize = POINT { x: 100, y: 100 };
                     info.ptMaxTrackSize = POINT { x: 10000, y: 10000 };
@@ -606,6 +610,15 @@ mod tests {
                     std::ptr::null(),
                 );
                 assert!(!hwnd.is_null());
+                let delay = std::env::var("WINSIZEP_LINKED_DELAY")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(0);
+                SetPropW(
+                    hwnd,
+                    windows_sys::core::w!("TestLimitsDelay"),
+                    delay as HANDLE,
+                );
                 windows.push(hwnd);
             }
         }
@@ -718,9 +731,15 @@ mod tests {
                 x: origin.x,
                 y: origin.y + 20,
             };
+            let started = Instant::now();
             let drag = Drag::start(origin, point, &cfg)
                 .unwrap()
                 .expect("horizontal seam");
+            println!(
+                "linked start members={} elapsed_ms={}",
+                drag.members.len(),
+                started.elapsed().as_millis()
+            );
             assert_eq!(drag.members.len(), 3);
             drag.follow(point).unwrap();
             let expected: Vec<_> = handles
