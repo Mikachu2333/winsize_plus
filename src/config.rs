@@ -1947,7 +1947,7 @@ mod tests {
         assert_eq!(cfg.preview_mode, "always");
         assert!(cfg.mouse_enabled);
         assert_eq!(doc["tip"]["show"].as_str(), Some("obsolete"));
-        let fields = crate::settings_schema::fields(1, 0, &cfg, &doc);
+        let fields = crate::settings::schema::fields(1, 0, &cfg, &doc);
         assert!(
             !fields
                 .iter()
@@ -2321,7 +2321,7 @@ My = "Center"
             assert!(doc[section].get("fade_ms").is_none());
         }
         assert!(
-            !crate::settings_schema::fields(8, 0, &cfg, &doc)
+            !crate::settings::schema::fields(8, 0, &cfg, &doc)
                 .iter()
                 .any(|field| field.key == "fade_ms")
         );
@@ -2340,7 +2340,7 @@ My = "Center"
         assert_eq!(cfg.alt, "left");
         assert!(cfg.mouse_enabled);
         assert_eq!(cfg.move_button, Some(1));
-        let fields = crate::settings_schema::fields(4, 0, &cfg, &doc);
+        let fields = crate::settings::schema::fields(4, 0, &cfg, &doc);
         assert_eq!(
             fields
                 .iter()

@@ -67,7 +67,7 @@
 
 ### 4．设置里的预览还保留两秒后隐藏其余框线的行为
 
-位置：`src/preview.rs` 的 `follow`、`reset`；`src/settings.rs` 的 `render`、`escape`。
+位置：`src/preview.rs` 的 `follow`、`reset`；`src/settings/mod.rs` 的 `render`、`escape`。
 
 实际 Alt 操作使用 `interactive` 模式，悬停不会在两秒后隐藏其他区域。设置里的分区／框线／选择预览使用普通模式，仍会在同一区域停留两秒后聚焦该区域；此时第一次 Esc 恢复全部框线，第二次才关闭。因此两个界面的悬停和退出体验不同。
 
@@ -91,7 +91,7 @@
 
 ### 7．设置更改经过两段防抖后，会中断正在进行的选区
 
-位置：`src/settings.rs` 的 `command`、`save`；`src/resident.rs` 的文件监听分支和 `load`。
+位置：`src/settings/mod.rs` 的 `command`、`save`；`src/resident.rs` 的文件监听分支和 `load`。
 
 开关／列表更改先等待 450 ms 保存，再等待常驻进程 160 ms 文件防抖，另有设置主计时器的调度粒度。配置真正载入时会取消输入状态并关闭预览。这样在选择期间，即使只改了字体或颜色，也会在设置操作之后延迟中断选区。
 

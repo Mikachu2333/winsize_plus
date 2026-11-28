@@ -1889,7 +1889,7 @@ mod tests {
                     let doc = config::read_settings(&path)?
                         .parse::<toml_edit::DocumentMut>()
                         .map_err(|error| error.to_string())?;
-                    let index = crate::settings_schema::fields(1, 0, &app.cfg, &doc)
+                    let index = crate::settings::schema::fields(1, 0, &app.cfg, &doc)
                         .iter()
                         .position(|field| field.key == "foreground")
                         .ok_or("Text color setting missing")?;

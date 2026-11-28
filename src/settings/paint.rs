@@ -33,14 +33,14 @@ pub fn draw(root: HWND, draw: &DRAWITEMSTRUCT) {
         let saved = SaveDC(dc);
         SetBkMode(dc, TRANSPARENT as i32);
         if draw.CtlID == 703 {
-            FillRect(dc, &rect, crate::settings_theme::control());
+            FillRect(dc, &rect, crate::settings::theme::control());
             FrameRect(
                 dc,
                 &rect,
                 if GetFocus() == GetDlgItem(root, 700) {
                     GetSysColorBrush(COLOR_HIGHLIGHT)
                 } else {
-                    crate::settings_theme::edge()
+                    crate::settings::theme::edge()
                 },
             );
         } else if draw.CtlID == 600 {
@@ -62,8 +62,8 @@ pub fn draw(root: HWND, draw: &DRAWITEMSTRUCT) {
                 ExtSelectClipRgn(dc, region, RGN_AND);
                 DeleteObject(region);
             }
-            FillRect(dc, &rect, crate::settings_theme::notice());
-            SetTextColor(dc, crate::settings_theme::notice_text());
+            FillRect(dc, &rect, crate::settings::theme::notice());
+            SetTextColor(dc, crate::settings::theme::notice_text());
             rect.left += scale(6);
             rect.right -= scale(6);
             rect.top += scale(4);
@@ -76,7 +76,7 @@ pub fn draw(root: HWND, draw: &DRAWITEMSTRUCT) {
                 DT_LEFT | DT_WORDBREAK | DT_NOPREFIX,
             );
         } else if !GetPropW(draw.hwndItem, w!("Separator")).is_null() {
-            FillRect(dc, &rect, crate::settings_theme::edge());
+            FillRect(dc, &rect, crate::settings::theme::edge());
         } else if matches!(draw.CtlType, ODT_COMBOBOX | ODT_LISTBOX) {
             let selected = draw.itemState & ODS_SELECTED != 0;
             FillRect(
@@ -97,11 +97,11 @@ pub fn draw(root: HWND, draw: &DRAWITEMSTRUCT) {
                 }),
             );
             if !selected {
-                FillRect(dc, &rect, crate::settings_theme::control());
-                SetTextColor(dc, crate::settings_theme::text());
+                FillRect(dc, &rect, crate::settings::theme::control());
+                SetTextColor(dc, crate::settings::theme::text());
             }
             if draw.itemState & ODS_DISABLED != 0 || IsWindowEnabled(draw.hwndItem) == 0 {
-                SetTextColor(dc, crate::settings_theme::hint());
+                SetTextColor(dc, crate::settings::theme::hint());
             }
             if draw.itemID != u32::MAX {
                 let (get_length, get_text) = if draw.CtlType == ODT_LISTBOX {
@@ -151,9 +151,9 @@ pub fn draw(root: HWND, draw: &DRAWITEMSTRUCT) {
                     );
                 }
             }
-        } else if (100..100 + crate::settings_schema::TABS.len() as u32).contains(&draw.CtlID) {
+        } else if (100..100 + crate::settings::schema::TABS.len() as u32).contains(&draw.CtlID) {
             let selected = GetPropW(draw.hwndItem, w!("SelectedTab")) as usize != 0;
-            FillRect(dc, &rect, crate::settings_theme::surface());
+            FillRect(dc, &rect, crate::settings::theme::surface());
             SelectObject(dc, GetStockObject(DC_BRUSH));
             SelectObject(dc, GetStockObject(NULL_PEN));
             SetDCBrushColor(
@@ -167,7 +167,7 @@ pub fn draw(root: HWND, draw: &DRAWITEMSTRUCT) {
             if !selected {
                 SetDCBrushColor(
                     dc,
-                    if crate::settings_theme::dark() {
+                    if crate::settings::theme::dark() {
                         0x303030
                     } else {
                         0xf5f5f5
@@ -192,7 +192,7 @@ pub fn draw(root: HWND, draw: &DRAWITEMSTRUCT) {
                 }),
             );
             if !selected {
-                SetTextColor(dc, crate::settings_theme::text());
+                SetTextColor(dc, crate::settings::theme::text());
             }
             let label = text(draw.hwndItem);
             rect.left += scale(16);
@@ -271,7 +271,7 @@ pub fn draw(root: HWND, draw: &DRAWITEMSTRUCT) {
                 &mut rect,
                 DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
             );
-            FrameRect(dc, &draw.rcItem, crate::settings_theme::edge());
+            FrameRect(dc, &draw.rcItem, crate::settings::theme::edge());
         }
         RestoreDC(dc, saved);
         SelectObject(dc, old);

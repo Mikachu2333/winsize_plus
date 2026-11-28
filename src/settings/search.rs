@@ -1,6 +1,6 @@
 use crate::{
     config::{self, Config},
-    settings_schema::{self as schema, Field, Kind, TABS},
+    settings::schema::{self, Field, Kind, TABS},
 };
 use std::collections::HashMap;
 use toml_edit::DocumentMut;

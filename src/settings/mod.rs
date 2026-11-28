@@ -1,3 +1,14 @@
+mod combo;
+mod paint;
+pub(crate) mod schema;
+mod search;
+mod theme;
+mod tooltip;
+
+use self::{
+    schema::{ColorChannels, Field, Kind, TABS},
+    tooltip::HoverTip,
+};
 use crate::{
     config::{self, Config},
     desktop::{self, err, wide},
@@ -6,8 +17,6 @@ use crate::{
     input,
     overlay::Overlay,
     preview::Preview,
-    settings_schema::{self as schema, ColorChannels, Field, Kind, TABS},
-    settings_tooltip::HoverTip,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -268,7 +277,7 @@ struct Search {
     edit: HWND,
     list: HWND,
     clear: HWND,
-    index: crate::settings_search::Index,
+    index: crate::settings::search::Index,
     matches: Vec<usize>,
     selected: usize,
     query: String,
@@ -276,7 +285,7 @@ struct Search {
     visible: bool,
     dismissed: bool,
     composing: bool,
-    highlight: Option<crate::settings_search::Target>,
+    highlight: Option<crate::settings::search::Target>,
 }
 fn text_width(text: &str, font: &Font) -> i32 {
     unsafe {
@@ -613,8 +622,8 @@ impl Editor {
     fn refresh_search_index(&mut self) -> Result<(), String> {
         if self.search.stale {
             let draft = self.collect().unwrap_or_else(|_| self.doc.clone());
-            self.search.index = crate::settings_search::Index::build(&draft)
-                .or_else(|_| crate::settings_search::Index::build(&self.doc))?;
+            self.search.index = crate::settings::search::Index::build(&draft)
+                .or_else(|_| crate::settings::search::Index::build(&self.doc))?;
             self.search.stale = false;
         }
         Ok(())
@@ -691,8 +700,8 @@ impl Editor {
         }
         self.navigate_search(false)
     }
-    fn search_row(&self, target: &crate::settings_search::Target) -> Option<usize> {
-        let crate::settings_search::Target::Field {
+    fn search_row(&self, target: &crate::settings::search::Target) -> Option<usize> {
+        let crate::settings::search::Target::Field {
             tab,
             axis,
             section,
@@ -712,9 +721,9 @@ impl Editor {
             .nth(*occurrence)
             .map(|(at, _)| at)
     }
-    fn search_control(&self, target: &crate::settings_search::Target) -> HWND {
+    fn search_control(&self, target: &crate::settings::search::Target) -> HWND {
         match target {
-            crate::settings_search::Target::Axis(at) => {
+            crate::settings::search::Target::Axis(at) => {
                 let control = self.axis_controls[*at];
                 if unsafe { IsWindowEnabled(control) } == 0 {
                     self.axis_controls[3]
@@ -808,7 +817,7 @@ impl Editor {
         let mut focus_control = control;
         if focus
             && unsafe { IsWindowEnabled(control) } == 0
-            && let crate::settings_search::Target::Field { section, key, .. } = &target
+            && let crate::settings::search::Target::Field { section, key, .. } = &target
         {
             let enabler = match (section.as_str(), key.as_str()) {
                 ("topmost_marker", _) => Some(("topmost_marker", "enabled")),
@@ -859,7 +868,7 @@ impl Editor {
                 .enumerate()
                 .filter_map(|(slot, &hwnd)| (slot != 11 && !hwnd.is_null()).then_some(hwnd))
                 .collect()
-        } else if matches!(target, crate::settings_search::Target::Axis(_)) {
+        } else if matches!(target, crate::settings::search::Target::Axis(_)) {
             vec![self.search_control(target)]
         } else {
             return;
@@ -1163,7 +1172,7 @@ impl Editor {
             return Err(err());
         }
         let control = Window(hwnd);
-        crate::settings_theme::apply(hwnd);
+        crate::settings::theme::apply(hwnd);
         send(hwnd, WM_SETFONT, self.font.0 as usize, 0);
         unsafe {
             desktop::check(SetWindowSubclass(
@@ -1173,7 +1182,7 @@ impl Editor {
                 self.window.0 as usize,
             ))?;
             if is_combo {
-                crate::settings_combo::attach(hwnd, self.cfg.zh);
+                crate::settings::combo::attach(hwnd, self.cfg.zh);
                 desktop::check(SetPropW(hwnd, w!("SettingsCombo"), 1usize as HANDLE))?;
                 let mut info = COMBOBOXINFO {
                     cbSize: size_of::<COMBOBOXINFO>() as u32,
@@ -2131,7 +2140,7 @@ impl Editor {
         Ok(())
     }
     fn selected_value(row: &Row, slot: usize) -> String {
-        let i = crate::settings_combo::selected_index(row.c(slot));
+        let i = crate::settings::combo::selected_index(row.c(slot));
         row.options
             .get(i.unwrap_or(usize::MAX))
             .map(|v| v.0.clone())
@@ -2810,7 +2819,7 @@ impl Editor {
         Ok(())
     }
     fn command(&mut self, id: i32, event: u32, sender: HWND) -> Result<(), String> {
-        if crate::settings_combo::notification(sender, event) {
+        if crate::settings::combo::notification(sender, event) {
             return Ok(());
         }
         if id == SEARCH_FRAME && event == STN_CLICKED {
@@ -2869,7 +2878,7 @@ impl Editor {
         }
         if matches!(
             event,
-            BN_CLICKED | crate::settings_combo::COMMIT | EN_CHANGE | EDIT_COMMIT
+            BN_CLICKED | crate::settings::combo::COMMIT | EN_CHANGE | EDIT_COMMIT
         ) {
             // A new user action can report the same problem again; background
             // retries without another edit keep the original ten-second deadline.
@@ -3029,9 +3038,9 @@ impl Editor {
         }
         let changed = match kind {
             Kind::Bool => event == BN_CLICKED,
-            Kind::Choice(_) | Kind::Font => event == crate::settings_combo::COMMIT,
+            Kind::Choice(_) | Kind::Font => event == crate::settings::combo::COMMIT,
             Kind::Mapping if slot == 0 && row.field.section != "presets" => {
-                event == crate::settings_combo::COMMIT
+                event == crate::settings::combo::COMMIT
             }
             _ => event == EN_CHANGE,
         };
@@ -3090,7 +3099,7 @@ impl Editor {
         )?;
         let _old_font = std::mem::replace(&mut self.font, font);
         let _old_hint = std::mem::replace(&mut self.hint_font, hint);
-        crate::settings_paint::reset_fonts();
+        crate::settings::paint::reset_fonts();
         MEASUREMENTS.with_borrow_mut(HashMap::clear);
         for handle in self
             .tabs
@@ -3269,7 +3278,7 @@ impl Editor {
         } else {
             item
         };
-        let original = crate::settings_combo::original_index(control, selected);
+        let original = crate::settings::combo::original_index(control, selected);
         let Some((_, label)) = row.options.get(original.unwrap_or(usize::MAX)) else {
             self.tooltip.hide();
             return;
@@ -3333,7 +3342,7 @@ fn shortcut_caption(name: &str, captured: bool, zh: bool) -> String {
     )
 }
 fn populate(hwnd: HWND, options: &[(String, String)], selected: &str, height: i32) {
-    crate::settings_combo::populate(hwnd, options, selected);
+    crate::settings::combo::populate(hwnd, options, selected);
     send(hwnd, CB_SETITEMHEIGHT, usize::MAX, height as isize);
     send(hwnd, CB_SETITEMHEIGHT, 0, height as isize);
 }
@@ -3789,7 +3798,7 @@ unsafe extern "system" fn pane_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: LP
                 if !UPDATING.with(Cell::get) {
                     // Commit item identity before CLOSEUP restores the full list.
                     // Combo notifications are synchronous; the editor runs later.
-                    if crate::settings_combo::notification(lp as HWND, (wp >> 16) as u32) {
+                    if crate::settings::combo::notification(lp as HWND, (wp >> 16) as u32) {
                         return 0;
                     }
                     PostMessageW(root, WM_COMMAND, wp, lp);
@@ -3810,7 +3819,7 @@ unsafe extern "system" fn pane_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: LP
             WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORBTN => {
                 let id = GetDlgCtrlID(lp as HWND);
                 let hint = id >= BASE && (id - BASE) % STRIDE == 2;
-                crate::settings_theme::color(
+                crate::settings::theme::color(
                     wp as HDC,
                     hint,
                     matches!(message, WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX),
@@ -3819,7 +3828,7 @@ unsafe extern "system" fn pane_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: LP
             WM_ERASEBKGND => {
                 let mut rect = RECT::default();
                 GetClientRect(hwnd, &mut rect);
-                FillRect(wp as HDC, &rect, crate::settings_theme::surface());
+                FillRect(wp as HDC, &rect, crate::settings::theme::surface());
                 if !GetPropW(hwnd, w!("SearchMatch")).is_null() {
                     let coord = |name| GetPropW(hwnd, name) as usize as i32;
                     let region = CreateRoundRectRgn(
@@ -3872,7 +3881,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
         }
         #[cfg(test)]
         TEST_THEME => {
-            crate::settings_theme::test_dark(match wp {
+            crate::settings::theme::test_dark(match wp {
                 1 => Some(false),
                 2 => Some(true),
                 _ => None,
@@ -3961,15 +3970,15 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
             0
         }
         WM_DPICHANGED | WM_SETTINGCHANGE | WM_THEMECHANGED | WM_SYSCOLORCHANGE => {
-            crate::settings_theme::refresh();
-            crate::settings_theme::apply(hwnd);
+            crate::settings::theme::refresh();
+            crate::settings::theme::apply(hwnd);
             unsafe {
                 let mut child = GetWindow(hwnd, GW_CHILD);
                 while !child.is_null() {
-                    crate::settings_theme::apply(child);
+                    crate::settings::theme::apply(child);
                     let mut control = GetWindow(child, GW_CHILD);
                     while !control.is_null() {
-                        crate::settings_theme::apply(control);
+                        crate::settings::theme::apply(control);
                         control = GetWindow(control, GW_HWNDNEXT);
                     }
                     child = GetWindow(child, GW_HWNDNEXT);
@@ -4033,7 +4042,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
             0
         }
         WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORBTN => unsafe {
-            crate::settings_theme::color(
+            crate::settings::theme::color(
                 wp as HDC,
                 false,
                 GetDlgCtrlID(lp as HWND) == 600
@@ -4043,7 +4052,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
         WM_ERASEBKGND => unsafe {
             let mut rect = RECT::default();
             GetClientRect(hwnd, &mut rect);
-            FillRect(wp as HDC, &rect, crate::settings_theme::surface());
+            FillRect(wp as HDC, &rect, crate::settings::theme::surface());
             1
         },
         WM_TIMER => {
@@ -4100,7 +4109,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
             0
         }
         WM_DRAWITEM => {
-            crate::settings_paint::draw(hwnd, unsafe { &*(lp as *const DRAWITEMSTRUCT) });
+            crate::settings::paint::draw(hwnd, unsafe { &*(lp as *const DRAWITEMSTRUCT) });
             1
         }
         WM_MEASUREITEM => {
@@ -4294,8 +4303,8 @@ pub fn run(path: &Path) -> Result<(), String> {
             return Err(err());
         }
         let window = Window(hwnd);
-        crate::settings_theme::refresh();
-        crate::settings_theme::apply(hwnd);
+        crate::settings::theme::refresh();
+        crate::settings::theme::apply(hwnd);
         desktop::check(SetPropW(hwnd, w!("PreviewSuspended"), 1usize as HANDLE))?;
         // Settings may retain an elevated token after the resident is restarted normally.
         // Only this payload-free lifecycle message is allowed across that boundary.
@@ -4335,7 +4344,7 @@ pub fn run(path: &Path) -> Result<(), String> {
             if pane.is_null() {
                 return Err(err());
             }
-            crate::settings_theme::apply(*pane);
+            crate::settings::theme::apply(*pane);
         }
         let ui_font = Font::new(
             &cfg.font,
@@ -4525,7 +4534,7 @@ fn message_loop(hwnd: HWND, timer: HANDLE) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    include!("settings_search_tests.rs");
+    include!("search_tests.rs");
     #[test]
     #[ignore = "uses a temporary settings window to verify search focus, keyboard input and navigation"]
     fn search_navigation_preserves_focus_values_and_fixed_header() {
@@ -4591,7 +4600,7 @@ mod tests {
         EDITOR.with_borrow(|slot| {
             let e = slot.as_ref().unwrap();
             assert_eq!(e.tab, 4);
-            assert!(matches!(e.search.highlight, Some(crate::settings_search::Target::Field { ref section, ref key, .. }) if section == "keys" && key == "Q"));
+            assert!(matches!(e.search.highlight, Some(crate::settings::search::Target::Field { ref section, ref key, .. }) if section == "keys" && key == "Q"));
             assert!(!unsafe { GetPropW(e.panes[1], w!("SearchMatch")) }.is_null());
         });
         assert_eq!(unsafe { GetFocus() }, edit);
@@ -4792,7 +4801,7 @@ mod tests {
             editor
                 .command(
                     BASE + index as i32 * STRIDE,
-                    crate::settings_combo::COMMIT,
+                    crate::settings::combo::COMMIT,
                     control,
                 )
                 .unwrap();
@@ -5323,7 +5332,7 @@ mod tests {
             GetComboBoxInfo(combo, &mut info);
         }
         for dark in [false, true] {
-            crate::settings_theme::test_dark(Some(dark));
+            crate::settings::theme::test_dark(Some(dark));
             editor.update_values();
             send(info.hwndItem, EM_SETSEL, 0, -1);
             unsafe {
@@ -5453,7 +5462,7 @@ mod tests {
                 }
             }
         }
-        crate::settings_theme::test_dark(None);
+        crate::settings::theme::test_dark(None);
     }
 
     #[test]
@@ -5732,11 +5741,14 @@ mod tests {
         assert_eq!(send(combo, CB_GETCOUNT, 0, 0), 1);
         assert_eq!(Editor::selected_value(&editor.rows[index], 0), "1/9");
         send(combo, CB_SETCURSEL, 0, 0);
-        crate::settings_combo::notification(combo, CBN_SELENDOK);
+        crate::settings::combo::notification(combo, CBN_SELENDOK);
         editor
-            .command(id, crate::settings_combo::COMMIT, combo)
+            .command(id, crate::settings::combo::COMMIT, combo)
             .unwrap();
-        assert_eq!(crate::settings_combo::selected_index(combo), Some(selected));
+        assert_eq!(
+            crate::settings::combo::selected_index(combo),
+            Some(selected)
+        );
         assert_eq!(editor.collect().unwrap()["keys"]["Q"].as_str(), Some("4/4"));
     }
 
@@ -5806,7 +5818,7 @@ mod tests {
                 .unwrap();
             place(edit, 20, 20, 320, 100);
             for dark in [false, true] {
-                crate::settings_theme::test_dark(Some(dark));
+                crate::settings::theme::test_dark(Some(dark));
                 for backspace in [false, true] {
                     set_text(edit, "12345678901234567890123456789012345678901234567890");
                     unsafe {
@@ -5866,7 +5878,7 @@ mod tests {
                 DestroyWindow(edit);
             }
         }
-        crate::settings_theme::test_dark(None);
+        crate::settings::theme::test_dark(None);
     }
 
     #[test]
@@ -5897,7 +5909,7 @@ mod tests {
             .create(root, "EDIT", text, WS_BORDER | WS_TABSTOP, 900)
             .unwrap();
         for dark in [false, true] {
-            crate::settings_theme::test_dark(Some(dark));
+            crate::settings::theme::test_dark(Some(dark));
             unsafe {
                 RedrawWindow(
                     root,
@@ -5977,7 +5989,7 @@ mod tests {
                 );
             }
         }
-        crate::settings_theme::test_dark(None);
+        crate::settings::theme::test_dark(None);
     }
 
     #[test]
@@ -6148,7 +6160,7 @@ mod tests {
             ShowWindow(root, SW_SHOW);
         }
         for dark in [false, true] {
-            crate::settings_theme::test_dark(Some(dark));
+            crate::settings::theme::test_dark(Some(dark));
             unsafe {
                 RedrawWindow(
                     root,
@@ -6236,7 +6248,7 @@ mod tests {
             }
             assert_eq!(hidden, painted_pixels(root, rect));
         }
-        crate::settings_theme::test_dark(None);
+        crate::settings::theme::test_dark(None);
     }
 
     #[test]
@@ -6319,7 +6331,8 @@ mod tests {
                 send(
                     root,
                     WM_COMMAND,
-                    (BASE + 2 * STRIDE) as usize | ((crate::settings_combo::COMMIT as usize) << 16),
+                    (BASE + 2 * STRIDE) as usize
+                        | ((crate::settings::combo::COMMIT as usize) << 16),
                     language as isize,
                 );
                 std::thread::sleep(Duration::from_millis(800));

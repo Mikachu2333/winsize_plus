@@ -106,7 +106,7 @@ fn paint_edit_padding(combo: HWND) {
         }
         let saved = SaveDC(dc);
         ExcludeClipRect(dc, edit.left, edit.top, edit.right, edit.bottom);
-        FillRect(dc, &info.rcItem, crate::settings_theme::control());
+        FillRect(dc, &info.rcItem, crate::settings::theme::control());
         RestoreDC(dc, saved);
         ReleaseDC(combo, dc);
     }
