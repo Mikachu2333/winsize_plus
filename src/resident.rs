@@ -598,7 +598,6 @@ impl App {
             input::TIP_SCROLL => {
                 self.overlay.scroll_tip(msg.wParam as i32);
                 self.hide = None;
-                self.preview_until = None;
                 Ok(())
             }
             input::DISPLAY_CHANGED => {
@@ -1163,6 +1162,37 @@ mod tests {
         app.act("pause").unwrap();
         assert!(!app.paused);
         assert_eq!(app.overlay.tip_text(), "开始捕获");
+    }
+
+    #[test]
+    #[ignore = "opens temporary selection tips to verify scrolling preserves active and paused deadlines"]
+    fn scrolling_selection_tips_never_changes_selection_deadlines() {
+        let _hooks = input::Hooks::start(&crate::test_support::cfg()).unwrap();
+        let mut app = test_app();
+        app.begin_alt_preview(unsafe { GetForegroundWindow() }, false)
+            .unwrap();
+        let deadline = app.preview_until;
+        app.handle_event(MSG {
+            message: input::TIP_SCROLL,
+            wParam: 400,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(app.preview_until, deadline);
+        app.handle_event(MSG {
+            message: input::POINTER_DOWN,
+            ..Default::default()
+        })
+        .unwrap();
+        let remaining = app.selection_suspended;
+        app.handle_event(MSG {
+            message: input::TIP_SCROLL,
+            wParam: 400,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(app.selection_suspended, remaining);
+        assert!(app.preview_until.is_none());
     }
 
     #[test]
