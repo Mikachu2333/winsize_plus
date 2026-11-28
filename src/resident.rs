@@ -94,6 +94,7 @@ impl App {
         input::track_preview(false)
     }
     fn begin_alt_preview(&mut self, window: HWND, _latched: bool) -> Result<(), String> {
+        self.close_prompt_without_focus();
         self.close_preview()?;
         self.clear();
         self.window = window;
@@ -320,6 +321,7 @@ impl App {
     fn act(&mut self, action: &str) -> Result<(), String> {
         match action {
             "pause" => {
+                self.close_prompt_without_focus();
                 let paused = !self.paused;
                 input::set_paused(paused)?;
                 self.paused = paused;
@@ -381,13 +383,15 @@ impl App {
                 self.overlay.tip(&self.cfg.help_text(), &self.cfg)
             }
             "command" => {
-                input::native_text(true);
                 self.command.clear();
                 self.hide = None;
                 self.prompt = match crate::command_prompt::Prompt::new(&self.cfg) {
-                    Ok(prompt) => Some(prompt),
+                    Ok(prompt) => {
+                        input::native_text(prompt.window);
+                        Some(prompt)
+                    }
                     Err(error) => {
-                        input::native_text(false);
+                        input::native_text(null_mut());
                         return Err(error);
                     }
                 };
@@ -525,12 +529,16 @@ impl App {
         self.overlay.tip(&format!(": {}▏", self.command), &self.cfg)
     }
     fn close_prompt(&mut self) {
-        self.prompt.take();
-        input::native_text(false);
+        self.close_prompt_without_focus();
         unsafe {
             if IsWindow(self.window) != 0 {
                 SetForegroundWindow(self.window);
             }
+        }
+    }
+    fn close_prompt_without_focus(&mut self) {
+        if self.prompt.take().is_some() {
+            input::native_text(null_mut());
         }
     }
     fn submit_prompt(&mut self) -> Result<(), String> {
@@ -607,7 +615,7 @@ impl App {
             return Ok(());
         }
         if self.paused
-            && (input::ARMED..=input::CONFIRM).contains(&msg.message)
+            && (input::ARMED..=input::COMMAND_CANCEL).contains(&msg.message)
             && msg.message != input::DISPLAY_CHANGED
         {
             return Ok(());
@@ -1208,6 +1216,30 @@ mod tests {
         app.act("pause").unwrap();
         assert!(!app.paused);
         assert_eq!(app.overlay.tip_text(), "开始捕获");
+    }
+
+    #[test]
+    #[ignore = "opens a temporary command prompt and verifies pause cancels it and blocks queued submissions"]
+    fn pausing_closes_command_prompt_and_rejects_pending_submission() {
+        let _hooks = input::Hooks::start(&crate::test_support::cfg()).unwrap();
+        let mut app = test_app();
+        app.window = unsafe { GetForegroundWindow() };
+        app.act("command").unwrap();
+        let hwnd = app.prompt.as_ref().unwrap().window;
+        unsafe {
+            SetWindowTextW(GetDlgItem(hwnd, 1), wide("version").as_ptr());
+        }
+        app.act("pause").unwrap();
+        assert!(app.prompt.is_none());
+        assert_eq!(unsafe { IsWindow(hwnd) }, 0);
+        let notice = app.overlay.tip_text().to_owned();
+        app.handle_event(MSG {
+            message: input::COMMAND_SUBMIT,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(app.overlay.tip_text(), notice);
+        app.act("pause").unwrap();
     }
 
     #[test]

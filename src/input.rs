@@ -80,7 +80,7 @@ enum Mode {
 struct Input {
     paused: bool,
     mode: Mode,
-    native_text: bool,
+    native_text: usize,
     edge_cursor: u8,
     alt_mask: u8,
     gesture_mask: u8,
@@ -559,7 +559,7 @@ impl Input {
             }
             return true;
         }
-        if self.native_text {
+        if self.native_text != 0 && unsafe { GetForegroundWindow() } as usize == self.native_text {
             if !down && matches!(key, LEFT | RIGHT) {
                 self.pressed &= if key == LEFT { !1 } else { !2 };
             }
@@ -1180,14 +1180,17 @@ pub fn alt_held() -> bool {
         )
     })
 }
-pub fn native_text(on: bool) {
+pub fn native_text(window: HWND) {
+    let window = window as usize;
     let _ = on_hook(move || {
         INPUT.with_borrow_mut(|input| {
-            input.mode = Mode::Idle;
-            input.cancel_hold();
-            input.native_text = on;
-            input.tap = None;
-            input.last_tap = None;
+            input.native_text = window;
+            if window != 0 {
+                input.mode = Mode::Idle;
+                input.cancel_hold();
+                input.tap = None;
+                input.last_tap = None;
+            }
         })
     });
 }
@@ -1604,6 +1607,25 @@ impl Drop for Hooks {
 
 #[cfg(test)]
 pub(super) mod tests {
+    #[test]
+    fn native_editor_bypasses_bindings_only_while_its_window_is_foreground() {
+        use super::*;
+        let _hooks = Hooks::escape_only().unwrap();
+        let mut input = pending_hold(100);
+        input.hold_started = None;
+        input.mode = Mode::Wait;
+        input.native_text = usize::MAX;
+        assert!(input.keyboard(0x51, true, 200));
+        assert_eq!(next_event().unwrap().message, ACTION);
+        let foreground = unsafe { GetForegroundWindow() } as usize;
+        if foreground != 0 {
+            input.mode = Mode::Wait;
+            input.eaten = [0; 4];
+            input.native_text = foreground;
+            assert!(!input.keyboard(0x51, true, 201));
+            assert!(next_event().is_none());
+        }
+    }
     pub fn enqueue_at(message: u32, at: super::Instant) {
         super::DEFERRED.with_borrow_mut(|events| {
             events.push_back(super::QueuedEvent {
